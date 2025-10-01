@@ -1,0 +1,98 @@
+{
+  "strategy": "EMA Trend Following Strategy",
+  "status": "Active",
+  "description": "EMA Trend following strategy for both CALL and PUT options",
+
+  "entry_conditions": {
+    "condition": "(close > previous_day_high) & (close > cpr_r1) & (close > ema_9) & (ema_9 > ema_20) & (ema_20 > ema_50) & (previous_candle_close > previous_candle_open) & (close > previous_candle_high) & (close > open) & (ltp_high > high)",
+    "description": "Enter when price is above previous day high, CPR R1, and all EMAs are aligned in uptrend with bullish candle pattern"
+  },
+
+  "exit_conditions": {
+    "condition": "(ltp < sl_price) | (close < ema_20)",
+    "description": "Exit when stop loss is hit or price closes below EMA 20"
+  },
+  "legs": [
+    {
+      "leg_id": "leg1",
+      "leg_type": "CALL",
+      "status": "open",
+      "expiry": "weekly",
+      "strike": "ATM",
+      "lot_size": 1,
+      "action": "BUY",
+      "stoploss": "risk_management.spot.stoploss.candle_range",
+      "target": "risk_management.spot.stoploss.candle_range",
+      "risk_reward_ratio": "1:1.5",
+      "max_reward_ratio": "1:2",
+      "trailing_stoploss": {
+        "enabled": false,
+        "method": ""
+      },
+      "entry_trigger": "immediate",
+      "description": "Open this leg immediately when entry condition is met"
+    },
+    {
+      "leg_id": "leg2",
+      "leg_type": "PUT",
+      "status": "open",
+      "expiry": "weekly",
+      "strike": "ITM3",
+      "lot_size": 1,
+      "action": "BUY",
+      "stoploss": "risk_management.spot.stoploss.candle_range",
+      "target": "risk_management.spot.stoploss.candle_range",
+      "risk_reward_ratio": "1:2",
+      "max_reward_ratio": "",
+      "trailing_stoploss": {
+        "enabled": true,
+        "method": "risk_management.spot.stoploss.candle_range"
+      },
+      "entry_trigger": "immediate",
+      "description": "Open this leg immediately when entry condition is met"
+    }
+  ],
+    "risk_management": {
+    "spot": {
+      "stoploss": {
+        "range": "signal_candle_range",
+        "points": 30,
+        "percentage": 15,
+        "sl_amount": 2000
+      },
+      "target": {
+        "range": "signal_candle_range",
+        "points": 30,
+        "percentage": 15,
+        "target_amount": 2000
+      }
+    },
+    "option": {
+      "stoploss": {
+        "range": "signal_candle_range",
+        "points": 30,
+        "percentage": 10
+      },
+      "target": {
+        "range": "signal_candle_range",
+        "points": 30,
+        "percentage": 10
+      }
+    },
+    "risk_control":
+    {   
+      "max_risk_per_trade_percentage": "10",
+      "max_capital_risk_per_day_percentage": "3",
+      "max_range_sl_points": 45,
+      "max_range_tp_points": 75
+    },
+    "buffer_points": {
+      "stoploss_points": 5,
+      "target_points": 3
+    }
+  },
+  "configuration": {
+    "available_strikes": ["1_percentage_spot, ATM", "ITM1", "ITM2", "ITM3", "OTM1", "OTM2", "OTM3"],
+    "available_sl_tp_range_method": ["risk_management.spot.stoploss.candle_range", "risk_management.spot.target.candle_range", "risk_management.option.target.candle_range", "risk_management.option.target.candle_range"]
+  }
+}

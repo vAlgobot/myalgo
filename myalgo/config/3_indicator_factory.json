@@ -1,0 +1,86 @@
+{
+  "indicators_config": {
+    "version": "1.0.0",
+    "description": "Technical indicators configuration for trading system",
+    
+    "candle_data": {
+      "current_candle": {
+        "enabled": true,
+        "description": "Current candle OHLC data",
+        "timeframe": "5m"
+      },
+      "previous_candle": {
+        "enabled": true,
+        "description": "Previous candle OHLC data",
+        "timeframe": "5m"
+      },
+      "signal_candle": {
+        "enabled": true,
+        "description": "Signal candle OHLC data captured at entry time. Used for SL/TP calculations"
+      },
+      "current_day_candle": {
+        "enabled": true,
+        "description": "Current day candle OHLC data",
+        "timeframe": "D"
+      }
+    },
+    
+    "trend_indicators": {
+      "sma": {
+        "enabled": true,
+        "description": "Simple Moving Average",
+        "timeframe": "5m",
+        "periods": [9, 20, 50, 200]
+      },
+      "ema": {
+        "enabled": true,
+        "description": "Exponential Moving Average",
+        "timeframe": "5m",
+        "periods": [9, 20, 50, 200]
+      }
+    },
+    
+    "momentum_indicators": {
+      "rsi": {
+        "enabled": true,
+        "description": "Relative Strength Index",
+        "timeframe": "5m",
+        "periods": [14, 21]
+      }
+    },
+    
+    "volume_indicators": {
+      "vwap": {
+        "enabled": false,
+        "description": "Volume Weighted Average Price",
+        "timeframe": "5m",
+        "calculation_method": "standard"
+      }
+    },
+    
+    "volatility_indicators": {
+      "bollinger_bands": {
+        "enabled": false,
+        "description": "Bollinger Bands",
+        "timeframe": "5m",
+        "config": {
+          "period": 20,
+          "std_dev": 2
+        }
+      }
+    },
+    
+    "support_resistance": {
+      "cpr": {
+        "enabled": true,
+        "description": "Central Pivot Range",
+        "timeframes": ["D", "W"],
+        "available_timeframes": {
+          "D": "Daily",
+          "W": "Weekly",
+          "M": "Monthly"
+        }
+      }
+    }
+  }
+}

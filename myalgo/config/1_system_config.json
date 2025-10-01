@@ -1,0 +1,87 @@
+{
+  "system_name": "V_Algo_System",
+  "version": "1.0.0",
+  "description": "Algorithmic trading system with backtesting, live trading, and data fetching capabilities",
+
+  "modes": {
+    "backtesting": {
+      "enabled": true,
+      "description": "Simulates trades over historical data to evaluate strategy performance",
+      "config": {
+        "start_date": "2024-06-01",
+        "end_date": "2025-06-30",
+        "instrument": "NIFTY",
+        "available_instruments": ["NIFTY", "BANKNIFTY", "SENSEX"]
+      },
+      "capital_management": {
+        "initial_capital": 100000,
+        "commission_per_trade": 25,
+        "slippage_percentage": 0.05
+      },
+      "reports": {
+        "signals": true,
+        "trades": true,
+        "strategy_comparison": false,
+        "json_export": false,
+        "export_path_template": "output/backtesting_reports/{strategy}_{instrument}_{report_type}_{timeframe}_{start_date}_to_{end_date}_{current_date}.json"
+      }
+    },
+    
+    "live_trading": {
+      "enabled": true,
+      "description": "Connects to broker for real-time trading execution",
+      "config": {
+        "instrument": "NIFTY",
+        "broker": "AngelOne",
+        "capital": 100000,
+        "investment_per_trade": 50000
+      }
+    },
+    
+    "data_fetching": {
+      "enabled": false,
+      "description": "Retrieves historical market data for specified instruments and timeframes",
+      "config": {
+        "data_source": "openalgo",
+        "instruments": ["NIFTY", "BANKNIFTY", "SENSEX"],
+        "timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "D"],
+        "date_range": {
+          "start_date": "2023-01-01",
+          "end_date": "2023-12-31"
+        }
+      },
+      "database": {
+        "type": "duckdb",
+        "path": "database/valgo_market_data.db",
+        "required_tables": [
+          "historical_instruments_ohlcv_data",
+          "historical_options_chain_data"
+        ]
+      },
+      "export": {
+        "enabled": true,
+        "path_template": "Historical_data/instruments/{instrument_name}_{timeframe}_{start_date}_to_{end_date}_{current_date}.csv"
+      }
+    }
+  },
+  
+  "trading_session": {
+    "market_hours": {
+      "trading_start": "09:20",
+      "trading_end": "14:00",
+      "forced_exit": "15:00"
+    },
+    "limits": {
+      "max_daily_trades": 3
+    }
+  },
+  
+  "timeframes": {
+    "seconds": ["5s", "10s", "15s", "30s", "45s"],
+    "minutes": ["1m", "2m", "3m", "5m", "10m", "15m", "20m", "30m"],
+    "hours": ["1h", "2h", "4h"],
+    "days": ["D"],
+    "weeks": ["W"],
+    "months": ["M"]
+  }
+}

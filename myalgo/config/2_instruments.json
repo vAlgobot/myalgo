@@ -1,0 +1,27 @@
+{
+  "instruments": {
+    "instrument_type": "index",
+    "available_types": ["equity", "index", "F&O"],
+    "NIFTY": {
+      "symbol": "NIFTY",
+      "exchange": "NSE_INDEX",
+      "timeframe": "5m",
+      "lot_size": 75,
+      "strike_interval": 50
+    },
+    "BANKNIFTY": {
+      "symbol": "BANKNIFTY",
+      "exchange": "NSE_INDEX",
+      "timeframe": "5m",
+      "lot_size": 35,
+      "strike_interval": 100
+    },
+    "SENSEX": {
+      "symbol": "SENSEX",
+      "exchange": "NSE_INDEX",
+      "timeframe": "3m",
+      "lot_size": 20,
+      "strike_interval": 100
+    }
+  }
+}
