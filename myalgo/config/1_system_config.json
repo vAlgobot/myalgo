@@ -1,7 +1,18 @@
 {
-  "system_name": "V_Algo_System",
+  "system_name": "myalgo",
   "version": "1.0.0",
   "description": "Algorithmic trading system with backtesting, live trading, and data fetching capabilities",
+
+  "openalgo": {
+    "api_key": "112c4900f6b2d83b7d812921de13d36898116fd79a592d96cec666dfbbc389f8",
+    "host": "http://127.0.0.1:5000",
+    "ws_url": "ws://127.0.0.1:8765",
+    "timeout": 30,
+    "retry_attempts": 3,
+    "rate_limit_buffer": 0.1,
+    "warmup_factor": 3,
+    "bars_per_day": 75
+  },
 
   "modes": {
     "backtesting": {

@@ -1,10 +1,24 @@
 {
+  "live_trading": {
+      "enabled": true,
+      "description": "Connects to broker for real-time trading execution",
+      "config": {
+        "instrument": "NIFTY",
+        "broker": "AngelOne",
+        "capital": 100000,
+        "investment_per_trade": 50000,
+        "api_key": "112c4900f6b2d83b7d812921de13d36898116fd79a592d96cec666dfbbc389f8",
+         "host": "http://127.0.0.1:5000" ,
+         "exchange": "NSE_INDEX"
+      }
+    },
+    
   "strategy": "EMA Trend Following Strategy",
   "status": "Active",
   "description": "EMA Trend following strategy for both CALL and PUT options",
 
   "entry_conditions": {
-    "condition": "(close > previous_day_high) & (close > cpr_r1) & (close > ema_9) & (ema_9 > ema_20) & (ema_20 > ema_50) & (previous_candle_close > previous_candle_open) & (close > previous_candle_high) & (close > open) & (ltp_high > high)",
+    "condition": "(close > prev_day_high) & (close > cpr_r1) & (close > ema_9) & (ema_9 > ema_20) & (ema_20 > ema_50) & (prev_close > prev_open) & (close > prev_high) & (close > open)",
     "description": "Enter when price is above previous day high, CPR R1, and all EMAs are aligned in uptrend with bullish candle pattern"
   },
 
@@ -21,8 +35,8 @@
       "strike": "ATM",
       "lot_size": 1,
       "action": "BUY",
-      "stoploss": "risk_management.spot.stoploss.candle_range",
-      "target": "risk_management.spot.stoploss.candle_range",
+      "stoploss": "risk_management.spot.stoploss.points",
+      "target": "risk_management.spot.target.points",
       "risk_reward_ratio": "1:1.5",
       "max_reward_ratio": "1:2",
       "trailing_stoploss": {
@@ -34,14 +48,14 @@
     },
     {
       "leg_id": "leg2",
-      "leg_type": "PUT",
+      "leg_type": "CALL",
       "status": "open",
       "expiry": "weekly",
       "strike": "ITM3",
       "lot_size": 1,
       "action": "BUY",
-      "stoploss": "risk_management.spot.stoploss.candle_range",
-      "target": "risk_management.spot.stoploss.candle_range",
+      "stoploss": "risk_management.spot.stoploss.points",
+      "target": "risk_management.spot.target.points",
       "risk_reward_ratio": "1:2",
       "max_reward_ratio": "",
       "trailing_stoploss": {
@@ -57,14 +71,12 @@
       "stoploss": {
         "range": "signal_candle_range",
         "points": 30,
-        "percentage": 15,
-        "sl_amount": 2000
+        "percentage": 15
       },
       "target": {
         "range": "signal_candle_range",
         "points": 30,
-        "percentage": 15,
-        "target_amount": 2000
+        "percentage": 15
       }
     },
     "option": {
@@ -93,6 +105,6 @@
   },
   "configuration": {
     "available_strikes": ["1_percentage_spot, ATM", "ITM1", "ITM2", "ITM3", "OTM1", "OTM2", "OTM3"],
-    "available_sl_tp_range_method": ["risk_management.spot.stoploss.candle_range", "risk_management.spot.target.candle_range", "risk_management.option.target.candle_range", "risk_management.option.target.candle_range"]
+    "available_sl_tp_range_method": ["risk_management.spot.stoploss.points", "risk_management.spot.target.points", "risk_management.option.target.candle_range", "risk_management.option.target.candle_range"]
   }
 }

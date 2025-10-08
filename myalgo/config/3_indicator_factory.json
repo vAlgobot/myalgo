@@ -16,7 +16,7 @@
       },
       "signal_candle": {
         "enabled": true,
-        "description": "Signal candle OHLC data captured at entry time. Used for SL/TP calculations"
+        "description": "Signal candle OHLC data captured at entry time."
       },
       "current_day_candle": {
         "enabled": true,
@@ -73,6 +73,8 @@
     "support_resistance": {
       "cpr": {
         "enabled": true,
+        "all_levels": true,
+        "excpected_format": "cpr_daily_tc,cpr_daily_bc,cpr_daily_r1,cpr_daily_r2,cpr_daily_r3,cpr_daily_r4,cpr_daily_s1,cpr_daily_s2,cpr_daily_s3,cpr_daily_s4,cpr_daily_width,cpr_daily_range_type,cpr_daily_type,cpr_weekly_tc,cpr_weekly_bc,cpr_weekly_r1,cpr_weekly_r2,cpr_weekly_r3,cpr_weekly_r4,cpr_weekly_s1,cpr_weekly_s2,cpr_weekly_s3,cpr_weekly_s4,cpr_weekly_width,cpr_weekly_range_type,cpr_weekly_type,cpr_monthly_tc,cpr_monthly_bc,cpr_monthly_r1,cpr_monthly_r2,cpr_monthly_r3,cpr_monthly_r4,cpr_monthly_s1,cpr_monthly_s2,cpr_monthly_s3,cpr_monthly_s4,cpr_monthly_width,cpr_monthly_range_type,cpr_monthly_type",
         "description": "Central Pivot Range",
         "timeframes": ["D", "W"],
         "available_timeframes": {
