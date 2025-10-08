@@ -96,7 +96,6 @@ LOT = 1
 USE_SPOT_FOR_SLTP = True      # If True → uses spot price for SL/TP tracking
 USE_OPTION_FOR_SLTP = False   # If True → uses option position LTP for SL/TP tracking
 
-
 # SL/TP Enhancement config
 SL_TP_METHOD = "Signal_candle_range_SL_TP" # current active method
 TSL_ENABLED = True # enable trailing stoploss behavior
@@ -124,7 +123,6 @@ data_logger = get_logger("market_data")
 # Keep original logger for backward compatibility
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("FixedSignalBot")
-
 # ----------------------------
 # MyAlgo Trdaing System
 # ----------------------------
@@ -421,7 +419,7 @@ class MYALGO_TRADING_BOT:
                 pass
             logger.info("websocket closed")
     # -------------------------
-    # Data fetchers
+    # Get Intraday Candle
     # -------------------------
     def get_intraday(self, days=LOOKBACK_DAYS):
         try:
@@ -444,140 +442,8 @@ class MYALGO_TRADING_BOT:
             logger.exception("get_intraday failed")
             return pd.DataFrame()
     # -------------------------
-    # Daily Candle Data fetchers
+    # Static indicators 
     # -------------------------
-    def get_daily(self, lookback=3):
-        try:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=lookback)
-            raw = self.client.history(symbol=SYMBOL, exchange=EXCHANGE, interval="D",
-                                      start_date=start_date.strftime("%Y-%m-%d"), end_date=end_date.strftime("%Y-%m-%d"))
-            if isinstance(raw, pd.DataFrame):
-                df = raw.copy()
-            elif isinstance(raw, dict) and "data" in raw:
-                df = pd.DataFrame(raw["data"])
-            else:
-                df = pd.DataFrame()
-            for c in ["open", "high", "low", "close", "volume"]:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-            return df
-        except Exception:
-            logger.exception("get_daily failed")
-            return pd.DataFrame()
-
-    def get_historical(self, interval="D", lookback=3):
-        """
-        Dynamic reusable function to fetch historical OHLC data for any timeframe.
-        Works for: 'D' (Daily), 'W' (Weekly), 'M' (Monthly)
-        """
-        try:
-            end_date = datetime.now()
-            if interval == "5m":
-                start_date = end_date - timedelta(days=lookback)
-            elif interval == "D":
-                start_date = end_date - timedelta(days=lookback)
-            elif interval == "W":
-                start_date = end_date - timedelta(weeks=lookback)
-            elif interval == "M":
-                tart_date = end_date - timedelta(days=lookback * 30)
-            else:
-                raise ValueError(f"Unsupported interval: {interval}")
-
-            raw = self.client.history(
-                symbol=SYMBOL,
-                exchange=EXCHANGE,
-                interval=interval,
-                start_date=start_date.strftime("%Y-%m-%d"),
-                end_date=end_date.strftime("%Y-%m-%d")
-                )
-
-            # Normalize to DataFrame
-            if isinstance(raw, pd.DataFrame):
-                df = raw.copy()
-            elif isinstance(raw, dict) and "data" in raw:
-                df = pd.DataFrame(raw["data"])
-            else:
-                df = pd.DataFrame()
-
-            # Type coercion for numeric fields
-            for c in ["open", "high", "low", "close", "volume"]:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-
-            # Convert timestamp to datetime index if available
-            if "timestamp" in df.columns:
-                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-                df.set_index("timestamp", inplace=True)
-
-            # Logging summary
-            indicators_logger.info(
-                f"[HISTORICAL] Interval:{interval} | Records:{len(df)} | "
-                f"Range:{start_date.strftime('%d-%b-%Y')} → {end_date.strftime('%d-%b-%Y')}"
-            )
-
-            return df
-
-        except Exception:
-            logger.exception(f"get_historical failed for interval {interval}")
-            return pd.DataFrame()
-
-    def compute_cpr(self, df, label: str):
-        """Generic CPR computation used by daily, weekly, monthly methods."""
-        if len(df) < 2:
-            indicators_logger.warning(f"{label} CPR: insufficient bars to compute.")
-            return None
-        prev = df.iloc[-2]
-        high, low, close = prev['high'], prev['low'], prev['close']
-        pivot = (high + low + close) / 3
-        bc = (high + low) / 2
-        tc = 2 * pivot - bc
-        cpr_range = abs(tc - bc)
-        r1 = (2 * pivot) - low
-        s1 = (2 * pivot) - high
-        r2 = pivot + (high - low)
-        s2 = pivot - (high - low)
-        r3 = high + 2 * (pivot - low)
-        s3 = low - 2 * (high - pivot)
-        r4 = r3 + (r2 - r1)
-        s4 = s3 - (s1 - s2)
-
-        # Unified log style
-        indicators_logger.info("═══════════════════════")
-        indicators_logger.info(f"📊 {label.upper()} CPR INDICATOR LEVELS (Previous {label.title()} Data)")
-        indicators_logger.info("───────────────────────")
-        if label.upper() == "DAILY":
-            indicators_logger.info(f"Date: {df.index[-2].strftime('%d-%b-%Y')}")
-        elif label.upper() == "WEEKLY":
-            indicators_logger.info(f"Week Start: {df.index[-2].strftime('%d-%b-%Y')}")
-        else:
-            indicators_logger.info(f"Month: {df.index[-2].strftime('%b %Y')}")
-        indicators_logger.info(f"High: {high:.2f} | Low: {low:.2f} | Close: {close:.2f}")
-        indicators_logger.info(f"Pivot: {pivot:.2f} | BC: {bc:.2f} | TC: {tc:.2f}")
-        indicators_logger.info(f"CPR Width: {cpr_range:.2f}")
-        indicators_logger.info(f"R1: {r1:.2f} | R2: {r2:.2f} | R3: {r3:.2f} | R4: {r4:.2f}")
-        indicators_logger.info(f"S1: {s1:.2f} | S2: {s2:.2f} | S3: {s3:.2f} | S4: {s4:.2f}")
-        indicators_logger.info("═══════════════════════")
-
-        return {
-            "pivot": pivot,
-            "bc": bc,
-            "tc": tc,
-            "cpr_range": cpr_range,
-            "r1": r1,
-            "s1": s1,
-            "r2": r2,
-            "s2": s2,
-            "r3": r3,
-            "s3": s3,
-            "r4": r4,
-            "s4": s4,
-            "high": high,
-            "low": low,
-            "close": close,
-            "timestamp": df.index[-2]
-        }
-
     def compute_static_indicators(self):
         """Compute static CPR indicators for all enabled timeframes and store in one structure."""
         try:
@@ -613,7 +479,7 @@ class MYALGO_TRADING_BOT:
         except Exception as e:
             indicators_logger.error(f"❌ Error computing static indicators: {e}", exc_info=True)
     # -------------------------
-    # CPR computation
+    # Get Historical OHLCV 
     # -------------------------
     def get_historical(self, interval="D", lookback=90):
         """
@@ -693,108 +559,64 @@ class MYALGO_TRADING_BOT:
         except Exception as e:
             logger.exception(f"get_historical failed for interval {interval}: {e}")
             return pd.DataFrame()
+    #--------------------------
+    # CPR - Daily, Weekly, Monthly
+    #--------------------------  
+    def compute_cpr(self, df, label: str):
+        """Generic CPR computation used by daily, weekly, monthly methods."""
+        if len(df) < 2:
+            indicators_logger.warning(f"{label} CPR: insufficient bars to compute.")
+            return None
+        prev = df.iloc[-2]
+        high, low, close = prev['high'], prev['low'], prev['close']
+        pivot = (high + low + close) / 3
+        bc = (high + low) / 2
+        tc = 2 * pivot - bc
+        cpr_range = abs(tc - bc)
+        r1 = (2 * pivot) - low
+        s1 = (2 * pivot) - high
+        r2 = pivot + (high - low)
+        s2 = pivot - (high - low)
+        r3 = high + 2 * (pivot - low)
+        s3 = low - 2 * (high - pivot)
+        r4 = r3 + (r2 - r1)
+        s4 = s3 - (s1 - s2)
 
-    def compute_cpr_from_daily(self, df_daily):
-        df = df_daily.copy()
-    
-        # Previous day OHLC
-        df["prev_day_high"] = df["high"].shift(1)
-        df["prev_day_low"] = df["low"].shift(1)
-        df["prev_day_close"] = df["close"].shift(1)
-    
-        # Pivot Point
-        df["Pivot"] = (df["prev_day_high"] + df["prev_day_low"] + df["prev_day_close"]) / 3.0
-    
-        # CPR (Central Pivot Range)
-        df["TC"] = (df["prev_day_high"] + df["prev_day_low"]) / 2.0      # Top Central Pivot
-        df["BC"] = (2.0 * df["Pivot"]) - df["TC"]                        # Bottom Central Pivot
-    
-        # Standard Pivot Levels
-        df["R1"] = (2.0 * df["Pivot"]) - df["prev_day_low"]
-        df["S1"] = (2.0 * df["Pivot"]) - df["prev_day_high"]
-    
-        df["R2"] = df["Pivot"] + (df["prev_day_high"] - df["prev_day_low"])
-        df["S2"] = df["Pivot"] - (df["prev_day_high"] - df["prev_day_low"])
-    
-        # Extended Pivot Levels
-        df["R3"] = df["prev_day_high"] + 2 * (df["Pivot"] - df["prev_day_low"])
-        df["S3"] = df["prev_day_low"] - 2 * (df["prev_day_high"] - df["Pivot"])
-    
-        df["R4"] = df["prev_day_high"] + 3 * (df["Pivot"] - df["prev_day_low"])
-        df["S4"] = df["prev_day_low"] - 3 * (df["prev_day_high"] - df["Pivot"])
+        # Unified log style
+        indicators_logger.info("═══════════════════════")
+        indicators_logger.info(f"📊 {label.upper()} CPR INDICATOR LEVELS (Previous {label.title()} Data)")
+        indicators_logger.info("───────────────────────")
+        if label.upper() == "DAILY":
+            indicators_logger.info(f"Date: {df.index[-2].strftime('%d-%b-%Y')}")
+        elif label.upper() == "WEEKLY":
+            indicators_logger.info(f"Week Start: {df.index[-2].strftime('%d-%b-%Y')}")
+        else:
+            indicators_logger.info(f"Month: {df.index[-2].strftime('%b %Y')}")
+        indicators_logger.info(f"High: {high:.2f} | Low: {low:.2f} | Close: {close:.2f}")
+        indicators_logger.info(f"Pivot: {pivot:.2f} | BC: {bc:.2f} | TC: {tc:.2f}")
+        indicators_logger.info(f"CPR Width: {cpr_range:.2f}")
+        indicators_logger.info(f"R1: {r1:.2f} | R2: {r2:.2f} | R3: {r3:.2f} | R4: {r4:.2f}")
+        indicators_logger.info(f"S1: {s1:.2f} | S2: {s2:.2f} | S3: {s3:.2f} | S4: {s4:.2f}")
+        indicators_logger.info("═══════════════════════")
 
-        return df
-    # -------------------------
-    # Compute static indicators (cached)
-    # -------------------------
-    def compute_static_indicators_old(self):
-        try:
-            indicators_logger.info("=== Computing Static Indicators ===")
-            
-            df_daily = self.get_daily(days=LOOKBACK_DAYS)
-            if df_daily.empty:
-                logger.warning("Daily candle data empty; skipping Static indicators")
-                indicators_logger.error("Failed to fetch daily data - DataFrame is empty")
-                return False
-            
-            indicators_logger.info(f"Fetched {len(df_daily)} days of daily data for CPR computation")
-            
-            df_cpr = self.compute_cpr_from_daily(df_daily)
-            today_row = df_cpr.iloc[-1]
-            
-            # Extract all values for detailed logging
-            prev_day_high = float(today_row.get("prev_day_high", 0.0))
-            prev_day_low = float(today_row.get("prev_day_low", 0.0))
-            prev_day_close = float(today_row.get("prev_day_close", 0.0))
-            
-            cpr_pivot = float(today_row.get("Pivot", 0.0))
-            cpr_tc = float(today_row.get("TC", 0.0))
-            cpr_bc = float(today_row.get("BC", 0.0))
-            cpr_r1 = float(today_row.get("R1", 0.0))
-            cpr_r2 = float(today_row.get("R2", 0.0))
-            cpr_r3 = float(today_row.get("R3", 0.0))
-            cpr_r4 = float(today_row.get("R4", 0.0))
-            cpr_s1 = float(today_row.get("S1", 0.0))
-            cpr_s2 = float(today_row.get("S2", 0.0))
-            cpr_s3 = float(today_row.get("S3", 0.0))
-            cpr_s4 = float(today_row.get("S4", 0.0))
-            
-            self.static_indicators = {
-                "date": date.today(),
-                "prev_day_high": prev_day_high,
-                "prev_day_low": prev_day_low,
-                "prev_day_close": prev_day_close,
-                "cpr": {
-                    "pivot": cpr_pivot,
-                    "tc": cpr_tc,
-                    "bc": cpr_bc,
-                    "r1": cpr_r1,
-                    "r2": cpr_r2,
-                    "r3": cpr_r3,
-                    "r4": cpr_r4,
-                    "s1": cpr_s1,
-                    "s2": cpr_s2,
-                    "s3": cpr_s3,
-                    "s4": cpr_s4
-                }
-            }
-            self.static_indicators_date = date.today()
-            
-            # Comprehensive logging of all computed indicators
-            indicators_logger.info("=== Static Indicators Computed Successfully ===")
-            indicators_logger.info(f"Date: {self.static_indicators_date}")
-            indicators_logger.info(f"Previous Day OHLC: High={prev_day_high:.2f}, Low={prev_day_low:.2f}, Close={prev_day_close:.2f}")
-            indicators_logger.info(f"CPR Levels: Pivot={cpr_pivot:.2f}, TC={cpr_tc:.2f}, BC={cpr_bc:.2f}")
-            indicators_logger.info(f"Resistance Levels: R1={cpr_r1:.2f}, R2={cpr_r2:.2f}")
-            indicators_logger.info(f"Support Levels: S1={cpr_s1:.2f}, S2={cpr_s2:.2f}")
-            indicators_logger.info(f"CPR Width: {abs(cpr_tc - cpr_bc):.2f} points")
-            
-            logger.info("Static daily indicators computed for %s", self.static_indicators_date)
-            return True
-        except Exception:
-            logger.exception("compute_static_indicators failed")
-            indicators_logger.error("Failed to compute daily indicators", exc_info=True)
-            return False
+        return {
+            "pivot": pivot,
+            "bc": bc,
+            "tc": tc,
+            "cpr_range": cpr_range,
+            "r1": r1,
+            "s1": s1,
+            "r2": r2,
+            "s2": s2,
+            "r3": r3,
+            "s3": s3,
+            "r4": r4,
+            "s4": s4,
+            "high": high,
+            "low": low,
+            "close": close,
+            "timestamp": df.index[-2]
+        }
     # -------------------------
     # Dynamic indicators (every current candle timeframe)
     # -------------------------
