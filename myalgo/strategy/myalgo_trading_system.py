@@ -17,7 +17,7 @@
   - Entry Conditions: EMA-based (close > EMA9, simplified from complex multi-condition)
   - Exit Conditions: EMA crossover (close < EMA20 for BUY, close > EMA20 for SELL)
   - Signal Processing: 1-minute interval checks via APScheduler
-  - Daily Indicators: CPR computation with previous day OHLC
+  - Static Indicators: CPR computation with previous day, weekly, monthly OHLC
 
   4. Order Management
   - Market orders via OpenAlgo API
@@ -144,8 +144,8 @@ class MYALGO_TRADING_BOT:
         self.running = True
         self.stop_event = threading.Event()
         self.instrument = [{"exchange": EXCHANGE, "symbol": SYMBOL}]
-        self.daily_indicators = None
-        self.daily_indicators_date = None
+        self.static_indicators = None
+        self.static_indicators_date = None
         self.current_day_high = None
         self.current_day_low = None
         self.trade_count = 0
@@ -188,9 +188,9 @@ class MYALGO_TRADING_BOT:
                 return
 
             # Ensure static daily indicators are present and fresh
-            if not self.daily_indicators or self.daily_indicators_date != date.today():
+            if not self.static_indicators or self.static_indicators_date != date.today():
                 # precompute once
-                ok = self.compute_daily_indicators()
+                ok = self.compute_static_indicators()
                 if not ok:
                     logger.warning("Daily indicators missing — skipping this tick")
                     return
@@ -443,11 +443,13 @@ class MYALGO_TRADING_BOT:
         except Exception:
             logger.exception("get_intraday failed")
             return pd.DataFrame()
-
-    def get_daily(self, days=LOOKBACK_DAYS):
+    # -------------------------
+    # Daily Candle Data fetchers
+    # -------------------------
+    def get_daily(self, lookback=3):
         try:
             end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
+            start_date = end_date - timedelta(days=lookback)
             raw = self.client.history(symbol=SYMBOL, exchange=EXCHANGE, interval="D",
                                       start_date=start_date.strftime("%Y-%m-%d"), end_date=end_date.strftime("%Y-%m-%d"))
             if isinstance(raw, pd.DataFrame):
@@ -463,32 +465,275 @@ class MYALGO_TRADING_BOT:
         except Exception:
             logger.exception("get_daily failed")
             return pd.DataFrame()
+
+    def get_historical(self, interval="D", lookback=3):
+        """
+        Dynamic reusable function to fetch historical OHLC data for any timeframe.
+        Works for: 'D' (Daily), 'W' (Weekly), 'M' (Monthly)
+        """
+        try:
+            end_date = datetime.now()
+            if interval == "5m":
+                start_date = end_date - timedelta(days=lookback)
+            elif interval == "D":
+                start_date = end_date - timedelta(days=lookback)
+            elif interval == "W":
+                start_date = end_date - timedelta(weeks=lookback)
+            elif interval == "M":
+                tart_date = end_date - timedelta(days=lookback * 30)
+            else:
+                raise ValueError(f"Unsupported interval: {interval}")
+
+            raw = self.client.history(
+                symbol=SYMBOL,
+                exchange=EXCHANGE,
+                interval=interval,
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d")
+                )
+
+            # Normalize to DataFrame
+            if isinstance(raw, pd.DataFrame):
+                df = raw.copy()
+            elif isinstance(raw, dict) and "data" in raw:
+                df = pd.DataFrame(raw["data"])
+            else:
+                df = pd.DataFrame()
+
+            # Type coercion for numeric fields
+            for c in ["open", "high", "low", "close", "volume"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+            # Convert timestamp to datetime index if available
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                df.set_index("timestamp", inplace=True)
+
+            # Logging summary
+            indicators_logger.info(
+                f"[HISTORICAL] Interval:{interval} | Records:{len(df)} | "
+                f"Range:{start_date.strftime('%d-%b-%Y')} → {end_date.strftime('%d-%b-%Y')}"
+            )
+
+            return df
+
+        except Exception:
+            logger.exception(f"get_historical failed for interval {interval}")
+            return pd.DataFrame()
+
+    def compute_cpr(self, df, label: str):
+        """Generic CPR computation used by daily, weekly, monthly methods."""
+        if len(df) < 2:
+            indicators_logger.warning(f"{label} CPR: insufficient bars to compute.")
+            return None
+        prev = df.iloc[-2]
+        high, low, close = prev['high'], prev['low'], prev['close']
+        pivot = (high + low + close) / 3
+        bc = (high + low) / 2
+        tc = 2 * pivot - bc
+        cpr_range = abs(tc - bc)
+        r1 = (2 * pivot) - low
+        s1 = (2 * pivot) - high
+        r2 = pivot + (high - low)
+        s2 = pivot - (high - low)
+        r3 = high + 2 * (pivot - low)
+        s3 = low - 2 * (high - pivot)
+        r4 = r3 + (r2 - r1)
+        s4 = s3 - (s1 - s2)
+
+        # Unified log style
+        indicators_logger.info("═══════════════════════")
+        indicators_logger.info(f"📊 {label.upper()} CPR INDICATOR LEVELS (Previous {label.title()} Data)")
+        indicators_logger.info("───────────────────────")
+        if label.upper() == "DAILY":
+            indicators_logger.info(f"Date: {df.index[-2].strftime('%d-%b-%Y')}")
+        elif label.upper() == "WEEKLY":
+            indicators_logger.info(f"Week Start: {df.index[-2].strftime('%d-%b-%Y')}")
+        else:
+            indicators_logger.info(f"Month: {df.index[-2].strftime('%b %Y')}")
+        indicators_logger.info(f"High: {high:.2f} | Low: {low:.2f} | Close: {close:.2f}")
+        indicators_logger.info(f"Pivot: {pivot:.2f} | BC: {bc:.2f} | TC: {tc:.2f}")
+        indicators_logger.info(f"CPR Width: {cpr_range:.2f}")
+        indicators_logger.info(f"R1: {r1:.2f} | R2: {r2:.2f} | R3: {r3:.2f} | R4: {r4:.2f}")
+        indicators_logger.info(f"S1: {s1:.2f} | S2: {s2:.2f} | S3: {s3:.2f} | S4: {s4:.2f}")
+        indicators_logger.info("═══════════════════════")
+
+        return {
+            "pivot": pivot,
+            "bc": bc,
+            "tc": tc,
+            "cpr_range": cpr_range,
+            "r1": r1,
+            "s1": s1,
+            "r2": r2,
+            "s2": s2,
+            "r3": r3,
+            "s3": s3,
+            "r4": r4,
+            "s4": s4,
+            "high": high,
+            "low": low,
+            "close": close,
+            "timestamp": df.index[-2]
+        }
+
+    def compute_static_indicators(self):
+        """Compute static CPR indicators for all enabled timeframes and store in one structure."""
+        try:
+            self.static_indicators = {}
+            indicators_logger.info("════════════════════════════")
+            indicators_logger.info("🔁 INITIALIZING MULTI-TIMEFRAME CPR COMPUTATION")
+            indicators_logger.info(f"Enabled CPR Timeframes: {', '.join(CPR)}")
+            indicators_logger.info("════════════════════════════")
+
+            # DAILY CPR
+            if 'DAILY' in CPR:
+                dfdaily = self.get_historical("D",lookback=3)
+                self.static_indicators['DAILY'] = self.compute_cpr(dfdaily, "DAILY")
+                self.static_indicators_date = date.today()
+            # WEEKLY CPR
+            if 'WEEKLY' in CPR:
+                dfweekly = self.get_historical("W",lookback=20)
+                self.static_indicators['WEEKLY'] = self.compute_cpr(dfweekly, "WEEKLY")
+            # MONTHLY CPR
+            if 'MONTHLY' in CPR:
+                dfmonthly = self.get_historical("M",lookback=70)
+                self.static_indicators['MONTHLY'] = self.compute_cpr(dfmonthly, "MONTHLY")
+            # Combined summary
+            indicators_logger.info("═══════════════════════")
+            indicators_logger.info("📘 CPR SUMMARY OVERVIEW (All Active Timeframes)")
+            for key, val in self.static_indicators.items():
+                if val:
+                    indicators_logger.info(
+                        f"{key:<8} | Pivot:{val['pivot']:.2f} | BC:{val['bc']:.2f} | TC:{val['tc']:.2f} | Width:{val['cpr_range']:.2f}"
+                    )
+            indicators_logger.info("═══════════════════════")
+
+        except Exception as e:
+            indicators_logger.error(f"❌ Error computing static indicators: {e}", exc_info=True)
     # -------------------------
     # CPR computation
     # -------------------------
+    def get_historical(self, interval="D", lookback=90):
+        """
+        Dynamic reusable function to fetch historical OHLC data for any timeframe.
+        Supports '5m', 'D' (Daily), 'W' (Weekly), 'M' (Monthly)
+        Weekly and Monthly bars are computed by resampling Daily data.
+        """
+        try:
+            end_date = datetime.now()
+
+            # Determine start_date range
+            if interval == "5m":
+                start_date = end_date - timedelta(days=lookback)
+            elif interval in ["D", "W", "M"]:
+                start_date = end_date - timedelta(days=lookback)
+            else:
+                raise ValueError(f"Unsupported interval: {interval}")
+
+            # Fetch base data (OpenAlgo supports up to daily)
+            raw = self.client.history(
+                symbol=SYMBOL,
+                exchange=EXCHANGE,
+                interval="D",   # ✅ always fetch daily for higher aggregation
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d")
+                )
+
+            # Normalize DataFrame
+            if isinstance(raw, pd.DataFrame):
+                df = raw.copy()
+            elif isinstance(raw, dict) and "data" in raw:
+                df = pd.DataFrame(raw["data"])
+            else:
+                df = pd.DataFrame()
+
+            if df.empty:
+                indicators_logger.warning(f"No data received for {SYMBOL} {EXCHANGE} {interval}")
+                return df
+
+            # Coerce data types
+            for c in ["open", "high", "low", "close", "volume"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+            # Set timestamp index
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                df.set_index("timestamp", inplace=True)
+                df.sort_index(inplace=True)
+
+            # --- Resampling for Weekly and Monthly ---
+            if interval == "W":
+                df = df.resample("W").agg({
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum"
+                }).dropna()
+            elif interval == "M":
+                df = df.resample("M").agg({
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum"
+                }).dropna()
+
+            # Logging summary
+            indicators_logger.info(
+                f"[HISTORICAL] Interval:{interval} | Records:{len(df)} | "
+                f"Range:{df.index.min().strftime('%d-%b-%Y')} → {df.index.max().strftime('%d-%b-%Y')}"
+            )
+
+            return df
+
+        except Exception as e:
+            logger.exception(f"get_historical failed for interval {interval}: {e}")
+            return pd.DataFrame()
+
     def compute_cpr_from_daily(self, df_daily):
         df = df_daily.copy()
+    
+        # Previous day OHLC
         df["prev_day_high"] = df["high"].shift(1)
         df["prev_day_low"] = df["low"].shift(1)
         df["prev_day_close"] = df["close"].shift(1)
+    
+        # Pivot Point
         df["Pivot"] = (df["prev_day_high"] + df["prev_day_low"] + df["prev_day_close"]) / 3.0
-        df["TC"] = (df["prev_day_high"] + df["prev_day_low"]) / 2.0
-        df["BC"] = (2.0 * df["Pivot"]) - df["TC"]
-        df["R1"] = 2.0 * df["Pivot"] - df["prev_day_low"]
+    
+        # CPR (Central Pivot Range)
+        df["TC"] = (df["prev_day_high"] + df["prev_day_low"]) / 2.0      # Top Central Pivot
+        df["BC"] = (2.0 * df["Pivot"]) - df["TC"]                        # Bottom Central Pivot
+    
+        # Standard Pivot Levels
+        df["R1"] = (2.0 * df["Pivot"]) - df["prev_day_low"]
+        df["S1"] = (2.0 * df["Pivot"]) - df["prev_day_high"]
+    
         df["R2"] = df["Pivot"] + (df["prev_day_high"] - df["prev_day_low"])
-        df["S1"] = 2.0 * df["Pivot"] - df["prev_day_high"]
         df["S2"] = df["Pivot"] - (df["prev_day_high"] - df["prev_day_low"])
+    
+        # Extended Pivot Levels
+        df["R3"] = df["prev_day_high"] + 2 * (df["Pivot"] - df["prev_day_low"])
+        df["S3"] = df["prev_day_low"] - 2 * (df["prev_day_high"] - df["Pivot"])
+    
+        df["R4"] = df["prev_day_high"] + 3 * (df["Pivot"] - df["prev_day_low"])
+        df["S4"] = df["prev_day_low"] - 3 * (df["prev_day_high"] - df["Pivot"])
+
         return df
     # -------------------------
-    # Daily static indicators (cached)
+    # Compute static indicators (cached)
     # -------------------------
-    def compute_daily_indicators(self):
+    def compute_static_indicators_old(self):
         try:
-            indicators_logger.info("=== Computing Daily Indicators ===")
+            indicators_logger.info("=== Computing Static Indicators ===")
             
             df_daily = self.get_daily(days=LOOKBACK_DAYS)
             if df_daily.empty:
-                logger.warning("Daily data empty; skipping daily indicators")
+                logger.warning("Daily candle data empty; skipping Static indicators")
                 indicators_logger.error("Failed to fetch daily data - DataFrame is empty")
                 return False
             
@@ -507,10 +752,14 @@ class MYALGO_TRADING_BOT:
             cpr_bc = float(today_row.get("BC", 0.0))
             cpr_r1 = float(today_row.get("R1", 0.0))
             cpr_r2 = float(today_row.get("R2", 0.0))
+            cpr_r3 = float(today_row.get("R3", 0.0))
+            cpr_r4 = float(today_row.get("R4", 0.0))
             cpr_s1 = float(today_row.get("S1", 0.0))
             cpr_s2 = float(today_row.get("S2", 0.0))
+            cpr_s3 = float(today_row.get("S3", 0.0))
+            cpr_s4 = float(today_row.get("S4", 0.0))
             
-            self.daily_indicators = {
+            self.static_indicators = {
                 "date": date.today(),
                 "prev_day_high": prev_day_high,
                 "prev_day_low": prev_day_low,
@@ -521,25 +770,29 @@ class MYALGO_TRADING_BOT:
                     "bc": cpr_bc,
                     "r1": cpr_r1,
                     "r2": cpr_r2,
+                    "r3": cpr_r3,
+                    "r4": cpr_r4,
                     "s1": cpr_s1,
                     "s2": cpr_s2,
+                    "s3": cpr_s3,
+                    "s4": cpr_s4
                 }
             }
-            self.daily_indicators_date = date.today()
+            self.static_indicators_date = date.today()
             
             # Comprehensive logging of all computed indicators
-            indicators_logger.info("=== Daily Indicators Computed Successfully ===")
-            indicators_logger.info(f"Date: {self.daily_indicators_date}")
+            indicators_logger.info("=== Static Indicators Computed Successfully ===")
+            indicators_logger.info(f"Date: {self.static_indicators_date}")
             indicators_logger.info(f"Previous Day OHLC: High={prev_day_high:.2f}, Low={prev_day_low:.2f}, Close={prev_day_close:.2f}")
             indicators_logger.info(f"CPR Levels: Pivot={cpr_pivot:.2f}, TC={cpr_tc:.2f}, BC={cpr_bc:.2f}")
             indicators_logger.info(f"Resistance Levels: R1={cpr_r1:.2f}, R2={cpr_r2:.2f}")
             indicators_logger.info(f"Support Levels: S1={cpr_s1:.2f}, S2={cpr_s2:.2f}")
             indicators_logger.info(f"CPR Width: {abs(cpr_tc - cpr_bc):.2f} points")
             
-            logger.info("Static daily indicators computed for %s", self.daily_indicators_date)
+            logger.info("Static daily indicators computed for %s", self.static_indicators_date)
             return True
         except Exception:
-            logger.exception("compute_daily_indicators failed")
+            logger.exception("compute_static_indicators failed")
             indicators_logger.error("Failed to compute daily indicators", exc_info=True)
             return False
     # -------------------------
@@ -779,14 +1032,15 @@ class MYALGO_TRADING_BOT:
             ema200 = float(dyn.get("EMA_200", 0.0))
 
             # static daily
-            if not self.daily_indicators:
+            if not self.static_indicators:
                 signal_logger.error("Daily indicators not available for signal evaluation")
                 return None
-            cpr_r1 = float(self.daily_indicators.get("cpr", {}).get("r1", 0.0))
-            cpr_s1 = float(self.daily_indicators.get("cpr", {}).get("s1", 0.0))
-            prev_day_high = float(self.daily_indicators.get("prev_day_high", 0.0))
-            prev_day_low = float(self.daily_indicators.get("prev_day_low", 0.0))
-
+            cpr_r1 = float(self.static_indicators.get("DAILY", {}).get("r1", 0.0))
+            cpr_s1 = float(self.static_indicators.get("DAILY", {}).get("s1", 0.0))
+            # prev_day_high = float(self.static_indicators.get("prev_day_high", 0.0))
+            # prev_day_low = float(self.static_indicators.get("prev_day_low", 0.0))
+            prev_day_high = float(self.static_indicators.get("DAILY", {}).get("high",0.0))
+            prev_day_low = float(self.static_indicators.get("DAILY", {}).get("low",0.0))
             # Log all key values for signal evaluation
             signal_logger.info(f"Signal Evaluation Data:")
             signal_logger.info(f"  Current Candle: Open={open_:.2f}, Close={close:.2f}")
@@ -1252,20 +1506,23 @@ class MYALGO_TRADING_BOT:
                 return False
                 
             # Get current LTP and P&L for logging
-            current_ltp = self.ltp if self.ltp else 0.0
+            spot_ltp = self.ltp if self.ltp else 0.0
+            option_ltp = self.option_ltp if self.ltp else 0.0
             
             # Calculate P&L before exit
             if self.position == "BUY":
-                unrealized_pnl = (current_ltp - self.entry_price) * QUANTITY
+                unrealized_pnl = (option_ltp - self.option_entry_price) * QUANTITY
             else:
-                unrealized_pnl = (self.entry_price - current_ltp) * QUANTITY
+                unrealized_pnl = (self.option_entry_price - option_ltp) * QUANTITY
                 
             # Calculate trade duration
             trade_start = getattr(self, 'trade_start_time', datetime.now())
             trade_duration = datetime.now() - trade_start
             
-            order_logger.info(f"Current Position: {self.position} @ {self.entry_price:.2f}")
-            order_logger.info(f"Current LTP: {current_ltp:.2f}")
+            order_logger.info(f"Trade Spot Position: {self.position} @ {self.spot_entry_price:.2f}")
+            order_logger.info(f"Current Spot LTP: {spot_ltp:.2f}")
+            order_logger.info(f"Trade Option Position: {self.position} @ {self.option_entry_price:.2f}")
+            order_logger.info(f"Current Option LTP: {option_ltp:.2f}")
             order_logger.info(f"Unrealized P&L: {unrealized_pnl:.2f}")
             order_logger.info(f"Trade Duration: {trade_duration}")
             
@@ -1304,7 +1561,7 @@ class MYALGO_TRADING_BOT:
                     
                     # Comprehensive trade summary
                     order_logger.info("=== TRADE COMPLETED ===")
-                    order_logger.info(f"Spot Entry: {self.position} @ {self.entry_price:.2f}")
+                    order_logger.info(f"Spot Entry: {self.position} @ {self.spot_entry_price:.2f}")
                     order_logger.info(f"Spot Exit: {action} @ {exit_price:.2f}")
                     order_logger.info(f"Option Entry: {self.position} @ {self.option_entry_price:.2f}")
                     order_logger.info(f"Option Exit: {action} @ {self.option_ltp:.2f}")
