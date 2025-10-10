@@ -1,42 +1,10 @@
 # myalgo_trading_system.py
-"""
-1. Initialization & Configuration
-  - Read all global config
-  - OpenAlgo client setup with API key and WebSocket URL
-  - Dynamic Risk parameters: Stoploss, Target, Max trades=3/day
-  - Option trading: NIFTY, NFO exchange, 75 quantity, ATM strikes
-  - Enhanced SL/TP method: "Signal_candle_range_SL_TP" with TSL enabled
-
-  2. Real-time Data Processing
-  - WebSocket thread: Live LTP updates with comprehensive position monitoring
-  - Quote mode subscription for high/low tracking
-  - Dual tracking modes: spot LTP vs option LTP for SL/TP
-  - Real-time P&L calculation and distance monitoring
-
-  3. Strategy Logic
-  - Entry Conditions: EMA-based (close > EMA9, simplified from complex multi-condition)
-  - Exit Conditions: EMA crossover (close < EMA20 for BUY, close > EMA20 for SELL)
-  - Signal Processing: 1-minute interval checks via APScheduler
-  - Static Indicators: CPR computation with previous day, weekly, monthly OHLC
-
-  4. Order Management
-  - Market orders via OpenAlgo API
-  - Option symbol resolution: ATM strike selection, weekly expiry
-  - Multi-leg capability for options (CE/PE based on signal)
-  - Order execution confirmation with price verification
-
-  5. Risk Management
-  - Signal Candle Range SL/TP: Uses signal candle high/low for dynamic levels
-  - Trailing Stop Loss: Multi-level advancement (breakeven → previous TP)
-  - Position Monitoring: Real-time via WebSocket with immediate exit triggers
-  - Daily Limits: Auto-shutdown at max trades
-
-  6. Advanced Features
-  - Option Strike Resolution: ATM/ITM/OTM/percentage-based selection
-  - Expiry Management: Automatic weekly expiry detection
-  - Symbol Search: API-based option symbol resolution
-  - State Synchronization: Thread-safe position updates
-"""
+from sqlalchemy import true
+from sqlalchemy.sql.functions import now
+from dataclasses import dataclass
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker
+import logging
 from openalgo import api
 import pandas as pd
 from datetime import datetime, timedelta, date
@@ -48,14 +16,32 @@ from apscheduler.triggers.cron import CronTrigger
 import pytz
 import re
 import sys
+from dataclasses import dataclass
 import os
-import math
+import argparse
+
+from typing import Dict, List, Optional
+
 # ----------------------------
 # Configuration
 # ----------------------------
 API_KEY = "112c4900f6b2d83b7d812921de13d36898116fd79a592d96cec666dfbbc389f8"
 API_HOST = "http://127.0.0.1:5000"
 WS_URL = "ws://127.0.0.1:8765"
+
+client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL)
+
+# Speed multiplier for simulation:
+
+SIMULATION_DATE: str | None = None  # e.g. "2025-06-02" for simulation, None for live  #1.0  = real time
+SIMULATION_SPEED_MULTIPLIER: float = 60.0
+
+_simulation_state = {
+    "start_real_time": None,
+    "start_simulated_time": None,
+    "last_replayed_time": None,
+    "replay_running": False
+}
 
 # Instrument
 SYMBOL = "NIFTY"
@@ -89,15 +75,23 @@ STRIKE_INTERVAL = 50
 OPTION_EXPIRY_TYPE = "WEEKLY"
 OPTION_STRIKE_SELECTION = "ATM"  # "ATM", "ITM1", "OTM2", etc.
 EXPIRY_LOOKAHEAD_DAYS = 30
-QUANTITY = 75
-LOT = 1
+LOT_QUANTITY =75
+LOT = 2
+QUANTITY = LOT * LOT_QUANTITY
+
+# Websocket CONSTANTS
+HEARTBEAT_INTERVAL = 10        # seconds
+OPTION_POLL_INTERVAL = 1.0     # seconds (or higher if rate-limited)
+RECONNECT_BASE = 1.0           # seconds
+RECONNECT_MAX = 60.0           # seconds
+
 
 # Stoploss/Target tracking configuration
 USE_SPOT_FOR_SLTP = True      # If True → uses spot price for SL/TP tracking
 USE_OPTION_FOR_SLTP = False   # If True → uses option position LTP for SL/TP tracking
 
 # SL/TP Enhancement config
-SL_TP_METHOD = "Signal_candle_range_SL_TP" # current active method
+SL_TP_METHOD = "Signal_candle_range_SL_TP" # current active method #CPR_range_SL_TP #Signal_candle_range_SL_TP
 TSL_ENABLED = True # enable trailing stoploss behavior
 TSL_METHOD = "TSL_Signal_candle_range" # trailing method for this enhancement
 
@@ -123,6 +117,197 @@ data_logger = get_logger("market_data")
 # Keep original logger for backward compatibility
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("FixedSignalBot")
+
+# =========================================================
+# 📘 SQLAlchemy Dataclass Setup for Trade Logging
+# =========================================================
+
+Base = declarative_base()
+
+@dataclass
+class TradeLog(Base):
+    __tablename__ = "my_trade_logs"
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp: datetime = Column(DateTime, default=datetime.now)
+    instrument: str = Column(String(50), default=SYMBOL),
+    spot_price: str = Column(String(50))
+    symbol: str = Column(String(50))
+    action: str = Column(String(10))
+    quantity: float = Column(Float)
+    price: float = Column(Float)
+    order_id: str = Column(String(50))
+    strategy: str = Column(String(50))
+    leg_type: str = Column(String(20))
+    reason: str = Column(String(200), nullable=True)
+    pnl: float = Column(Float, default=0.0)
+    leg_status: str = Column(String(20), default="open")
+
+# ✅ Proper engine and session setup
+DB_PATH = os.path.join(os.getcwd(), "myalgo.db")
+engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+
+# Create tables once at initialization
+Base.metadata.create_all(engine)
+# ----------------------------
+# Database Logging Utility
+# ----------------------------
+def log_trade_db(trade_data: dict):
+    """Persist trade details (entry/exit) to SQLite via SQLAlchemy ORM."""
+    session = SessionLocal()
+    try:
+        record = TradeLog(**trade_data)
+        session.add(record)
+        session.commit()
+        print(f"✅ Trade logged: {trade_data['symbol']} | {trade_data['action']} @ {trade_data['price']}")
+    except Exception as e:
+        print(f"⚠️ DB Logging Error: {e}")
+        session.rollback()
+    finally:
+        session.close()
+
+# =========================================================
+# 🔹 CPR / Pivot Utility Functions
+# =========================================================        
+def merge_pivot_levels(pivots: Dict[str, Dict[str, float]]) -> List[float]:
+    vals = set()
+    for period, mapping in (pivots or {}).items():
+        if not isinstance(mapping, dict):
+            continue
+        for k, v in mapping.items():
+            try:
+                vals.add(float(v))
+            except Exception:
+                continue
+    return sorted(vals)
+
+def expand_with_midpoints(levels: List[float]) -> List[float]:
+    if not levels:
+        return []
+    mids = [(levels[i] + levels[i + 1]) / 2.0 for i in range(len(levels) - 1)]
+    return sorted(set(levels + mids))
+
+def get_nearest_level_above(price: float, levels: List[float]) -> Optional[float]:
+    return next((lvl for lvl in sorted(levels) if lvl > price), None)
+
+def get_nearest_level_below(price: float, levels: List[float]) -> Optional[float]:
+    return next((lvl for lvl in sorted(levels, reverse=True) if lvl < price), None)
+# ----------------------------
+# CLI Parser
+# ----------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run MYALGO_TRADING_BOT with optional simulation mode")
+    parser.add_argument("--simulate", type=str, default=None, help="Date (YYYY-MM-DD) for simulation mode")
+    parser.add_argument("--speed", type=float, default=60.0, help="Speed multiplier for replay (default 60x)")
+    return parser.parse_args()
+# ----------------------------
+# Time helper (simulation aware)
+# ----------------------------
+def now() -> datetime:
+    if not SIMULATION_DATE or not _simulation_state["replay_running"]:
+        return datetime.now(IST)
+
+    if _simulation_state["last_replayed_time"] is not None:
+        return _simulation_state["last_replayed_time"]
+
+    start_real = _simulation_state["start_real_time"]
+    start_sim = _simulation_state["start_simulated_time"]
+    if not start_real or not start_sim:
+        return datetime.now(IST)
+
+    elapsed_real = datetime.now(IST) - start_real
+    elapsed_sim = timedelta(seconds=elapsed_real.total_seconds() * SIMULATION_SPEED_MULTIPLIER)
+    return (start_sim + elapsed_sim).astimezone(IST)
+# ----------------------------
+# Intraday data wrapper
+# ----------------------------
+def get_intraday(symbol: str, exchange: str, interval: str = "1m", start_date: str | None = None, end_date: str | None = None):
+    if SIMULATION_DATE and not start_date and not end_date:
+        start_date = end_date = SIMULATION_DATE
+    elif not start_date or not end_date:
+        raise ValueError("start_date and end_date must be provided when not simulating")
+
+    df = client.history(symbol=symbol, exchange=exchange, interval=interval, start_date=start_date, end_date=end_date)
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(IST)
+    else:
+        df.index = df.index.tz_convert(IST)
+    return df
+
+class ReplayWebsocket:
+    def __init__(self, client_api, simulation_date: str, speed_multiplier: float = 60.0):
+        self.client_api = client_api
+        self.simulation_date = simulation_date
+        self.speed_multiplier = speed_multiplier
+        self._stop = threading.Event()
+        self._thread = None
+        self._callbacks = {}
+        self._subscriptions = []
+
+    def connect(self):
+        print(f"[ReplayWebsocket] Connected (simulation {self.simulation_date})")
+
+    def subscribe_ltp(self, instruments_list, on_data_received):
+        for inst in instruments_list:
+            key = f"{inst['exchange']}:{inst['symbol']}"
+            self._callbacks[key] = on_data_received
+            self._subscriptions.append(inst)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        if not self._subscriptions:
+            return
+        inst = self._subscriptions[0]
+        df = get_intraday(inst["symbol"], inst["exchange"], "1m", start_date=self.simulation_date, end_date=self.simulation_date)
+        df = df.sort_index()
+
+        _simulation_state["start_real_time"] = datetime.now(IST)
+        _simulation_state["start_simulated_time"] = df.index[0]
+        _simulation_state["replay_running"] = True
+
+        for ts, row in df.iterrows():
+            if self._stop.is_set():
+                break
+            msg = {
+                "type": "market_data",
+                "symbol": inst["symbol"],
+                "exchange": inst["exchange"],
+                "mode": 1,
+                "data": {
+                    "ltp": float(row.close),
+                    "open": float(row.open),
+                    "high": float(row.high),
+                    "low": float(row.low),
+                    "close": float(row.close),
+                    "volume": float(row.volume),
+                    "timestamp": int(ts.timestamp() * 1000),
+                }
+            }
+            key = f"{inst['exchange']}:{inst['symbol']}"
+            _simulation_state["last_replayed_time"] = ts
+            cb = self._callbacks.get(key)
+            if cb:
+                try:
+                    cb(msg)
+                except Exception as e:
+                    print(f"[ReplayWebsocket] Callback error: {e}")
+            time.sleep(60 / SIMULATION_SPEED_MULTIPLIER)
+
+        print("[ReplayWebsocket] Completed replay")
+        _simulation_state["replay_running"] = False
+
+    def unsubscribe_ltp(self, instruments_list):
+        self._stop.set()
+
+    def disconnect(self):
+        self._stop.set()
+        print("[ReplayWebsocket] Disconnected simulation")
 # ----------------------------
 # MyAlgo Trdaing System
 # ----------------------------
@@ -131,7 +316,7 @@ class MYALGO_TRADING_BOT:
     # Initialization
     # -------------------------
     def __init__(self):
-        self.client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL)
+        self.client = None
         self.position = None
         self.entry_price = 0.0
         self.stoploss_price = 0.0
@@ -155,12 +340,71 @@ class MYALGO_TRADING_BOT:
         self.trailing_index = 0
         self._state_lock = threading.Lock() # state lock to avoid race between entry placement and websocket LTP handling
         logger.info("Bot initialized")
-        logger.info("Bot initialized")
         main_logger.info("=== MyAlgo Trading Bot Initialized ===")
         main_logger.info(f"Strategy: {STRATEGY} | Symbol: {SYMBOL} | Timeframe: {CANDLE_TIMEFRAME}")
         main_logger.info(f"Risk Management: SL={STOPLOSS}, TP={TARGET} | Max Trades: {MAX_TRADES_PER_DAY}")
         main_logger.info(f"Options Enabled: {OPTION_ENABLED} | Strike Selection: {OPTION_STRIKE_SELECTION}")
         main_logger.info(f"Signal Check Interval: {SIGNAL_CHECK_INTERVAL} minutes")
+
+        if SIMULATION_DATE:
+            print(f"[MYALGO_TRADING_BOT] Simulation mode active for {SIMULATION_DATE}")
+            self.client = ReplayWebsocket(client_api=client, simulation_date=SIMULATION_DATE, speed_multiplier=SIMULATION_SPEED_MULTIPLIER)
+        else:
+            print("[MYALGO_TRADING_BOT] Live mode active")
+            self.client = client
+
+    def on_data_received(self, data):
+        ts = datetime.fromtimestamp(data["data"]["timestamp"] / 1000, tz=IST)
+        ltp = data["data"].get("ltp")
+        print(f"[{ts}] LTP={ltp}")
+    # =========================================================
+    # 💰 Auto PnL Reconciliation Helper
+    # =========================================================
+    def reconcile_trade_pnl(self, exit_trade: dict):
+        """
+        Auto-match exit order with last open entry and update realized PnL.
+        Called automatically when exit order is placed.
+        """
+        try:
+            session = SessionLocal()
+            symbol = exit_trade.get("symbol")
+            strategy = exit_trade.get("strategy")
+
+            # Find last open entry for same symbol + strategy
+            open_leg = (
+                session.query(TradeLog)
+                .filter(TradeLog.symbol == symbol)
+                .filter(TradeLog.strategy == strategy)
+                .filter(TradeLog.leg_status == "open")
+                .order_by(TradeLog.id.desc())
+                .first()
+            )
+
+            if open_leg:
+                exit_price = float(exit_trade.get("price", 0))
+                entry_price = float(open_leg.price or 0)
+                qty = float(exit_trade.get("quantity", 0))
+
+                # Calculate PnL (for long vs short)
+                if open_leg.action.upper() == "CALL":
+                    pnl = (exit_price - entry_price) * qty
+                else:
+                    pnl = (entry_price - exit_price) * qty
+
+                open_leg.pnl = pnl
+                open_leg.leg_status = "closed"
+                session.commit()
+
+                order_logger.info(
+                    f"💰 Trade reconciled: {symbol} | Entry:{entry_price:.2f} | Exit:{exit_price:.2f} | Qty:{qty} | PnL:{pnl:.2f}"
+                )
+            else:
+                order_logger.warning(f"No open leg found for {symbol} ({strategy}) to reconcile.")
+
+            session.close()
+
+        except Exception as e:
+            order_logger.error(f"❌ PnL reconciliation failed: {e}", exc_info=True)
     # -------------------------
     # Scheduler & Strategy job
     # -------------------------
@@ -180,7 +424,7 @@ class MYALGO_TRADING_BOT:
         """Main scheduled job — runs aligned to timeframe close calls."""
         try:
             # If reached daily trade limit, initiate graceful shutdown and skip signals
-            if self.trade_count >= MAX_TRADES_PER_DAY:
+            if not self.position and self.trade_count >= MAX_TRADES_PER_DAY:
                 logger.info("Max trades reached (%d). Initiating graceful shutdown.", MAX_TRADES_PER_DAY)
                 self.shutdown_gracefully()
                 return
@@ -232,6 +476,103 @@ class MYALGO_TRADING_BOT:
     # -------------------------
     # WebSocket - Real time data LTP 
     # -------------------------  
+    def option_poller(self):
+        """Periodically fetch option LTP (non-blocking to websocket)."""
+        while not self.stop_event.is_set() and self.running:
+            try:
+                opt = getattr(self, 'option_symbol', None)
+                if opt:
+                    q_opt = self.client.quotes(symbol=opt, exchange=OPTION_EXCHANGE)
+                    ltp = float((q_opt.get("data") or {}).get("ltp", 0) or 0)
+                    with self._state_lock:
+                        self.option_ltp = ltp
+                time.sleep(1.0)
+            except Exception:
+                logger.exception("option_poller error")
+                time.sleep(1)
+    
+    def _set_attr_threadsafe(self, name, value):
+        with self._state_lock:
+            setattr(self, name, value)
+
+    def heartbeat_thread(self):
+        """Keeps the websocket session alive using a lightweight quotes request."""
+        while not self.stop_event.is_set() and self.running:
+            try:
+                # perform a simple quotes call as a keepalive
+                self.client.quotes(symbol="NIFTY", exchange="NSE_INDEX")
+                logger.debug("✅ Heartbeat successful (quotes ping).")
+            except Exception as e:
+                logger.exception("heartbeat ping failed")
+            time.sleep(10)  # every 10 seconds
+
+    # websocket_thread with reconnect/backoff and safe subscribe
+    # def websocket_thread(self):
+    #     backoff = RECONNECT_BASE
+    #     logger.info("Starting websocket loop (with reconnect)")
+    #     while not self.stop_event.is_set() and self.running:
+    #         try:
+    #             logger.info("Connecting websocket...")
+    #             self.client.connect()     # may raise
+    #             # try subscribing with mode param (handle SDK differences)
+    #             try:
+    #                 self.client.subscribe_ltp(self.instrument, on_data_received=self.on_ltp_update, mode="quote")
+    #             except TypeError:
+    #                 self.client.subscribe_ltp(self.instrument, on_data_received=self.on_ltp_update)
+    #             logger.info("Subscribed to LTP")
+
+    #             # start background helper threads (once connected)
+    #             if not getattr(self, '_heartbeat_started', False):
+    #                 threading.Thread(target=self.heartbeat_thread, daemon=True).start()
+    #                 self._heartbeat_started = True
+
+    #             if not getattr(self, '_option_poller_started', False):
+    #                 threading.Thread(target=self.option_poller, daemon=True).start()
+    #                 self._option_poller_started = True
+
+    #             # reset backoff after successful connect
+    #             backoff = RECONNECT_BASE
+
+    #             # keep alive loop; when client.disconnect or server closes, an exception may be raised or subscribe returns
+    #             # keep alive loop; when client.disconnect or server closes, an exception may be raised or subscribe returns
+    #             while not self.stop_event.is_set() and self.running and self.client.connected:
+    #                 time.sleep(0.5)
+    #             # If loop breaks, try to cleanly unsubscribe and disconnect
+    #             try:
+    #                 self.client.unsubscribe_ltp(self.instrument)
+    #             except Exception:
+    #                 pass
+    #             try:
+    #                 self.client.disconnect()
+    #             except Exception:
+    #                 pass
+
+    #             # if we reach here without stop_event, we'll reconnect (backoff)
+    #             if not self.stop_event.is_set() and self.running:
+    #                 logger.warning("Websocket disconnected unexpectedly; reconnecting in %.1f sec", backoff)
+    #                 time.sleep(backoff)
+    #                 backoff = min(backoff * 2, RECONNECT_MAX)
+
+    #         except Exception:
+    #             logger.exception("websocket connection error; retrying in %.1f sec", backoff)
+    #             try:
+    #                 self.client.disconnect()
+    #             except Exception:
+    #                 pass
+    #             time.sleep(backoff)
+    #             backoff = min(backoff * 2, RECONNECT_MAX)
+
+    #     # final cleanup
+    #     try:
+    #         self.client.unsubscribe_ltp(self.instrument)
+    #     except Exception:
+    #         pass
+    #     try:
+    #         self.client.disconnect()
+    #     except Exception:
+    #         pass
+    #     logger.info("websocket loop ended")
+
     def on_ltp_update(self, data):
         """Handle incoming websocket ticks/quote updates with comprehensive position tracking."""
         try:
@@ -308,15 +649,17 @@ class MYALGO_TRADING_BOT:
                 distance_to_tp = track_ltp - target_price
 
             # Print brief status line
-            print(f"\r[{now}] {symbol} LTP={track_ltp:.2f} | {position} @ {entry_price:.2f} | P&L {unreal:.2f} | SL {stoploss_price:.2f} TG {target_price:.2f}", end="")
+            # print(f"\r[{now}] {symbol} LTP={track_ltp:.2f} | {position} @ {entry_price:.2f} | P&L {unreal:.2f} | SL {stoploss_price:.2f} TG {target_price:.2f}", end="")
 
             # Detailed position logging occasionally
             current_time = time.time()
             if not hasattr(self, '_last_detailed_log') or current_time - self._last_detailed_log > 10:
                 position_logger.info("=== Position Status Update ===")
-                position_logger.info(f"Position: {position} @ {entry_price:.2f}")
+                position_logger.info(f"Spot Entry: {position} @ {entry_price:.2f}")
+                position_logger.info(f"Option Entry: {position} @ {self.option_entry_price:.2f}")
                 position_logger.info(f"Tracking Mode: {tracking_mode}")
-                position_logger.info(f"Current LTP: {track_ltp:.2f}")
+                position_logger.info(f"Current Spot LTP: {track_ltp:.2f}")
+                position_logger.info(f"Current Option LTP: {track_option_ltp:.2f}")
                 position_logger.info(f"Unrealized P&L: {unreal:.2f}")
                 position_logger.info(f"SL Level: {stoploss_price:.2f} (Distance: {distance_to_sl:.2f})")
                 position_logger.info(f"TP Level: {target_price:.2f} (Distance: {distance_to_tp:.2f})")
@@ -475,6 +818,7 @@ class MYALGO_TRADING_BOT:
                         f"{key:<8} | Pivot:{val['pivot']:.2f} | BC:{val['bc']:.2f} | TC:{val['tc']:.2f} | Width:{val['cpr_range']:.2f}"
                     )
             indicators_logger.info("═══════════════════════")
+            return true
 
         except Exception as e:
             indicators_logger.error(f"❌ Error computing static indicators: {e}", exc_info=True)
@@ -771,35 +1115,38 @@ class MYALGO_TRADING_BOT:
             last_close = float(last.get("close", 0.0))
             ema20 = float(dyn.get("EMA_20", 0.0))
             ema50 = float(dyn.get("EMA_20", 0.0))
+            ema200 = float(dyn.get("EMA_20", 0.0))
             
             signal_logger.info(f"Exit Signal Evaluation Data:")
             signal_logger.info(f"  Last Candle Close: {last_close:.2f}")
             signal_logger.info(f"  EMA20: {ema20:.2f}")
             
             # Calculate current P&L for context
+            if self.option_ltp is None:
+                    self.option_ltp = self.option_entry_price
             if self.position == "BUY":
-                unrealized_pnl = (current_ltp - self.entry_price) * QUANTITY
+                unrealized_pnl = (self.option_ltp - self.option_entry_price) * QUANTITY
             else:
-                unrealized_pnl = (self.entry_price - current_ltp) * QUANTITY
+                unrealized_pnl = (self.option_entry_price - self.option_ltp) * QUANTITY
                 
             signal_logger.info(f"  Current P&L: {unrealized_pnl:.2f}")
             
-            # Check EMA20 crossover exit conditions
+           # Check EMA200 crossover exit conditions
             if self.position == "BUY":
-                ema_exit_condition = last_close < ema20
-                signal_logger.info(f"BUY Exit Check: Close < EMA20 -> {last_close:.2f} < {ema20:.2f} = {ema_exit_condition}")
+                ema_exit_condition = False
+                signal_logger.info(f"BUY Exit Check: Close < EMA200 -> {last_close:.2f} < {ema200:.2f} = {ema_exit_condition}")
                 if ema_exit_condition:
-                    signal_logger.info("🔴 EXIT SIGNAL TRIGGERED: CLOSE BELOW EMA20 (BUY Position)")
+                    signal_logger.info("🔴 EXIT SIGNAL TRIGGERED: CLOSE BELOW EMA200 (BUY Position)")
                     signal_logger.info(f"Exit Context: LTP={current_ltp:.2f}, Close={last_close:.2f}, EMA20={ema20:.2f}, P&L={unrealized_pnl:.2f}")
-                    return f"CLOSE_BELOW_EMA20 (close={last_close:.2f}, ema20={ema20:.2f})"
+                    return f"CLOSE_BELOW_EMA20 (close={last_close:.2f}, EMA200={ema20:.2f})"
                     
             elif self.position == "SELL":
-                ema_exit_condition = last_close > ema20
-                signal_logger.info(f"SELL Exit Check: Close > EMA20 -> {last_close:.2f} > {ema20:.2f} = {ema_exit_condition}")
+                ema_exit_condition = False
+                signal_logger.info(f"SELL Exit Check: Close > ema200 -> {last_close:.2f} > {ema20:.2f} = {ema_exit_condition}")
                 if ema_exit_condition:
-                    signal_logger.info("🔴 EXIT SIGNAL TRIGGERED: CLOSE ABOVE EMA20 (SELL Position)")
-                    signal_logger.info(f"Exit Context: LTP={current_ltp:.2f}, Close={last_close:.2f}, EMA20={ema20:.2f}, P&L={unrealized_pnl:.2f}")
-                    return f"CLOSE_ABOVE_EMA20 (close={last_close:.2f}, ema20={ema20:.2f})"
+                    signal_logger.info("🔴 EXIT SIGNAL TRIGGERED: CLOSE ABOVE EMA200 (SELL Position)")
+                    signal_logger.info(f"Exit Context: LTP={current_ltp:.2f}, Close={last_close:.2f}, EMA200={ema200:.2f}, P&L={unrealized_pnl:.2f}")
+                    return f"CLOSE_ABOVE_EMA200 (close={last_close:.2f}, EMA200={ema200:.2f})"
             
             signal_logger.info("⚪ NO EMA EXIT SIGNAL - Position maintained")
             return None
@@ -883,7 +1230,7 @@ class MYALGO_TRADING_BOT:
             long_cond5 = (prev_close > prev_open)
             long_cond6 = (close > open_)
              
-            long_cond = long_cond3 
+            long_cond =  long_cond3 and long_cond6
 
             # Evaluate Short conditions step by step
             short_cond1 = (close < prev_day_low)
@@ -893,7 +1240,7 @@ class MYALGO_TRADING_BOT:
             short_cond5 = (prev_close < prev_open)
             short_cond6 = (close < open_)
             
-            short_cond =  short_cond3 
+            short_cond =   short_cond3 and short_cond6
 
             # Log detailed condition evaluation
             signal_logger.info("=== LONG Signal Conditions ===")
@@ -1033,7 +1380,7 @@ class MYALGO_TRADING_BOT:
             return True
         except Exception:
             position_logger.exception("initialize_signal_candle_sl_tp failed")
-            return False
+            return False        
     # -------------------------
     # Option functions - Identify Option Strike, Expiry, Symbol
     # -------------------------
@@ -1212,6 +1559,8 @@ class MYALGO_TRADING_BOT:
             order_logger.info(f"Product: {PRODUCT}")
             order_logger.info(f"Strategy: {STRATEGY}")
 
+            # MAX_RETRIES = 3 is pending
+
             resp = self.client.placeorder(strategy=STRATEGY, symbol=tradable_symbol, exchange=tradable_exchange,
                                           action=signal, quantity=QUANTITY, price_type="MARKET", product=PRODUCT)
             order_logger.info(f"Order Response: {resp}")
@@ -1219,13 +1568,15 @@ class MYALGO_TRADING_BOT:
                 order_logger.error(f"Entry order failed: {resp}")
                 logger.warning("Entry order failed: %s", resp)
                 return False
-
+            self.trade_start_time = datetime.now()
+            
             order_id = resp.get("orderid")
             order_logger.info(f"Order ID: {order_id}")
             order_logger.info("Waiting for order execution confirmation...")
             exec_price = self.get_executed_price(order_id)
             q_opt = self.client.quotes(symbol=self.option_symbol, exchange=OPTION_EXCHANGE)
             self.option_entry_price = float((q_opt.get("data") or {}).get("ltp", 0) or 0) # Option entry price
+
             if exec_price is None:
                 order_logger.error("Could not confirm executed price for entry order")
                 logger.warning("Could not confirm executed price for entry")
@@ -1273,8 +1624,6 @@ class MYALGO_TRADING_BOT:
 
                 self.trade_count += 1
                 self.entry_price = round(base_price,2)
-                self.trade_start_time = datetime.now()
-
                 # re-enable monitoring only after SL/TP set
                 self.exit_in_progress = False
 
@@ -1297,17 +1646,18 @@ class MYALGO_TRADING_BOT:
             except Exception:
                 pass
 
-            trade_data = {
-                'symbol': tradable_symbol,
-                'action': signal,
-                'leg_type': opt_type if OPTION_ENABLED else 'SPOT',
-                'strike': strike if OPTION_ENABLED else '',
-                'quantity': QUANTITY,
-                'price': exec_price,
-                'order_id': order_id,
-                'strategy': STRATEGY
-            }
-            log_trade_execution(trade_data)
+            log_trade_db({
+            "timestamp": self.trade_start_time,
+            "symbol": tradable_symbol,
+            "spot_price": self.spot_entry_price,
+            "action": "CALL" if signal.upper() == "BUY" else "PUT",
+            "quantity": QUANTITY,
+            "price": self.option_entry_price,
+            "order_id": order_id,
+            "strategy": STRATEGY,
+            "leg_type": "ENTRY",
+            "leg_status": "open"
+            })
 
             logger.info("Entry executed: %s @ %.2f | trade_count=%d", self.position, self.entry_price, self.trade_count)
             return True
@@ -1339,7 +1689,8 @@ class MYALGO_TRADING_BOT:
                 
             # Calculate trade duration
             trade_start = getattr(self, 'trade_start_time', datetime.now())
-            trade_duration = datetime.now() - trade_start
+            trade_end_time = datetime.now()
+            trade_duration = trade_end_time - trade_start
             
             order_logger.info(f"Trade Spot Position: {self.position} @ {self.spot_entry_price:.2f}")
             order_logger.info(f"Current Spot LTP: {spot_ltp:.2f}")
@@ -1371,6 +1722,8 @@ class MYALGO_TRADING_BOT:
                 
                 # Try to get execution price
                 exit_price = self.get_executed_price(order_id)
+                if self.option_ltp is None:
+                    self.option_ltp = self.option_entry_price
                 if exit_price:
                     # Calculate actual P&L
                     if self.position == "BUY":
@@ -1382,28 +1735,38 @@ class MYALGO_TRADING_BOT:
                     order_logger.info(f"Realized P&L: {realized_pnl:.2f}")
                     
                     # Comprehensive trade summary
-                    order_logger.info("=== TRADE COMPLETED ===")
+                    order_logger.info("=== TRADE COMPLETED ===") 
+                    order_logger.info(f"Trade Start Time: {self.trade_start_time}")
                     order_logger.info(f"Spot Entry: {self.position} @ {self.spot_entry_price:.2f}")
-                    order_logger.info(f"Spot Exit: {action} @ {exit_price:.2f}")
+                    order_logger.info(f"Spot Exit: {action} @ {spot_ltp}")
+                    order_logger.info(f"Option Symbol: {self.option_symbol}")
                     order_logger.info(f"Option Entry: {self.position} @ {self.option_entry_price:.2f}")
                     order_logger.info(f"Option Exit: {action} @ {self.option_ltp:.2f}")
+                    order_logger.info(f"Trade End Time: {trade_end_time}")
                     order_logger.info(f"P&L: {realized_pnl:.2f}")
                     order_logger.info(f"Reason: {reason}")
                     order_logger.info(f"Duration: {trade_duration}")
-                    
-                    # Log comprehensive trade data
-                    trade_data = {
-                        'symbol': exit_symbol,
-                        'action': action,
-                        'leg_type': 'EXIT',
-                        'quantity': QUANTITY,
-                        'price': exit_price,
-                        'order_id': order_id,
-                        'pnl': realized_pnl,
-                        'reason': reason,
-                        'strategy': STRATEGY
-                    }
-                    log_trade_execution(trade_data)
+
+                    log_trade_db({
+                    "symbol": self.option_symbol,
+                    "action": "PUT" if self.position == "SELL" else "CALL",
+                    "spot_price": spot_ltp,
+                    "quantity": QUANTITY,
+                    "price": option_ltp,
+                    "order_id": order_id,
+                    "strategy": STRATEGY,
+                    "leg_type": "EXIT",
+                    "reason": reason,
+                    "leg_status": "closed"
+                    })
+
+                    self.reconcile_trade_pnl({
+                    "symbol": self.option_symbol,
+                    "strategy": STRATEGY,
+                    "price": self.option_ltp,
+                    "quantity": QUANTITY
+                    })
+                   
                 else:
                     order_logger.warning("Could not confirm exit execution price")
                     
@@ -1426,7 +1789,7 @@ class MYALGO_TRADING_BOT:
             self.option_entry_price = 0.0
             
             order_logger.info("Position cleared and reset")
-            main_logger.info(f"Position {previous_position} @ {previous_entry:.2f} exited due to: {reason}")
+            # main_logger.info(f"Position {previous_position} @ {previous_entry:.2f} exited due to: {reason}")
             
             return True
         except Exception:
