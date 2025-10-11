@@ -18,7 +18,6 @@ import re
 import sys
 from dataclasses import dataclass
 import os
-import argparse
 
 from typing import Dict, List, Optional
 
@@ -30,18 +29,6 @@ API_HOST = "http://127.0.0.1:5000"
 WS_URL = "ws://127.0.0.1:8765"
 
 client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL)
-
-# Speed multiplier for simulation:
-
-SIMULATION_DATE: str | None = None  # e.g. "2025-06-02" for simulation, None for live  #1.0  = real time
-SIMULATION_SPEED_MULTIPLIER: float = 60.0
-
-_simulation_state = {
-    "start_real_time": None,
-    "start_simulated_time": None,
-    "last_replayed_time": None,
-    "replay_running": False
-}
 
 # Instrument
 SYMBOL = "NIFTY"
@@ -148,7 +135,6 @@ DB_PATH = os.path.join(os.getcwd(), "myalgo.db")
 engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-
 # Create tables once at initialization
 Base.metadata.create_all(engine)
 # ----------------------------
@@ -195,120 +181,6 @@ def get_nearest_level_above(price: float, levels: List[float]) -> Optional[float
 def get_nearest_level_below(price: float, levels: List[float]) -> Optional[float]:
     return next((lvl for lvl in sorted(levels, reverse=True) if lvl < price), None)
 # ----------------------------
-# CLI Parser
-# ----------------------------
-def parse_args():
-    parser = argparse.ArgumentParser(description="Run MYALGO_TRADING_BOT with optional simulation mode")
-    parser.add_argument("--simulate", type=str, default=None, help="Date (YYYY-MM-DD) for simulation mode")
-    parser.add_argument("--speed", type=float, default=60.0, help="Speed multiplier for replay (default 60x)")
-    return parser.parse_args()
-# ----------------------------
-# Time helper (simulation aware)
-# ----------------------------
-def now() -> datetime:
-    if not SIMULATION_DATE or not _simulation_state["replay_running"]:
-        return datetime.now(IST)
-
-    if _simulation_state["last_replayed_time"] is not None:
-        return _simulation_state["last_replayed_time"]
-
-    start_real = _simulation_state["start_real_time"]
-    start_sim = _simulation_state["start_simulated_time"]
-    if not start_real or not start_sim:
-        return datetime.now(IST)
-
-    elapsed_real = datetime.now(IST) - start_real
-    elapsed_sim = timedelta(seconds=elapsed_real.total_seconds() * SIMULATION_SPEED_MULTIPLIER)
-    return (start_sim + elapsed_sim).astimezone(IST)
-# ----------------------------
-# Intraday data wrapper
-# ----------------------------
-def get_intraday(symbol: str, exchange: str, interval: str = "1m", start_date: str | None = None, end_date: str | None = None):
-    if SIMULATION_DATE and not start_date and not end_date:
-        start_date = end_date = SIMULATION_DATE
-    elif not start_date or not end_date:
-        raise ValueError("start_date and end_date must be provided when not simulating")
-
-    df = client.history(symbol=symbol, exchange=exchange, interval=interval, start_date=start_date, end_date=end_date)
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    if df.index.tz is None:
-        df.index = df.index.tz_localize(IST)
-    else:
-        df.index = df.index.tz_convert(IST)
-    return df
-
-class ReplayWebsocket:
-    def __init__(self, client_api, simulation_date: str, speed_multiplier: float = 60.0):
-        self.client_api = client_api
-        self.simulation_date = simulation_date
-        self.speed_multiplier = speed_multiplier
-        self._stop = threading.Event()
-        self._thread = None
-        self._callbacks = {}
-        self._subscriptions = []
-
-    def connect(self):
-        print(f"[ReplayWebsocket] Connected (simulation {self.simulation_date})")
-
-    def subscribe_ltp(self, instruments_list, on_data_received):
-        for inst in instruments_list:
-            key = f"{inst['exchange']}:{inst['symbol']}"
-            self._callbacks[key] = on_data_received
-            self._subscriptions.append(inst)
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def _loop(self):
-        if not self._subscriptions:
-            return
-        inst = self._subscriptions[0]
-        df = get_intraday(inst["symbol"], inst["exchange"], "1m", start_date=self.simulation_date, end_date=self.simulation_date)
-        df = df.sort_index()
-
-        _simulation_state["start_real_time"] = datetime.now(IST)
-        _simulation_state["start_simulated_time"] = df.index[0]
-        _simulation_state["replay_running"] = True
-
-        for ts, row in df.iterrows():
-            if self._stop.is_set():
-                break
-            msg = {
-                "type": "market_data",
-                "symbol": inst["symbol"],
-                "exchange": inst["exchange"],
-                "mode": 1,
-                "data": {
-                    "ltp": float(row.close),
-                    "open": float(row.open),
-                    "high": float(row.high),
-                    "low": float(row.low),
-                    "close": float(row.close),
-                    "volume": float(row.volume),
-                    "timestamp": int(ts.timestamp() * 1000),
-                }
-            }
-            key = f"{inst['exchange']}:{inst['symbol']}"
-            _simulation_state["last_replayed_time"] = ts
-            cb = self._callbacks.get(key)
-            if cb:
-                try:
-                    cb(msg)
-                except Exception as e:
-                    print(f"[ReplayWebsocket] Callback error: {e}")
-            time.sleep(60 / SIMULATION_SPEED_MULTIPLIER)
-
-        print("[ReplayWebsocket] Completed replay")
-        _simulation_state["replay_running"] = False
-
-    def unsubscribe_ltp(self, instruments_list):
-        self._stop.set()
-
-    def disconnect(self):
-        self._stop.set()
-        print("[ReplayWebsocket] Disconnected simulation")
-# ----------------------------
 # MyAlgo Trdaing System
 # ----------------------------
 class MYALGO_TRADING_BOT:
@@ -316,7 +188,7 @@ class MYALGO_TRADING_BOT:
     # Initialization
     # -------------------------
     def __init__(self):
-        self.client = None
+        self.client = client
         self.position = None
         self.entry_price = 0.0
         self.stoploss_price = 0.0
@@ -345,18 +217,6 @@ class MYALGO_TRADING_BOT:
         main_logger.info(f"Risk Management: SL={STOPLOSS}, TP={TARGET} | Max Trades: {MAX_TRADES_PER_DAY}")
         main_logger.info(f"Options Enabled: {OPTION_ENABLED} | Strike Selection: {OPTION_STRIKE_SELECTION}")
         main_logger.info(f"Signal Check Interval: {SIGNAL_CHECK_INTERVAL} minutes")
-
-        if SIMULATION_DATE:
-            print(f"[MYALGO_TRADING_BOT] Simulation mode active for {SIMULATION_DATE}")
-            self.client = ReplayWebsocket(client_api=client, simulation_date=SIMULATION_DATE, speed_multiplier=SIMULATION_SPEED_MULTIPLIER)
-        else:
-            print("[MYALGO_TRADING_BOT] Live mode active")
-            self.client = client
-
-    def on_data_received(self, data):
-        ts = datetime.fromtimestamp(data["data"]["timestamp"] / 1000, tz=IST)
-        ltp = data["data"].get("ltp")
-        print(f"[{ts}] LTP={ltp}")
     # =========================================================
     # 💰 Auto PnL Reconciliation Helper
     # =========================================================
@@ -476,103 +336,6 @@ class MYALGO_TRADING_BOT:
     # -------------------------
     # WebSocket - Real time data LTP 
     # -------------------------  
-    def option_poller(self):
-        """Periodically fetch option LTP (non-blocking to websocket)."""
-        while not self.stop_event.is_set() and self.running:
-            try:
-                opt = getattr(self, 'option_symbol', None)
-                if opt:
-                    q_opt = self.client.quotes(symbol=opt, exchange=OPTION_EXCHANGE)
-                    ltp = float((q_opt.get("data") or {}).get("ltp", 0) or 0)
-                    with self._state_lock:
-                        self.option_ltp = ltp
-                time.sleep(1.0)
-            except Exception:
-                logger.exception("option_poller error")
-                time.sleep(1)
-    
-    def _set_attr_threadsafe(self, name, value):
-        with self._state_lock:
-            setattr(self, name, value)
-
-    def heartbeat_thread(self):
-        """Keeps the websocket session alive using a lightweight quotes request."""
-        while not self.stop_event.is_set() and self.running:
-            try:
-                # perform a simple quotes call as a keepalive
-                self.client.quotes(symbol="NIFTY", exchange="NSE_INDEX")
-                logger.debug("✅ Heartbeat successful (quotes ping).")
-            except Exception as e:
-                logger.exception("heartbeat ping failed")
-            time.sleep(10)  # every 10 seconds
-
-    # websocket_thread with reconnect/backoff and safe subscribe
-    # def websocket_thread(self):
-    #     backoff = RECONNECT_BASE
-    #     logger.info("Starting websocket loop (with reconnect)")
-    #     while not self.stop_event.is_set() and self.running:
-    #         try:
-    #             logger.info("Connecting websocket...")
-    #             self.client.connect()     # may raise
-    #             # try subscribing with mode param (handle SDK differences)
-    #             try:
-    #                 self.client.subscribe_ltp(self.instrument, on_data_received=self.on_ltp_update, mode="quote")
-    #             except TypeError:
-    #                 self.client.subscribe_ltp(self.instrument, on_data_received=self.on_ltp_update)
-    #             logger.info("Subscribed to LTP")
-
-    #             # start background helper threads (once connected)
-    #             if not getattr(self, '_heartbeat_started', False):
-    #                 threading.Thread(target=self.heartbeat_thread, daemon=True).start()
-    #                 self._heartbeat_started = True
-
-    #             if not getattr(self, '_option_poller_started', False):
-    #                 threading.Thread(target=self.option_poller, daemon=True).start()
-    #                 self._option_poller_started = True
-
-    #             # reset backoff after successful connect
-    #             backoff = RECONNECT_BASE
-
-    #             # keep alive loop; when client.disconnect or server closes, an exception may be raised or subscribe returns
-    #             # keep alive loop; when client.disconnect or server closes, an exception may be raised or subscribe returns
-    #             while not self.stop_event.is_set() and self.running and self.client.connected:
-    #                 time.sleep(0.5)
-    #             # If loop breaks, try to cleanly unsubscribe and disconnect
-    #             try:
-    #                 self.client.unsubscribe_ltp(self.instrument)
-    #             except Exception:
-    #                 pass
-    #             try:
-    #                 self.client.disconnect()
-    #             except Exception:
-    #                 pass
-
-    #             # if we reach here without stop_event, we'll reconnect (backoff)
-    #             if not self.stop_event.is_set() and self.running:
-    #                 logger.warning("Websocket disconnected unexpectedly; reconnecting in %.1f sec", backoff)
-    #                 time.sleep(backoff)
-    #                 backoff = min(backoff * 2, RECONNECT_MAX)
-
-    #         except Exception:
-    #             logger.exception("websocket connection error; retrying in %.1f sec", backoff)
-    #             try:
-    #                 self.client.disconnect()
-    #             except Exception:
-    #                 pass
-    #             time.sleep(backoff)
-    #             backoff = min(backoff * 2, RECONNECT_MAX)
-
-    #     # final cleanup
-    #     try:
-    #         self.client.unsubscribe_ltp(self.instrument)
-    #     except Exception:
-    #         pass
-    #     try:
-    #         self.client.disconnect()
-    #     except Exception:
-    #         pass
-    #     logger.info("websocket loop ended")
-
     def on_ltp_update(self, data):
         """Handle incoming websocket ticks/quote updates with comprehensive position tracking."""
         try:
