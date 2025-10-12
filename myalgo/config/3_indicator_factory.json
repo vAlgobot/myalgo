@@ -1,88 +1,97 @@
 {
-  "indicators_config": {
-    "version": "1.0.0",
-    "description": "Technical indicators configuration for trading system",
-    
-    "candle_data": {
-      "current_candle": {
-        "enabled": true,
-        "description": "Current candle OHLC data",
-        "timeframe": "5m"
-      },
-      "previous_candle": {
-        "enabled": true,
-        "description": "Previous candle OHLC data",
-        "timeframe": "5m"
-      },
-      "signal_candle": {
-        "enabled": true,
-        "description": "Signal candle OHLC data captured at entry time."
-      },
-      "current_day_candle": {
-        "enabled": true,
-        "description": "Current day candle OHLC data",
-        "timeframe": "D"
-      }
-    },
-    
-    "trend_indicators": {
-      "sma": {
-        "enabled": true,
-        "description": "Simple Moving Average",
-        "timeframe": "5m",
-        "periods": [9, 20, 50, 200]
-      },
-      "ema": {
-        "enabled": true,
-        "description": "Exponential Moving Average",
-        "timeframe": "5m",
-        "periods": [9, 20, 50, 200]
-      }
-    },
-    
-    "momentum_indicators": {
-      "rsi": {
-        "enabled": true,
-        "description": "Relative Strength Index",
-        "timeframe": "5m",
-        "periods": [14, 21]
-      }
-    },
-    
-    "volume_indicators": {
-      "vwap": {
-        "enabled": false,
-        "description": "Volume Weighted Average Price",
-        "timeframe": "5m",
-        "calculation_method": "standard"
-      }
-    },
-    
-    "volatility_indicators": {
-      "bollinger_bands": {
-        "enabled": false,
-        "description": "Bollinger Bands",
-        "timeframe": "5m",
-        "config": {
-          "period": 20,
-          "std_dev": 2
+    "indicators_config": {
+        "version": "1.0.0",
+        "description": "Technical indicators configuration for trading system",
+        "candle_data": {
+            "current_candle": {
+                "enabled": true,
+                "description": "Current candle OHLC data",
+                "timeframe": "5m"
+            },
+            "previous_candle": {
+                "enabled": true,
+                "description": "Previous candle OHLC data",
+                "timeframe": "5m"
+            },
+            "signal_candle": {
+                "enabled": true,
+                "description": "Signal candle OHLC data captured at entry time."
+            },
+            "current_day_candle": {
+                "enabled": true,
+                "description": "Current day candle OHLC data",
+                "timeframe": "D"
+            }
+        },
+        "trend_indicators": {
+            "sma": {
+                "enabled": true,
+                "description": "Simple Moving Average",
+                "timeframe": "5m",
+                "periods": [
+                    9,
+                    20,
+                    50,
+                    200
+                ]
+            },
+            "ema": {
+                "enabled": true,
+                "description": "Exponential Moving Average",
+                "timeframe": "5m",
+                "periods": [
+                    9,
+                    20,
+                    50,
+                    200
+                ]
+            }
+        },
+        "momentum_indicators": {
+            "rsi": {
+                "enabled": true,
+                "description": "Relative Strength Index",
+                "timeframe": "5m",
+                "periods": [
+                    14,
+                    21
+                ]
+            }
+        },
+        "volume_indicators": {
+            "vwap": {
+                "enabled": false,
+                "description": "Volume Weighted Average Price",
+                "timeframe": "5m",
+                "calculation_method": "standard"
+            }
+        },
+        "volatility_indicators": {
+            "bollinger_bands": {
+                "enabled": false,
+                "description": "Bollinger Bands",
+                "timeframe": "5m",
+                "config": {
+                    "period": 20,
+                    "std_dev": 2
+                }
+            }
+        },
+        "support_resistance": {
+            "cpr": {
+                "enabled": true,
+                "all_levels": true,
+                "excpected_format": "cpr_daily_tc,cpr_daily_bc,cpr_daily_r1,cpr_daily_r2,cpr_daily_r3,cpr_daily_r4,cpr_daily_s1,cpr_daily_s2,cpr_daily_s3,cpr_daily_s4,cpr_daily_width,cpr_daily_range_type,cpr_daily_type,cpr_weekly_tc,cpr_weekly_bc,cpr_weekly_r1,cpr_weekly_r2,cpr_weekly_r3,cpr_weekly_r4,cpr_weekly_s1,cpr_weekly_s2,cpr_weekly_s3,cpr_weekly_s4,cpr_weekly_width,cpr_weekly_range_type,cpr_weekly_type,cpr_monthly_tc,cpr_monthly_bc,cpr_monthly_r1,cpr_monthly_r2,cpr_monthly_r3,cpr_monthly_r4,cpr_monthly_s1,cpr_monthly_s2,cpr_monthly_s3,cpr_monthly_s4,cpr_monthly_width,cpr_monthly_range_type,cpr_monthly_type",
+                "description": "Central Pivot Range",
+                "timeframes": [
+                    "D"
+                ],
+                "available_timeframes": {
+                    "D": "Daily",
+                    "W": "Weekly",
+                    "M": "Monthly"
+                }
+            }
         }
-      }
-    },
-    
-    "support_resistance": {
-      "cpr": {
-        "enabled": true,
-        "all_levels": true,
-        "excpected_format": "cpr_daily_tc,cpr_daily_bc,cpr_daily_r1,cpr_daily_r2,cpr_daily_r3,cpr_daily_r4,cpr_daily_s1,cpr_daily_s2,cpr_daily_s3,cpr_daily_s4,cpr_daily_width,cpr_daily_range_type,cpr_daily_type,cpr_weekly_tc,cpr_weekly_bc,cpr_weekly_r1,cpr_weekly_r2,cpr_weekly_r3,cpr_weekly_r4,cpr_weekly_s1,cpr_weekly_s2,cpr_weekly_s3,cpr_weekly_s4,cpr_weekly_width,cpr_weekly_range_type,cpr_weekly_type,cpr_monthly_tc,cpr_monthly_bc,cpr_monthly_r1,cpr_monthly_r2,cpr_monthly_r3,cpr_monthly_r4,cpr_monthly_s1,cpr_monthly_s2,cpr_monthly_s3,cpr_monthly_s4,cpr_monthly_width,cpr_monthly_range_type,cpr_monthly_type",
-        "description": "Central Pivot Range",
-        "timeframes": ["D", "W"],
-        "available_timeframes": {
-          "D": "Daily",
-          "W": "Weekly",
-          "M": "Monthly"
-        }
-      }
     }
-  }
 }

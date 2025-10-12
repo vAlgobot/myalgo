@@ -34,7 +34,7 @@ client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL)
 SYMBOL = "NIFTY"
 EXCHANGE = "NSE_INDEX"
 PRODUCT = "MIS"
-CANDLE_TIMEFRAME = "1m"
+CANDLE_TIMEFRAME = "5m"
 LOOKBACK_DAYS = 3
 SIGNAL_CHECK_INTERVAL = 1  # minutes (use integer minutes)
 
@@ -45,7 +45,7 @@ RSI_PERIODS = [14, 21]
 CPR = ['DAILY', 'WEEKLY','MONTHLY']
 
 # Risk settings
-STOPLOSS = 50
+STOPLOSS = 0
 TARGET = 5
 
 # Trade management
@@ -78,9 +78,38 @@ USE_SPOT_FOR_SLTP = True      # If True → uses spot price for SL/TP tracking
 USE_OPTION_FOR_SLTP = False   # If True → uses option position LTP for SL/TP tracking
 
 # SL/TP Enhancement config
-SL_TP_METHOD = "Signal_candle_range_SL_TP" # current active method #CPR_range_SL_TP #Signal_candle_range_SL_TP
+# Available Methods:
+# - "Signal_candle_range_SL_TP": Uses signal candle range for SL/TP with TSL
+# - "CPR_range_SL_TP": Uses CPR pivot levels as dynamic targets with trailing
+SL_TP_METHOD = "CPR_range_SL_TP" # current active method #CPR_range_SL_TP #Signal_candle_range_SL_TP
 TSL_ENABLED = True # enable trailing stoploss behavior
-TSL_METHOD = "TSL_Signal_candle_range" # trailing method for this enhancement
+TSL_METHOD = "TSL_CPR_range_SL_TP" # trailing method for this enhancement
+
+# ===============================================================
+# 🎯 CPR PIVOT EXCLUSION CONFIGURATION
+# ===============================================================
+# Exclude unreliable or frequently false pivot levels from CPR targets
+# CPR_EXCLUDE_PIVOTS = [
+#     "DAILY_S3", "DAILY_S4", "DAILY_R3", "DAILY_R4",      # Extreme daily levels
+#     "WEEKLY_S4", "WEEKLY_R4", "WEEKLY_TC",  "WEEKLY_BC",                              # Far weekly levels  
+#     "MONTHLY_S3", "MONTHLY_S4", "MONTHLY_R3", "MONTHLY_R4"  # Extreme monthly levels
+# ]
+
+CPR_EXCLUDE_PIVOTS = [     # Extreme daily levels
+     "WEEKLY_TC",  "WEEKLY_BC",                              # Far weekly levels  
+    "MONTHLY_TC", "MONTHLY_BC",  # Extreme monthly levels
+]
+
+# ===============================================================
+# 🎯 DYNAMIC RISK-REWARD CONFIGURATION
+# ===============================================================
+# Define your global target multiplier (RR ratio)
+RISK_REWARD_RATIO = 2.0        # e.g., 1.5 = 1:1.5, 2.0 = 1:2 risk-reward
+USE_DYNAMIC_TARGET = True      # Enable or disable dynamic target logic
+DYNAMIC_TARGET_METHOD = "NEAREST_VALID"  # "NEAREST_VALID" or "FIRST_BEYOND"
+
+# Define which CPR levels can be used as valid targets
+VALID_TARGET_LEVELS = ["pivot", "bc", "tc", "r1", "r2", "s1", "s2"]  # CPR level names to consider
 
 # month map for option token if needed
 MONTH_MAP = {
@@ -158,6 +187,7 @@ def log_trade_db(trade_data: dict):
 # 🔹 CPR / Pivot Utility Functions
 # =========================================================        
 def merge_pivot_levels(pivots: Dict[str, Dict[str, float]]) -> List[float]:
+    """Original merge function - kept for backward compatibility"""
     vals = set()
     for period, mapping in (pivots or {}).items():
         if not isinstance(mapping, dict):
@@ -168,6 +198,44 @@ def merge_pivot_levels(pivots: Dict[str, Dict[str, float]]) -> List[float]:
             except Exception:
                 continue
     return sorted(vals)
+
+def merge_pivot_levels_with_exclusion(pivots: Dict[str, Dict[str, float]], exclude_list: List[str] = None) -> tuple:
+    """
+    Enhanced pivot merger with exclusion filtering and identifier mapping
+    Returns: (values_list, value_to_identifier_mapping, excluded_identifiers)
+    """
+    if exclude_list is None:
+        exclude_list = CPR_EXCLUDE_PIVOTS
+        
+    vals = set()
+    value_mapping = {}  # {level_value: "DAILY_R1"}
+    excluded_identifiers = []
+    included_identifiers = []
+    
+    for period, mapping in (pivots or {}).items():
+        if not isinstance(mapping, dict):
+            continue
+            
+        period_upper = period.upper()
+        for k, v in mapping.items():
+            try:
+                level_value = float(v)
+                # Create identifier like "DAILY_R1", "WEEKLY_PIVOT", etc.
+                identifier = f"{period_upper}_{k.upper()}"
+                
+                # Check if this identifier should be excluded
+                if identifier in exclude_list:
+                    excluded_identifiers.append(identifier)
+                    continue
+                    
+                vals.add(level_value)
+                value_mapping[level_value] = identifier
+                included_identifiers.append(identifier)
+                
+            except Exception:
+                continue
+    
+    return sorted(vals), value_mapping, excluded_identifiers
 
 def expand_with_midpoints(levels: List[float]) -> List[float]:
     if not levels:
@@ -211,12 +279,46 @@ class MYALGO_TRADING_BOT:
         self.trailing_levels = []
         self.trailing_index = 0
         self._state_lock = threading.Lock() # state lock to avoid race between entry placement and websocket LTP handling
+        
+        # CPR_range_SL_TP specific attributes
+        self.cpr_levels_sorted = []
+        self.cpr_targets = []
+        self.cpr_sl = 0.0
+        self.cpr_side = None
+        self.current_tp_index = 0
+        self.cpr_tp_hit_count = 0
+        self.cpr_active = False
+        
+        # Enhanced CPR attributes for dynamic targeting and exclusions
+        self.dynamic_target_info = None
+        self.excluded_pivots_info = None
         logger.info("Bot initialized")
         main_logger.info("=== MyAlgo Trading Bot Initialized ===")
         main_logger.info(f"Strategy: {STRATEGY} | Symbol: {SYMBOL} | Timeframe: {CANDLE_TIMEFRAME}")
         main_logger.info(f"Risk Management: SL={STOPLOSS}, TP={TARGET} | Max Trades: {MAX_TRADES_PER_DAY}")
+        main_logger.info(f"SL/TP Method: {SL_TP_METHOD} | TSL Enabled: {TSL_ENABLED}")
         main_logger.info(f"Options Enabled: {OPTION_ENABLED} | Strike Selection: {OPTION_STRIKE_SELECTION}")
         main_logger.info(f"Signal Check Interval: {SIGNAL_CHECK_INTERVAL} minutes")
+        
+        # Validate SL/TP method configuration
+        valid_methods = ["Signal_candle_range_SL_TP", "CPR_range_SL_TP"]
+        if SL_TP_METHOD not in valid_methods:
+            main_logger.warning(f"Unknown SL_TP_METHOD: {SL_TP_METHOD}. Valid options: {valid_methods}")
+        else:
+            main_logger.info(f"✅ Valid SL/TP Method configured: {SL_TP_METHOD}")
+            
+        # Log CPR enhancement features
+        if SL_TP_METHOD == "CPR_range_SL_TP":
+            main_logger.info("=== CPR Enhancement Features ===")
+            main_logger.info(f"Pivot Exclusion: {'Enabled' if CPR_EXCLUDE_PIVOTS else 'Disabled'}")
+            if CPR_EXCLUDE_PIVOTS:
+                main_logger.info(f"  Excluded Levels: {len(CPR_EXCLUDE_PIVOTS)} ({', '.join(CPR_EXCLUDE_PIVOTS[:3])}...)")
+            main_logger.info(f"Dynamic Risk:Reward: {'Enabled' if USE_DYNAMIC_TARGET else 'Disabled'}")
+            if USE_DYNAMIC_TARGET:
+                main_logger.info(f"  RR Ratio: 1:{RISK_REWARD_RATIO:.2f}")
+                main_logger.info(f"  Target Method: {DYNAMIC_TARGET_METHOD}")
+                main_logger.info(f"  Valid Target Levels: {', '.join(VALID_TARGET_LEVELS)}")
+            main_logger.info("===============================")
     # =========================================================
     # 💰 Auto PnL Reconciliation Helper
     # =========================================================
@@ -430,8 +532,28 @@ class MYALGO_TRADING_BOT:
                 self._last_detailed_log = current_time
 
             # --- SL/TP/TSL logic ---
+            # Handle CPR Range SL/TP method
+            if SL_TP_METHOD == "CPR_range_SL_TP":
+                cpr_result = self.check_cpr_sl_tp_conditions(track_ltp)
+                if cpr_result == "SL_HIT":
+                    position_logger.warning(f"🔴 CPR STOP LOSS TRIGGERED at {track_ltp:.2f}")
+                    print(f"\n[{now}] CPR Stoploss hit at {track_ltp:.2f}")
+                    with self._state_lock:
+                        self.exit_in_progress = True
+                    threading.Thread(target=self.place_exit_order, args=("CPR_STOPLOSS",), daemon=True).start()
+                    return
+                elif cpr_result == "FINAL_EXIT":
+                    position_logger.info(f"🏁 CPR FINAL TARGET ACHIEVED at {track_ltp:.2f}")
+                    print(f"\n[{now}] CPR Final target reached at {track_ltp:.2f}")
+                    with self._state_lock:
+                        self.exit_in_progress = True
+                    threading.Thread(target=self.place_exit_order, args=("CPR_FINAL_TARGET",), daemon=True).start()
+                    return
+                elif cpr_result == "TP_HIT":
+                    # TP hit handled in check_cpr_sl_tp_conditions, continue monitoring
+                    return
             # If TSL is enabled and the SL_TP_METHOD is Signal_candle_range_SL_TP, handle TP hits by trailing instead of exiting immediately.
-            if TSL_ENABLED and SL_TP_METHOD == "Signal_candle_range_SL_TP":
+            elif TSL_ENABLED and SL_TP_METHOD == "Signal_candle_range_SL_TP":
                 # TP hit -> advance TSL; SL hit -> exit
                 if position == "BUY":
                     # Stoploss check (exit)
@@ -993,7 +1115,7 @@ class MYALGO_TRADING_BOT:
             long_cond5 = (prev_close > prev_open)
             long_cond6 = (close > open_)
              
-            long_cond =  long_cond3 and long_cond6
+            long_cond =  long_cond6
 
             # Evaluate Short conditions step by step
             short_cond1 = (close < prev_day_low)
@@ -1003,7 +1125,7 @@ class MYALGO_TRADING_BOT:
             short_cond5 = (prev_close < prev_open)
             short_cond6 = (close < open_)
             
-            short_cond =   short_cond3 and short_cond6
+            short_cond =  short_cond6
 
             # Log detailed condition evaluation
             signal_logger.info("=== LONG Signal Conditions ===")
@@ -1144,6 +1266,472 @@ class MYALGO_TRADING_BOT:
         except Exception:
             position_logger.exception("initialize_signal_candle_sl_tp failed")
             return False        
+    # -------------------------
+    # CPR_range_SL_TP Implementation
+    # -------------------------
+    def initialize_cpr_range_sl_tp(self, signal, intraday_df, base_price=None):
+        """
+        Initialize CPR-based dynamic SL/TP system:
+        - Uses merged pivot levels (daily, weekly, monthly) as targets
+        - Signal candle low/high for initial SL
+        - Dynamic trailing after each TP hit
+        """
+        try:
+            position_logger.info(f"Initializing CPR Range SL/TP for {signal} signal")
+            
+            # Get signal candle data for initial SL
+            if intraday_df is None or intraday_df.empty or len(intraday_df) < 2:
+                position_logger.warning("No signal candle data available for CPR initialization")
+                return False
+                
+            sig_candle = intraday_df.iloc[-2]
+            signal_candle_low = float(sig_candle.get('low', 0) or 0)
+            signal_candle_high = float(sig_candle.get('high', 0) or 0)
+            
+            # Merge all available pivot levels
+            if not self.static_indicators:
+                position_logger.error("No static indicators available for CPR levels")
+                return False
+                
+            pivots_dict = {}
+            for timeframe in ['DAILY', 'WEEKLY', 'MONTHLY']:
+                if timeframe in self.static_indicators:
+                    pivots_dict[timeframe.lower()] = self.static_indicators[timeframe]
+                    
+            # Get merged and expanded pivot levels
+            merged_levels = merge_pivot_levels(pivots_dict)
+            expanded_levels = expand_with_midpoints(merged_levels)
+            self.cpr_levels_sorted = sorted(expanded_levels)
+            
+            if not self.cpr_levels_sorted:
+                position_logger.warning("No CPR levels found, falling back to signal candle method")
+                return False
+                
+            # Set entry price and side
+            if base_price is None:
+                base_price = float(self.entry_price or 0.0)
+            self.entry_price = float(base_price)
+            self.cpr_side = signal.upper()
+            
+            # Initialize SL and targets based on signal direction
+            if self.cpr_side == "BUY":
+                # SL from signal candle low
+                self.cpr_sl = round(signal_candle_low - STOPLOSS, 2)
+                # Targets: all levels above entry price
+                self.cpr_targets = [lvl for lvl in self.cpr_levels_sorted if lvl > base_price]
+            else:  # SELL
+                # SL from signal candle high  
+                self.cpr_sl = round(signal_candle_high + STOPLOSS, 2)
+                # Targets: all levels below entry price (reversed order)
+                self.cpr_targets = [lvl for lvl in sorted(self.cpr_levels_sorted, reverse=True) if lvl < base_price]
+                
+            # Initialize tracking variables
+            self.current_tp_index = 0 if self.cpr_targets else -1
+            self.cpr_tp_hit_count = 0
+            self.cpr_active = True
+            
+            # Set initial target and SL for WebSocket monitoring
+            if self.cpr_targets:
+                self.target_price = round(self.cpr_targets[0], 2)
+            else:
+                # Fallback if no CPR targets available
+                if signal == "BUY":
+                    self.target_price = round(base_price + TARGET, 2)
+                else:
+                    self.target_price = round(base_price - TARGET, 2)
+                    
+            self.stoploss_price = self.cpr_sl
+            
+            position_logger.info(f"CPR Range SL/TP Initialized Successfully:")
+            position_logger.info(f"  Side: {self.cpr_side}")
+            position_logger.info(f"  Entry Price: {self.entry_price:.2f}")
+            position_logger.info(f"  Initial SL: {self.cpr_sl:.2f}")
+            position_logger.info(f"  Signal Candle: Low={signal_candle_low:.2f}, High={signal_candle_high:.2f}")
+            position_logger.info(f"  Available CPR Targets: {len(self.cpr_targets)}")
+            position_logger.info(f"  Next Target: {self.target_price:.2f}")
+            position_logger.info(f"  Total CPR Levels: {len(self.cpr_levels_sorted)}")
+            
+            return True
+            
+        except Exception as e:
+            position_logger.error(f"Error initializing CPR Range SL/TP: {e}", exc_info=True)
+            self.cpr_active = False
+            return False
+            
+    def initialize_cpr_range_sl_tp_enhanced(self, signal, intraday_df, base_price=None):
+        """
+        Enhanced CPR initialization with exclusion filtering and dynamic risk:reward targeting
+        Combines both CPR pivot exclusion and dynamic target selection features
+        """
+        try:
+            position_logger.info(f"Initializing Enhanced CPR Range SL/TP for {signal} signal")
+            position_logger.info(f"Features: Exclusion Filter={'ON' if CPR_EXCLUDE_PIVOTS else 'OFF'}, Dynamic Target={'ON' if USE_DYNAMIC_TARGET else 'OFF'}")
+            
+            # Get signal candle data for initial SL
+            if intraday_df is None or intraday_df.empty or len(intraday_df) < 2:
+                position_logger.warning("No signal candle data available for enhanced CPR initialization")
+                return False
+                
+            sig_candle = intraday_df.iloc[-2]
+            signal_candle_low = float(sig_candle.get('low', 0) or 0)
+            signal_candle_high = float(sig_candle.get('high', 0) or 0)
+            
+            # Merge pivot levels with exclusion filtering
+            if not self.static_indicators:
+                position_logger.error("No static indicators available for CPR levels")
+                return False
+                
+            pivots_dict = {}
+            for timeframe in ['DAILY', 'WEEKLY', 'MONTHLY']:
+                if timeframe in self.static_indicators:
+                    pivots_dict[timeframe.lower()] = self.static_indicators[timeframe]
+                    
+            # Get filtered pivot levels with exclusion
+            filtered_levels, level_mapping, excluded_ids = merge_pivot_levels_with_exclusion(pivots_dict, CPR_EXCLUDE_PIVOTS)
+            
+            # Store and log exclusion results
+            self.excluded_pivots_info = excluded_ids
+            if excluded_ids:
+                position_logger.info(f"Excluded {len(excluded_ids)} unreliable pivot levels: {', '.join(excluded_ids[:5])}")
+                if len(excluded_ids) > 5:
+                    position_logger.info(f"... and {len(excluded_ids) - 5} more excluded levels")
+            else:
+                position_logger.info("No pivot levels excluded")
+                
+            # Expand with midpoints
+            expanded_levels = expand_with_midpoints(filtered_levels)
+            self.cpr_levels_sorted = sorted(expanded_levels)
+            
+            if not self.cpr_levels_sorted:
+                position_logger.warning("No CPR levels available after filtering, falling back to signal candle method")
+                return False
+                
+            # Set entry price and initial SL
+            if base_price is None:
+                base_price = float(self.entry_price or 0.0)
+            self.entry_price = float(base_price)
+            self.cpr_side = signal.upper()
+            
+            # Calculate initial SL from signal candle
+            if self.cpr_side == "BUY":
+                initial_sl = round(signal_candle_low - STOPLOSS, 2)
+            else:  # SELL
+                initial_sl = round(signal_candle_high + STOPLOSS, 2)
+                
+            self.cpr_sl = initial_sl
+            self.stoploss_price = initial_sl
+            
+            # Enhanced target selection with dynamic risk:reward
+            if USE_DYNAMIC_TARGET:
+                # Use dynamic calculation with filtered CPR levels
+                dynamic_target, risk_dist, reward_dist, target_key, rationale = self.calculate_dynamic_cpr_target(
+                    signal, base_price, initial_sl, self.cpr_levels_sorted, level_mapping
+                )
+                
+                # Set the dynamic target as initial target
+                self.target_price = round(dynamic_target, 2)
+                
+                # Create CPR targets list starting from the selected dynamic target
+                if self.cpr_side == "BUY":
+                    self.cpr_targets = [lvl for lvl in self.cpr_levels_sorted if lvl >= dynamic_target]
+                else:  # SELL
+                    self.cpr_targets = [lvl for lvl in sorted(self.cpr_levels_sorted, reverse=True) if lvl <= dynamic_target]
+                    
+                # Store dynamic calculation results for logging
+                self.dynamic_target_info = {
+                    "risk": risk_dist,
+                    "reward_distance": reward_dist,
+                    "target_key": target_key,
+                    "rationale": rationale,
+                    "rr_ratio": RISK_REWARD_RATIO
+                }
+                
+                position_logger.info(f"Dynamic Target Selected: {target_key} @ {dynamic_target:.2f}")
+                position_logger.info(f"Risk: {risk_dist:.2f} | Reward: {reward_dist:.2f} | RR: 1:{RISK_REWARD_RATIO:.2f}")
+                position_logger.info(f"Rationale: {rationale}")
+                
+            else:
+                # Use original CPR target selection (all levels in direction)
+                if self.cpr_side == "BUY":
+                    self.cpr_targets = [lvl for lvl in self.cpr_levels_sorted if lvl > base_price]
+                else:  # SELL
+                    self.cpr_targets = [lvl for lvl in sorted(self.cpr_levels_sorted, reverse=True) if lvl < base_price]
+                    
+                # Set first target as initial TP
+                if self.cpr_targets:
+                    self.target_price = round(self.cpr_targets[0], 2)
+                else:
+                    # Fallback if no targets
+                    if signal == "BUY":
+                        self.target_price = round(base_price + TARGET, 2)
+                    else:
+                        self.target_price = round(base_price - TARGET, 2)
+                        
+                self.dynamic_target_info = None
+                position_logger.info(f"Standard CPR Target: {self.target_price:.2f}")
+                
+            # Initialize tracking variables
+            self.current_tp_index = 0 if self.cpr_targets else -1
+            self.cpr_tp_hit_count = 0
+            self.cpr_active = True
+            
+            # Comprehensive initialization summary
+            position_logger.info(f"Enhanced CPR Range SL/TP Initialized Successfully:")
+            position_logger.info(f"  Side: {self.cpr_side}")
+            position_logger.info(f"  Entry Price: {self.entry_price:.2f}")
+            position_logger.info(f"  Initial SL: {self.cpr_sl:.2f}")
+            position_logger.info(f"  Signal Candle: Low={signal_candle_low:.2f}, High={signal_candle_high:.2f}")
+            position_logger.info(f"  Total CPR Levels (after filtering): {len(self.cpr_levels_sorted)}")
+            position_logger.info(f"  Available Targets: {len(self.cpr_targets)}")
+            position_logger.info(f"  Next Target: {self.target_price:.2f}")
+            position_logger.info(f"  Exclusions Applied: {len(excluded_ids)} levels")
+            position_logger.info(f"  Dynamic Targeting: {'Enabled' if USE_DYNAMIC_TARGET else 'Disabled'}")
+            
+            return True
+            
+        except Exception as e:
+            position_logger.error(f"Error initializing Enhanced CPR Range SL/TP: {e}", exc_info=True)
+            self.cpr_active = False
+            return False
+            
+    def get_current_cpr_tp(self):
+        """Get the current CPR target price"""
+        if not getattr(self, "cpr_active", False) or not self.cpr_targets:
+            return None
+        idx = getattr(self, "current_tp_index", -1)
+        if 0 <= idx < len(self.cpr_targets):
+            return float(self.cpr_targets[idx])
+        return None
+        
+    def handle_cpr_tp_hit(self, hit_price):
+        """
+        Handle CPR target hit - advance trailing stop loss:
+        Rule 1: After first TP hit -> move SL to entry (breakeven)
+        Rule 2: After second TP hit -> move SL to first TP price
+        Rule 3+: Continue rolling SL to last TP price
+        """
+        try:
+            with self._state_lock:
+                self.cpr_tp_hit_count += 1
+                prev_idx = self.current_tp_index
+                
+                position_logger.info(f"CPR TP Hit #{self.cpr_tp_hit_count}: {hit_price:.2f}")
+                
+                # Advance SL based on TP hit count
+                if self.cpr_tp_hit_count == 1:
+                    # First TP hit -> move SL to breakeven (entry price)
+                    self.cpr_sl = round(float(self.entry_price), 2)
+                    position_logger.info(f"First CPR TP hit - SL moved to breakeven: {self.cpr_sl:.2f}")
+                elif prev_idx >= 0 and prev_idx < len(self.cpr_targets):
+                    # Subsequent TP hits -> move SL to previous TP price
+                    self.cpr_sl = round(float(self.cpr_targets[prev_idx]), 2)
+                    position_logger.info(f"CPR TP hit #{self.cpr_tp_hit_count} - SL moved to previous TP: {self.cpr_sl:.2f}")
+                
+                # Move to next target
+                self.current_tp_index = prev_idx + 1
+                
+                # Update WebSocket monitoring variables
+                self.stoploss_price = self.cpr_sl
+                
+                if self.current_tp_index >= len(self.cpr_targets):
+                    # No more targets - final exit
+                    self.current_tp_index = -1
+                    position_logger.info("Final CPR target reached - will exit on next update")
+                    return True  # Signal for final exit
+                else:
+                    # Set next target
+                    next_tp = self.cpr_targets[self.current_tp_index]
+                    self.target_price = round(float(next_tp), 2)
+                    position_logger.info(f"Next CPR Target: {self.target_price:.2f}")
+                    
+                    # Log CPR TP hit to database
+                    self._log_cpr_tp_hit(hit_price)
+                    
+                return False  # Continue trading
+                    
+        except Exception as e:
+            position_logger.error(f"Error handling CPR TP hit: {e}", exc_info=True)
+            return True  # Exit on error
+            
+    def check_cpr_sl_tp_conditions(self, current_ltp):
+        """
+        Check CPR SL/TP conditions in real-time
+        Returns: 'SL_HIT', 'TP_HIT', 'FINAL_EXIT', or None
+        """
+        if not getattr(self, "cpr_active", False):
+            return None
+            
+        try:
+            side = self.cpr_side
+            current_tp = self.get_current_cpr_tp()
+            
+            # Check SL conditions
+            if side == "BUY" and current_ltp <= self.cpr_sl:
+                position_logger.warning(f"CPR BUY SL Hit: {current_ltp:.2f} <= {self.cpr_sl:.2f}")
+                return "SL_HIT"
+            elif side == "SELL" and current_ltp >= self.cpr_sl:
+                position_logger.warning(f"CPR SELL SL Hit: {current_ltp:.2f} >= {self.cpr_sl:.2f}")
+                return "SL_HIT"
+                
+            # Check TP conditions
+            if current_tp is not None:
+                if side == "BUY" and current_ltp >= current_tp:
+                    position_logger.info(f"CPR BUY TP Hit: {current_ltp:.2f} >= {current_tp:.2f}")
+                    
+                    # Check TSL_ENABLED to determine behavior
+                    if not TSL_ENABLED:
+                        position_logger.info("TSL disabled - sending FINAL_EXIT signal on TP hit")
+                        return "FINAL_EXIT"
+                    else:
+                        # TSL enabled - proceed with trailing logic
+                        final_exit = self.handle_cpr_tp_hit(current_tp)
+                        return "FINAL_EXIT" if final_exit else "TP_HIT"
+                        
+                elif side == "SELL" and current_ltp <= current_tp:
+                    position_logger.info(f"CPR SELL TP Hit: {current_ltp:.2f} <= {current_tp:.2f}")
+                    
+                    # Check TSL_ENABLED to determine behavior
+                    if not TSL_ENABLED:
+                        position_logger.info("TSL disabled - sending FINAL_EXIT signal on TP hit")
+                        return "FINAL_EXIT"
+                    else:
+                        # TSL enabled - proceed with trailing logic
+                        final_exit = self.handle_cpr_tp_hit(current_tp)
+                        return "FINAL_EXIT" if final_exit else "TP_HIT"
+                    
+            return None
+            
+        except Exception as e:
+            position_logger.error(f"Error checking CPR SL/TP conditions: {e}", exc_info=True)
+            return "SL_HIT"  # Exit on error
+            
+    def _log_cpr_tp_hit(self, target_level):
+        """Log CPR TP hit to database"""
+        try:
+            if self.option_ltp is None:
+                self.option_ltp = self.option_entry_price
+                
+            # Calculate P&L at TP hit
+            if self.position == "BUY":
+                unrealized_pnl = (self.option_ltp - self.option_entry_price) * QUANTITY
+            else:
+                unrealized_pnl = (self.option_entry_price - self.option_ltp) * QUANTITY
+                
+            data = {
+                "timestamp": datetime.now(),
+                "symbol": self.option_symbol if hasattr(self, 'option_symbol') else SYMBOL,
+                "spot_price": self.ltp if self.ltp else 0.0,
+                "action": f"CPR_TP_{self.cpr_tp_hit_count}",
+                "quantity": QUANTITY,
+                "price": float(self.option_ltp),
+                "order_id": "",
+                "strategy": STRATEGY,
+                "leg_type": "CPR_TP_HIT",
+                "reason": f"CPR TP {target_level:.2f} hit",
+                "pnl": unrealized_pnl,
+                "leg_status": "partial"
+            }
+            log_trade_db(data)
+            position_logger.info(f"CPR TP hit logged: Level={target_level:.2f}, P&L={unrealized_pnl:.2f}")
+            
+        except Exception as e:
+            position_logger.error(f"Error logging CPR TP hit: {e}", exc_info=True)
+            
+    def calculate_dynamic_cpr_target(self, signal, entry_price, sl_price, available_levels, level_mapping):
+        """
+        Calculate optimal target using risk:reward ratio and filtered CPR levels
+        Returns: (target_price, risk, reward_distance, selected_level_key, rationale)
+        """
+        try:
+            signal = signal.upper()
+            entry_price = float(entry_price)
+            sl_price = float(sl_price)
+            
+            # Calculate risk distance
+            risk = abs(entry_price - sl_price)
+            if risk <= 0:
+                position_logger.warning("Invalid risk distance; using fallback target calculation")
+                fallback_target = entry_price + TARGET if signal == "BUY" else entry_price - TARGET
+                return fallback_target, 0, 0, "FALLBACK", "Invalid risk distance"
+            
+            # Compute required reward distance
+            reward_distance = risk * RISK_REWARD_RATIO
+            
+            # Determine required minimum target price
+            if signal == "BUY":
+                required_target = entry_price + reward_distance
+            else:  # SELL
+                required_target = entry_price - reward_distance
+                
+            position_logger.info(f"Dynamic Target Calculation:")
+            position_logger.info(f"  Signal: {signal} | Entry: {entry_price:.2f} | SL: {sl_price:.2f}")
+            position_logger.info(f"  Risk: {risk:.2f} | RR Ratio: {RISK_REWARD_RATIO:.2f} | Required Reward: {reward_distance:.2f}")
+            position_logger.info(f"  Required Target: {required_target:.2f}")
+            
+            if not available_levels:
+                position_logger.warning("No CPR levels available; using computed target")
+                return required_target, risk, reward_distance, "COMPUTED", "No CPR levels available"
+            
+            # Filter CPR levels based on direction and minimum distance requirement
+            valid_candidates = []
+            
+            for level_value in available_levels:
+                level_id = level_mapping.get(level_value, f"UNKNOWN_{level_value:.2f}")
+                
+                if signal == "BUY":
+                    # For BUY: level must be above entry AND meet minimum reward requirement
+                    if level_value > entry_price and level_value >= required_target:
+                        distance_from_entry = level_value - entry_price
+                        valid_candidates.append((level_value, level_id, distance_from_entry))
+                else:  # SELL
+                    # For SELL: level must be below entry AND meet minimum reward requirement  
+                    if level_value < entry_price and level_value <= required_target:
+                        distance_from_entry = entry_price - level_value
+                        valid_candidates.append((level_value, level_id, distance_from_entry))
+            
+            if not valid_candidates:
+                position_logger.warning("No valid CPR levels meet minimum reward requirement; using computed target")
+                return required_target, risk, reward_distance, "COMPUTED", "No CPR levels meet minimum reward"
+            
+            # Select target based on method
+            if DYNAMIC_TARGET_METHOD == "NEAREST_VALID":
+                # Select the nearest level that meets requirements
+                selected = min(valid_candidates, key=lambda x: x[2])  # Sort by distance from entry
+                target_price, target_key, distance = selected
+                rationale = f"Nearest valid CPR level ({distance:.2f} from entry)"
+                
+            elif DYNAMIC_TARGET_METHOD == "FIRST_BEYOND":
+                # Select the first level beyond the required target
+                if signal == "BUY":
+                    # Sort by price ascending, take first
+                    selected = min(valid_candidates, key=lambda x: x[0])
+                else:
+                    # Sort by price descending, take first  
+                    selected = max(valid_candidates, key=lambda x: x[0])
+                target_price, target_key, distance = selected
+                rationale = f"First CPR level beyond required reward ({distance:.2f} from entry)"
+            else:
+                # Fallback to nearest
+                selected = min(valid_candidates, key=lambda x: x[2])
+                target_price, target_key, distance = selected
+                rationale = f"Default nearest CPR level ({distance:.2f} from entry)"
+            
+            # Log selection details
+            position_logger.info(f"  Available Candidates: {len(valid_candidates)}")
+            for level_val, level_key, dist in valid_candidates[:5]:  # Log first 5
+                position_logger.info(f"    {level_key}: {level_val:.2f} (dist: {dist:.2f})")
+            if len(valid_candidates) > 5:
+                position_logger.info(f"    ... and {len(valid_candidates) - 5} more")
+                
+            position_logger.info(f"  🎯 SELECTED TARGET: {target_key} @ {target_price:.2f}")
+            position_logger.info(f"  Actual RR Ratio: 1:{(target_price - entry_price if signal == 'BUY' else entry_price - target_price) / risk:.2f}")
+            
+            return target_price, risk, reward_distance, target_key, rationale
+            
+        except Exception as e:
+            position_logger.error(f"Error in dynamic CPR target calculation: {e}", exc_info=True)
+            fallback_target = entry_price + TARGET if signal == "BUY" else entry_price - TARGET
+            return fallback_target, 0, 0, "ERROR_FALLBACK", f"Calculation error: {str(e)}"
     # -------------------------
     # Option functions - Identify Option Strike, Expiry, Symbol
     # -------------------------
@@ -1373,9 +1961,22 @@ class MYALGO_TRADING_BOT:
                     base_price = self.option_entry_price
                     risk_logger.info(f"SL/TP tracking via OPTION | Option Entry = {base_price:.2f}")
 
-                # Initialize SL/TP using the Signal Candle Range method if configured
+                # Initialize SL/TP using the configured method
                 if SL_TP_METHOD == "Signal_candle_range_SL_TP":
                     self.initialize_signal_candle_sl_tp(signal, intraday, base_price=base_price)
+                elif SL_TP_METHOD == "CPR_range_SL_TP":
+                    risk_logger.info("Initializing CPR Range SL/TP method")
+                    # Use enhanced method if exclusions or dynamic targeting are enabled
+                    if CPR_EXCLUDE_PIVOTS or USE_DYNAMIC_TARGET:
+                        risk_logger.info("Using Enhanced CPR method with exclusions/dynamic targeting")
+                        cpr_success = self.initialize_cpr_range_sl_tp_enhanced(signal, intraday, base_price=base_price)
+                    else:
+                        risk_logger.info("Using Standard CPR method")
+                        cpr_success = self.initialize_cpr_range_sl_tp(signal, intraday, base_price=base_price)
+                    
+                    if not cpr_success:
+                        risk_logger.warning("CPR initialization failed, falling back to Signal Candle method")
+                        self.initialize_signal_candle_sl_tp(signal, intraday, base_price=base_price)
                 else:
                     # fallback: simple fixed SL/TP
                     if signal == "BUY":
@@ -1409,18 +2010,36 @@ class MYALGO_TRADING_BOT:
             except Exception:
                 pass
 
-            log_trade_db({
-            "timestamp": self.trade_start_time,
-            "symbol": tradable_symbol,
-            "spot_price": self.spot_entry_price,
-            "action": "CALL" if signal.upper() == "BUY" else "PUT",
-            "quantity": QUANTITY,
-            "price": self.option_entry_price,
-            "order_id": order_id,
-            "strategy": STRATEGY,
-            "leg_type": "ENTRY",
-            "leg_status": "open"
-            })
+            # Prepare enhanced trade logging data
+            trade_data = {
+                "timestamp": self.trade_start_time,
+                "symbol": tradable_symbol,
+                "spot_price": self.spot_entry_price,
+                "action": "CALL" if signal.upper() == "BUY" else "PUT",
+                "quantity": QUANTITY,
+                "price": self.option_entry_price,
+                "order_id": order_id,
+                "strategy": STRATEGY,
+                "leg_type": "ENTRY",
+                "leg_status": "open"
+            }
+            
+            # Add enhanced CPR data if available
+            if hasattr(self, 'dynamic_target_info') and self.dynamic_target_info:
+                trade_data.update({
+                    "reason": f"Enhanced CPR Entry - {self.dynamic_target_info.get('target_key', 'Unknown')}",
+                    "pnl": float(self.dynamic_target_info.get('risk', 0.0))  # Store risk as initial pnl field
+                })
+            elif hasattr(self, 'excluded_pivots_info') and self.excluded_pivots_info:
+                trade_data.update({
+                    "reason": f"CPR Entry with {len(self.excluded_pivots_info)} exclusions"
+                })
+            else:
+                trade_data.update({
+                    "reason": f"{SL_TP_METHOD} Entry"
+                })
+            
+            log_trade_db(trade_data)
 
             logger.info("Entry executed: %s @ %.2f | trade_count=%d", self.position, self.entry_price, self.trade_count)
             return True
@@ -1551,7 +2170,20 @@ class MYALGO_TRADING_BOT:
             self.spot_entry_price = 0.0
             self.option_entry_price = 0.0
             
-            order_logger.info("Position cleared and reset")
+            # Reset CPR state
+            self.cpr_active = False
+            self.cpr_levels_sorted = []
+            self.cpr_targets = []
+            self.cpr_sl = 0.0
+            self.cpr_side = None
+            self.current_tp_index = 0
+            self.cpr_tp_hit_count = 0
+            
+            # Reset enhanced CPR attributes
+            self.dynamic_target_info = None
+            self.excluded_pivots_info = None
+            
+            order_logger.info("Position cleared and reset (including CPR state)")
             # main_logger.info(f"Position {previous_position} @ {previous_entry:.2f} exited due to: {reason}")
             
             return True
