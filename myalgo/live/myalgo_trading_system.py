@@ -40,11 +40,6 @@ PRODUCT = "MIS"
 CANDLE_TIMEFRAME = "5m"
 LOOKBACK_DAYS = 3
 SIGNAL_CHECK_INTERVAL = 1 # minutes (use integer minutes)
-# ===============================================================
-# 🔧 Dynamic LTP Breakout Confirmation Config
-# ===============================================================
-LTP_BREAKOUT_ENABLED = True          # enable / disable breakout waiting
-LTP_BREAKOUT_INTERVAL_MIN = 5        # minutes to wait for LTP breakout confirmatio
 
 # Indicators to compute
 EMA_PERIODS = [9, 20, 50, 200]
@@ -55,7 +50,7 @@ CPR = ['DAILY', 'WEEKLY','MONTHLY']
 # Risk settings
 STOPLOSS = 0
 TARGET = 5
-MAX_SIGNAL_RANGE = 50
+
 # Trade management
 MAX_TRADES_PER_DAY = 3
 STRATEGY = "myalgo_scalping"
@@ -73,7 +68,7 @@ EXPIRY_LOOKAHEAD_DAYS = 30
 LOT_QUANTITY =75
 LOT = 1
 QUANTITY = LOT * LOT_QUANTITY
-SL_ORDER_ENABLED = False
+
 # Websocket CONSTANTS
 HEARTBEAT_INTERVAL = 10        # seconds
 OPTION_POLL_INTERVAL = 1.0     # seconds (or higher if rate-limited)
@@ -127,7 +122,6 @@ RISK_REWARD_RATIO = 2.0        # e.g., 1.5 = 1:1.5, 2.0 = 1:2 risk-reward
 USE_DYNAMIC_TARGET = True      # Enable or disable dynamic target logic
 DYNAMIC_TARGET_METHOD = "NEAREST_VALID"  # "NEAREST_VALID" or "FIRST_BEYOND"
 
-
 # Define which CPR levels can be used as valid targets
 VALID_TARGET_LEVELS = ["pivot", "bc", "tc", "r1", "r2", "s1", "s2"]  # CPR level names to consider
 
@@ -149,7 +143,6 @@ position_logger = get_logger("positions")
 risk_logger = get_logger("risk_management")
 indicators_logger = get_logger("indicators")
 data_logger = get_logger("market_data")
-
 
 # Keep original logger for backward compatibility
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -300,10 +293,8 @@ class MYALGO_TRADING_BOT:
         self.scheduler = None
         self.trailing_levels = []
         self.trailing_index = 0
-        self.pending_breakout = None
-        self.pending_breakout_expiry = None
-        self.breakout_side = None
         self._state_lock = threading.Lock() # state lock to avoid race between entry placement and websocket LTP handling
+        
         # CPR_range_SL_TP specific attributes
         self.cpr_levels_sorted = []
         self.cpr_targets = []
@@ -312,6 +303,7 @@ class MYALGO_TRADING_BOT:
         self.current_tp_index = 0
         self.cpr_tp_hit_count = 0
         self.cpr_active = False
+        
         # Enhanced CPR attributes for dynamic targeting and exclusions
         self.dynamic_target_info = None
         self.excluded_pivots_info = None
@@ -342,7 +334,6 @@ class MYALGO_TRADING_BOT:
                 main_logger.info(f"  Target Method: {DYNAMIC_TARGET_METHOD}")
                 main_logger.info(f"  Valid Target Levels: {', '.join(VALID_TARGET_LEVELS)}")
             main_logger.info("===============================")
-
     # =========================================================
     # 💰 Auto PnL Reconciliation Helper
     # =========================================================
@@ -468,12 +459,6 @@ class MYALGO_TRADING_BOT:
             if self.scheduler:
                 self.scheduler.shutdown(wait=False)
                 logger.info("Scheduler stopped")
-
-    def reset_pending_breakout(self):
-        """Reset any active pending breakout state."""
-        self.pending_breakout = None
-        self.pending_breakout_expiry = None
-        self.breakout_side = None
     # -------------------------
     # WebSocket - Real time data LTP 
     # -------------------------  
@@ -482,39 +467,37 @@ class MYALGO_TRADING_BOT:
         try:
             dtype = data.get("type")
             symbol = data.get("symbol") or (data.get("data") or {}).get("symbol")
-            ltp = data.get("ltp") or (data.get("data") or {}).get("ltp")
+
+            if dtype == "quote":
+                q = data.get("data", {})
+                self.ltp = float(data.get("ltp", 0))
+                self.current_day_high = float(data.get("high", 0))
+                self.current_day_low = float(data.get("low", 0))
+                self.current_day_open = float(data.get("open", 0))
+                self.current_day_close = float(data.get("close", 0))
+            # Optional logging
+                order_logger.info(
+                f"LTP: {self.ltp} | High: {self.current_day_high} | Low: {self.current_day_low}"
+                )
+                high = q.get("high")
+                low = q.get("low")
+                if high is not None:
+                    self.current_day_high = float(high)
+                    data_logger.debug(f"Updated current day high: {self.current_day_high:.2f}")
+                if low is not None:
+                    self.current_day_low = float(low)
+                    data_logger.debug(f"Updated current day low: {self.current_day_low:.2f}")
+                ltp = q.get("ltp")
+            else:
+                ltp = data.get("ltp") or (data.get("data") or {}).get("ltp")
 
             if symbol is None or ltp is None:
-                position_logger.info("No LTP")
                 return
+
             # update raw LTP immediately
             self.ltp = float(ltp)
             now = datetime.now().strftime("%H:%M:%S")
-            # 🔍 Check LTP pending breakout confirmations
-            if LTP_BREAKOUT_ENABLED and self.pending_breakout:
-                signal_logger.info(f"✅ LTP breakout check")
-                now_ts = datetime.now(IST)
-                side = self.breakout_side
-                high = self.pending_breakout.get("high", 0)
-                low = self.pending_breakout.get("low", 0)
 
-                if now_ts > self.pending_breakout_expiry:
-                    signal_logger.info("❌ Breakout window expired — clearing pending signal.")
-                    self.reset_pending_breakout()
-                else:
-                    if side == "BUY" and self.ltp > high:
-                        signal_logger.info(f"✅ LTP breakout confirmed (BUY) at {self.ltp:.2f}")
-                        self.place_entry_order("BUY", None)
-                        self.reset_pending_breakout()
-                    elif side == "SELL" and self.ltp < low:
-                        signal_logger.info(f"✅ LTP breakout confirmed (SELL) at {self.ltp:.2f}")
-                        self.place_entry_order("SELL", None)
-                        self.reset_pending_breakout()
-                    else:
-                    # still waiting
-                        print(f"\r⏳ Waiting for {side} breakout | LTP={self.ltp:.2f}", end="")
-                # Don't process position logic while waiting
-                return
             # Snapshot critical state under lock — use these locals for all monitoring decisions
             with self._state_lock:
                 position = self.position
@@ -530,6 +513,7 @@ class MYALGO_TRADING_BOT:
             if not position or exit_in_progress or stoploss_price in (None, 0.0) or target_price in (None, 0.0):
                 print(f"\r[{now}] {symbol} LTP={self.ltp:.2f} | No Active Position", end="")
                 return
+
             # Choose LTP stream for monitoring (track_ltp). Do not re-read self.* after snapshot.
             track_ltp = None
             tracking_mode = "UNKNOWN"
@@ -569,7 +553,7 @@ class MYALGO_TRADING_BOT:
             current_time = time.time()
             if not hasattr(self, '_last_detailed_log') or current_time - self._last_detailed_log > 10:
                 position_logger.info("=== Position Status Update ===")
-                position_logger.info(f"Spot Entry: {position} @ {spot_entry_price:.2f}")
+                position_logger.info(f"Spot Entry: {position} @ {entry_price:.2f}")
                 position_logger.info(f"Option Entry: {position} @ {self.option_entry_price:.2f}")
                 position_logger.info(f"Tracking Mode: {tracking_mode}")
                 position_logger.info(f"Current Spot LTP: {track_ltp:.2f}")
@@ -1190,7 +1174,7 @@ class MYALGO_TRADING_BOT:
                     signal_logger.info(f"Exit Context: LTP={current_ltp:.2f}, Close={last_close:.2f}, EMA200={ema200:.2f}, P&L={unrealized_pnl:.2f}")
                     return f"CLOSE_ABOVE_EMA200 (close={last_close:.2f}, EMA200={ema200:.2f})"
             
-            signal_logger.info("⚪ NO EXIT SIGNAL - Position maintained")
+            signal_logger.info("⚪ NO EMA EXIT SIGNAL - Position maintained")
             return None
         except Exception:
             logger.exception("check_exit_signal failed")
@@ -1225,7 +1209,7 @@ class MYALGO_TRADING_BOT:
         """
         try:
             signal_logger.info("=== Evaluating Entry Signal ===")
-
+            
             if intraday_df is None or intraday_df.empty:
                 signal_logger.warning("No intraday data available for signal evaluation")
                 return None
@@ -1233,34 +1217,6 @@ class MYALGO_TRADING_BOT:
             # Get current LTP for logging context
             current_ltp = self.ltp if self.ltp else 0.0
             signal_logger.info(f"Current LTP: {current_ltp:.2f}")
-
-             # ---------------------------
-                # Handle any pending breakout first
-            # ---------------------------
-            if LTP_BREAKOUT_ENABLED and self.pending_breakout:
-                signal_logger.info(f"⏳ LTP breakout enabled.")
-                return None
-
-                    # Check breakout confirmation condition
-                last = intraday_df.iloc[-1] if len(intraday_df) > 0 else None
-                if last is not None:
-                    ltp = self.ltp or 0.0
-                    if pb["signal"] == "BUY":
-                        if ltp > pb["trigger_level"]:
-                            signal_logger.info(f"✅ LTP breakout confirmed for BUY: {ltp:.2f} > {pb['trigger_level']:.2f}")
-                            self.reset_pending_breakout()
-                            return "BUY"
-                        else:
-                            signal_logger.info(f"⏳ Waiting BUY breakout: LTP={ltp:.2f} <= {pb['trigger_level']:.2f} | Expires={self.pending_breakout_expiry.strftime('%H:%M:%S')}")
-                            return None
-                elif pb["signal"] == "SELL":
-                    if ltp < pb["trigger_level"]:
-                        signal_logger.info(f"✅ LTP breakout confirmed for SELL: {ltp:.2f} < {pb['trigger_level']:.2f}")
-                        self.reset_pending_breakout()
-                        return "SELL"
-                    else:
-                        signal_logger.info(f"⏳ Waiting SELL breakout: LTP={ltp:.2f} >= {pb['trigger_level']:.2f} | Expires={self.pending_breakout_expiry.strftime('%H:%M:%S')}")
-                        return None
 
             # ENHANCEMENT: Day High/Low Validation (Early Exit for Performance)
             # Perform this check BEFORE expensive technical analysis
@@ -1330,9 +1286,6 @@ class MYALGO_TRADING_BOT:
             cpr_s1 = float(self.static_indicators.get("DAILY", {}).get("s1", 0.0))
             prev_day_high = float(self.static_indicators.get("DAILY", {}).get("high",0.0))
             prev_day_low = float(self.static_indicators.get("DAILY", {}).get("low",0.0))
-
-
-
             # Log all key values for signal evaluation
             signal_logger.info(f"Signal Evaluation Data:")
             signal_logger.info(f"  Current Candle: Open={open_:.2f}, Close={close:.2f}")
@@ -1354,10 +1307,10 @@ class MYALGO_TRADING_BOT:
             long_cond6 = (close > open_)
             long_cond7 = (close > ema50)
             long_cond8 = (close > ema200)
-            long_cond9 = (current_ltp > high)
+            long_cond9 = (self.ltp > high)
             long_cond10 = (close > self.current_day_high)
              
-            long_cond = long_cond1 and long_cond2 and long_cond3 and long_cond4 and long_cond5 and long_cond6 and long_cond7 and long_cond8
+            long_cond =  long_cond1 and long_cond2 and long_cond3 and long_cond4 and long_cond5 and long_cond6 and long_cond7 and long_cond8  
             # long_cond = long_cond6
             # Evaluate Short conditions step by step
             short_cond1 = (close < prev_day_low)
@@ -1368,7 +1321,7 @@ class MYALGO_TRADING_BOT:
             short_cond6 = (close < open_)
             short_cond7 = (close < ema50)
             short_cond8 = (close < ema200)
-            short_cond9 = (current_ltp < low)
+            short_cond9 = (self.ltp < low)
             short_cond10 = (close < self.current_day_low)
 
             short_cond =  short_cond1 and short_cond2 and short_cond3 and short_cond4 and short_cond5 and short_cond6 and short_cond7 and short_cond8  
@@ -1400,49 +1353,43 @@ class MYALGO_TRADING_BOT:
             signal_logger.info(f"  10. Close < current day low: {close:.2f} < {self.current_day_low :.2f} = {short_cond10}")
             signal_logger.info(f"  SHORT Signal Valid: {short_cond}")
 
-            # === Breakout Filter Check ===
+            # Final validation: Apply day high/low restriction to confirmed signals
             if long_cond:
-                last_candle = last
-                if LTP_BREAKOUT_ENABLED:
-                    self.pending_breakout = {
-                        "type": "BUY",
-                        "timestamp": datetime.now(IST),
-                        "high": float(last_candle.get("high", 0)),
-                        "low": float(last_candle.get("low", 0))
-                        }
-                    now = datetime.now(IST)
-                    minute = now.minute
-                    next_multiple = ((minute // LTP_BREAKOUT_INTERVAL_MIN) + 1) * LTP_BREAKOUT_INTERVAL_MIN
-                    expiry = now.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=next_multiple)
-                    self.pending_breakout_expiry = expiry
-                    self.breakout_side = "BUY"
-                    signal_logger.info(f"📈 BUY signal waiting for LTP breakout > {self.pending_breakout['high']:.2f} until {self.pending_breakout_expiry.strftime('%H:%M:%S')}")
-                    return None
-                else:
-                    signal_logger.info("🟢 ENTRY SIGNAL GENERATED: BUY (no LTP breakout filter)")
-                    return "BUY"
-
+                if self.trade_count >= DAY_HIGH_LOW_VALIDATION_FROM_TRADE:
+                    # Final BUY validation: signal candle close > current day high
+                    if self.current_day_high is None:
+                        signal_logger.warning("🟡 BUY signal blocked: Current day high not available")
+                        return None
+                    sig_candle = intraday_df.iloc[-2]
+                    close_price = float(sig_candle.get("close", 0.0))
+                    if close_price <= float(self.current_day_high):
+                        signal_logger.info(f"🟡 BUY signal blocked: Signal close={close_price:.2f} <= Day high={self.current_day_high:.2f}")
+                        return None
+                    signal_logger.info(f"✅ BUY signal approved: Signal close={close_price:.2f} > Day high={self.current_day_high:.2f}")
+                
+                signal_logger.info("🟢 ENTRY SIGNAL GENERATED: BUY")
+                signal_logger.info(f"Entry Context: LTP={current_ltp:.2f}, Close={close:.2f}, EMA9={ema9:.2f}, EMA20={ema20:.2f}")
+                logger.info("Entry signal -> BUY | close=%.2f prev_day_high=%.2f cpr_r1=%.2f ema9=%.2f ema20=%.2f", close, prev_day_high, cpr_r1, ema9, ema20)
+                return "BUY"
+                
             if short_cond:
-                last_candle = dyn["last_candle"]
-                if LTP_BREAKOUT_ENABLED:
-                    self.pending_breakout = {
-                        "type": "SELL",
-                        "timestamp": datetime.now(IST),
-                        "high": float(last_candle.get("high", 0)),
-                        "low": float(last_candle.get("low", 0))
-                    }
-                    now = datetime.now(IST)
-                    minute = now.minute
-                    next_multiple = ((minute // LTP_BREAKOUT_INTERVAL_MIN) + 1) * LTP_BREAKOUT_INTERVAL_MIN
-                    expiry = now.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=next_multiple)
-                    self.pending_breakout_expiry = expiry
-                    self.breakout_side = "SELL"
-                    signal_logger.info(f"📉 SELL signal waiting for LTP breakout < {self.pending_breakout['low']:.2f} until {self.pending_breakout_expiry.strftime('%H:%M:%S')}")
-                    return None
-                else:
-                    signal_logger.info("🔴 ENTRY SIGNAL GENERATED: SELL (no LTP breakout filter)")
-                    return "SELL"
-                                    
+                if self.trade_count >= DAY_HIGH_LOW_VALIDATION_FROM_TRADE:
+                    # Final SELL validation: signal candle close < current day low
+                    if self.current_day_low is None:
+                        signal_logger.warning("🟡 SELL signal blocked: Current day low not available")
+                        return None
+                    sig_candle = intraday_df.iloc[-2]
+                    close_price = float(sig_candle.get("close", 0.0))
+                    if close_price >= float(self.current_day_low):
+                        signal_logger.info(f"🟡 SELL signal blocked: Signal close={close_price:.2f} >= Day low={self.current_day_low:.2f}")
+                        return None
+                    signal_logger.info(f"✅ SELL signal approved: Signal close={close_price:.2f} < Day low={self.current_day_low:.2f}")
+                
+                signal_logger.info("🔴 ENTRY SIGNAL GENERATED: SELL")
+                signal_logger.info(f"Entry Context: LTP={current_ltp:.2f}, Close={close:.2f}, EMA9={ema9:.2f}, EMA20={ema20:.2f}")
+                logger.info("Entry signal -> SELL | close=%.2f prev_day_low=%.2f cpr_s1=%.2f ema9=%.2f ema20=%.2f", close, prev_day_low, cpr_s1, ema9, ema20)
+                return "SELL"
+            
             signal_logger.info("⚪ NO ENTRY SIGNAL - Conditions not met")
             return None
         except Exception:
@@ -1502,82 +1449,59 @@ class MYALGO_TRADING_BOT:
         """
         try:
             # defensive
-                if intraday_df is None or intraday_df.empty or len(intraday_df) < 2:
+            if intraday_df is None or intraday_df.empty or len(intraday_df) < 2:
                 # fallback to fixed STOPLOSS/TARGET if no candle
-                    if base_price is None:
-                        base_price = float(self.entry_price or 0.0)
-                    if signal == "BUY":
-                        self.stoploss_price = round(base_price - STOPLOSS, 2)
-                        self.target_price = round(base_price + TARGET, 2)
-                    else:
-                        self.stoploss_price = round(base_price + STOPLOSS, 2)
-                        self.target_price = round(base_price - TARGET, 2)
-                    self.trailing_levels = []
-                    self.trailing_index = 0
-                    self.tsl_step = abs(self.target_price - base_price) if self.target_price and base_price else TARGET
-                    position_logger.info("Signal candle not found -> fallback SL/TP set")
-                    return True
-
-                sig_candle = intraday_df.iloc[-2]
-                sig_high = float(sig_candle.get('high', 0) or 0)
-                sig_low = float(sig_candle.get('low', 0) or 0)
-                
                 if base_price is None:
                     base_price = float(self.entry_price or 0.0)
-
-            # --- Apply integrated enhanced SL/TP logic ---
-                sl, tp, sig_range = self.calculate_signal_candle_sl_tp(signal, sig_high, sig_low)
-                self.stoploss_price = round(sl, 2)
-                self.target_price = round(tp, 2)
-
-                # Initialize trailing variables
+                if signal == "BUY":
+                    self.stoploss_price = round(base_price - STOPLOSS, 2)
+                    self.target_price = round(base_price + TARGET, 2)
+                else:
+                    self.stoploss_price = round(base_price + STOPLOSS, 2)
+                    self.target_price = round(base_price - TARGET, 2)
                 self.trailing_levels = []
                 self.trailing_index = 0
-                try:
-                    self.tsl_step = abs(self.target_price - base_price) if self.target_price and base_price else sig_range
-                    if self.tsl_step == 0:
-                        self.tsl_step = sig_range
-                except Exception:
-                    self.tsl_step = sig_range
-
-                position_logger.info(
-                    f"Initialized Signal Candle Range SL/TP | SignalCandle H={sig_high:.2f} L={sig_low:.2f} Range={sig_range:.2f}"
-                )
-                position_logger.info(
-                    f"SL={self.stoploss_price:.2f}, TP={self.target_price:.2f}, TSL_step={self.tsl_step:.2f}, "
-                    f"MaxRangeCap={MAX_SIGNAL_RANGE}, RR={RISK_REWARD_RATIO}"
-                )
+                self.tsl_step = abs(self.target_price - base_price) if self.target_price and base_price else TARGET
+                position_logger.info("Signal candle not found -> fallback SL/TP set")
                 return True
+
+            sig_candle = intraday_df.iloc[-2]
+            sig_high = float(sig_candle.get('high', 0) or 0)
+            sig_low = float(sig_candle.get('low', 0) or 0)
+            sig_range = (sig_high - sig_low)
+            TARGET = sig_range
+
+            if base_price is None:
+                base_price = float(self.entry_price or 0.0)
+
+            if signal == "BUY":
+                # SL from signal candle low, TP from base_price + configured TARGET
+                self.stoploss_price = round(sig_low - STOPLOSS, 2)
+                self.target_price = round(base_price + TARGET, 2)
+            else:
+                self.stoploss_price = round(sig_high + STOPLOSS, 2)
+                self.target_price = round(base_price - TARGET, 2)
+
+            # initialize trailing meta
+            self.trailing_levels = []
+            self.trailing_index = 0
+            # step for future TP increments: use first TP - entry as the base step
+            try:
+                self.tsl_step = abs(self.target_price - base_price) if self.target_price is not None and base_price is not None else TARGET
+                if self.tsl_step == 0:
+                    self.tsl_step = TARGET
+            except Exception:
+                self.tsl_step = TARGET
+
+            position_logger.info(f"Initialized Signal Candle Range SL/TP | SignalCandle H={sig_high:.2f} L={sig_low:.2f}")
+            position_logger.info(f"SL={self.stoploss_price:.2f}, TP={self.target_price:.2f}, TSL_step={self.tsl_step:.2f}")
+            return True
         except Exception:
-                    position_logger.exception("initialize_signal_candle_sl_tp failed")
-                    return False        
+            position_logger.exception("initialize_signal_candle_sl_tp failed")
+            return False        
     # -------------------------
     # CPR_range_SL_TP Implementation
     # -------------------------
-    def calculate_signal_candle_sl_tp(self, signal: str, high: float, low: float):
-        """Enhanced Signal Candle Range SL/TP logic with capped target range."""
-        candle_range = abs(high - low)
-        # Stop Loss logic
-        if signal == "BUY":
-            raw_sl = low
-            sl = high - MAX_SIGNAL_RANGE if (high - low) > MAX_SIGNAL_RANGE else raw_sl
-            sl = low
-        else:
-            raw_sl = high
-            sl = low + MAX_SIGNAL_RANGE if (high - low) > MAX_SIGNAL_RANGE else raw_sl
-            # Target logic: if candle range < MAX_SIGNAL_RANGE, use dynamic; else cap at MAX_SIGNAL_RANGE * reward
-        if candle_range < MAX_SIGNAL_RANGE:
-            target_range = candle_range * RISK_REWARD_RATIO
-        else:
-            target_range = MAX_SIGNAL_RANGE * RISK_REWARD_RATIO
-
-        if signal == "BUY":
-            tp = high + target_range
-        else:
-            tp = low - target_range
-
-        return sl, tp, candle_range
-
     def initialize_cpr_range_sl_tp(self, signal, intraday_df, base_price=None):
         """
         Initialize CPR-based dynamic SL/TP system:
@@ -1623,17 +1547,14 @@ class MYALGO_TRADING_BOT:
             self.cpr_side = signal.upper()
             
             # Initialize SL and targets based on signal direction
-
             if self.cpr_side == "BUY":
                 # SL from signal candle low
-                raw_sl = round(signal_candle_low - STOPLOSS, 2)
-                self.cpr_sl = signal_candle_high - MAX_SIGNAL_RANGE if signal_candle_high - signal_candle_low > MAX_SIGNAL_RANGE else raw_sl
+                self.cpr_sl = round(signal_candle_low - STOPLOSS, 2)
                 # Targets: all levels above entry price
                 self.cpr_targets = [lvl for lvl in self.cpr_levels_sorted if lvl > base_price]
             else:  # SELL
                 # SL from signal candle high  
-                raw_sl = round(signal_candle_high + STOPLOSS, 2)
-                self.cpr_sl = signal_candle_low + MAX_SIGNAL_RANGE if signal_candle_high - signal_candle_low  > MAX_SIGNAL_RANGE else raw_sl
+                self.cpr_sl = round(signal_candle_high + STOPLOSS, 2)
                 # Targets: all levels below entry price (reversed order)
                 self.cpr_targets = [lvl for lvl in sorted(self.cpr_levels_sorted, reverse=True) if lvl < base_price]
                 
@@ -1687,7 +1608,7 @@ class MYALGO_TRADING_BOT:
             sig_candle = intraday_df.iloc[-2]
             signal_candle_low = float(sig_candle.get('low', 0) or 0)
             signal_candle_high = float(sig_candle.get('high', 0) or 0)
-            signal_candle_range = abs(signal_candle_high - signal_candle_low)
+            
             # Merge pivot levels with exclusion filtering
             if not self.static_indicators:
                 position_logger.error("No static indicators available for CPR levels")
@@ -1726,11 +1647,9 @@ class MYALGO_TRADING_BOT:
             
             # Calculate initial SL from signal candle
             if self.cpr_side == "BUY":
-                raw_sl = round(signal_candle_low - STOPLOSS, 2)
-                initial_sl = signal_candle_high - MAX_SIGNAL_RANGE if signal_candle_range > MAX_SIGNAL_RANGE else raw_sl
+                initial_sl = round(signal_candle_low - STOPLOSS, 2)
             else:  # SELL
-                raw_sl = round(signal_candle_high + STOPLOSS, 2)
-                initial_sl = signal_candle_low + MAX_SIGNAL_RANGE if signal_candle_range > MAX_SIGNAL_RANGE else raw_sl
+                initial_sl = round(signal_candle_high + STOPLOSS, 2)
                 
             self.cpr_sl = initial_sl
             self.stoploss_price = initial_sl
@@ -1881,10 +1800,10 @@ class MYALGO_TRADING_BOT:
             
             # Check SL conditions
             if side == "BUY" and current_ltp <= self.cpr_sl:
-                position_logger.warning(f"CPR BUY | SL Hit: {current_ltp:.2f} <= {self.cpr_sl:.2f}")
+                position_logger.warning(f"CPR BUY SL Hit: {current_ltp:.2f} <= {self.cpr_sl:.2f}")
                 return "SL_HIT"
             elif side == "SELL" and current_ltp >= self.cpr_sl:
-                position_logger.warning(f"CPR SELL | SL Hit: {current_ltp:.2f} >= {self.cpr_sl:.2f}")
+                position_logger.warning(f"CPR SELL SL Hit: {current_ltp:.2f} >= {self.cpr_sl:.2f}")
                 return "SL_HIT"
                 
             # Check TP conditions
@@ -1969,7 +1888,7 @@ class MYALGO_TRADING_BOT:
                 return fallback_target, 0, 0, "FALLBACK", "Invalid risk distance"
             
             # Compute required reward distance
-            reward_distance = risk 
+            reward_distance = risk * RISK_REWARD_RATIO
             
             # Determine required minimum target price
             if signal == "BUY":
@@ -2196,8 +2115,9 @@ class MYALGO_TRADING_BOT:
                     exchange=exit_exchange,
                     action=sl_action,
                     quantity=QUANTITY,
-                    price_type="SL-M",
+                    price_type="SL",
                     product=PRODUCT,
+                    price=str(sl_price),
                     trigger_price=str(sl_price)
                 )
                 order_logger.info(f"SL place order response (attempt {attempt}): {resp}")
@@ -2229,22 +2149,17 @@ class MYALGO_TRADING_BOT:
         order_logger.error(f"Failed to place/confirm SL after {MAX_SL_RETRIES} attempts")
         return None
 
-# PATCH: place_entry_order - clear exit_in_progress after initialization
-# File: nifty_myalgo_trading_system.py
-# This is a drop-in replacement for the place_entry_order method.
-# Apply by replacing the existing method in your file with this version.
-
+                            
     def place_entry_order(self, signal, intraday_df):
         """
         Enhanced entry order placement with:
         1. Stop Loss Automation (25% rule)
-        2. Option symbol resolution and SL/TP initialization
-
-        BUGFIX: ensure self.exit_in_progress is cleared after SL/TP initialization
-        so that on_ltp_update() will begin monitoring the newly opened position.
+        
+        Note: Day High/Low Entry Restrictions are now handled in check_entry_signal() 
+        for better performance and architectural separation.
         """
         try:
-            order_logger.info("=== PLACING ENTRY ORDER ===")
+            order_logger.info("=== ENHANCED PLACING ENTRY ORDER ===")
             order_logger.info(f"Signal: {signal}")
 
             if self.trade_count >= MAX_TRADES_PER_DAY:
@@ -2272,11 +2187,11 @@ class MYALGO_TRADING_BOT:
                 except Exception:
                     spot_ltp = self.ltp or 0.0
                     order_logger.warning(f"Failed to fetch spot LTP, using cached: {spot_ltp:.2f}")
-                strike = self.get_option_strike(OPTION_STRIKE_SELECTION, spot_ltp, opt_type)
-                order_logger.info(f"Resolved Strike: {strike} (selection: {OPTION_STRIKE_SELECTION})")
-                expiry = self.get_nearest_weekly_expiry()
+                strike = self.get_option_strike(OPTION_STRIKE_SELECTION, spot_ltp, opt_type) # Strike selection
+                order_logger.info(f"Resolved Strike: {strike} (selection: {OPTION_STRIKE_SELECTION})") 
+                expiry = self.get_nearest_weekly_expiry() # Expiry date
                 order_logger.info(f"Selected Expiry: {expiry}")
-                opt_symbol = self.get_option_symbol_via_search_api(expiry, strike, opt_type)
+                opt_symbol = self.get_option_symbol_via_search_api(expiry, strike, opt_type) # Option symbol
                 if not opt_symbol:
                     order_logger.error(f"Failed to resolve option symbol: expiry={expiry}, strike={strike}, type={opt_type}")
                     logger.warning("Could not resolve option symbol for expiry=%s strike=%s type=%s", expiry, strike, opt_type)
@@ -2288,18 +2203,20 @@ class MYALGO_TRADING_BOT:
                 order_logger.info(f"Option Exchange: {tradable_exchange}")
                 logger.info("Placing %s option order -> %s (%s) strike=%s", opt_type, tradable_symbol, tradable_exchange, strike)
 
-            resp = self.client.placeorder(strategy=STRATEGY, symbol=tradable_symbol, exchange=tradable_exchange,
-                                      action=signal, quantity=QUANTITY, price_type="MARKET", product=PRODUCT)
+            
 
+            resp = self.client.placeorder(strategy=STRATEGY, symbol=tradable_symbol, exchange=tradable_exchange,
+                                          action=signal, quantity=QUANTITY, price_type="MARKET", product=PRODUCT)
+            
             if not isinstance(resp, dict) or resp.get("status") != "success":
                 order_logger.error(f"Entry order failed: {resp}")
                 logger.warning("Entry order failed: %s", resp)
                 return False
-
-            order_logger.info(f"Order placed successfully. dynamic SL/TP calculation started")
-            self.trade_start_time = datetime.now()
-            # mark that we are initializing (prevent concurrent monitoring during setup)
+            self.exit_in_progress = False
+            order_logger.info(f"Dynamic SL/TP calculation initiated")
+            
             with self._state_lock:
+                # guard monitoring while we initialize
                 self.exit_in_progress = True
                 self.position = signal
 
@@ -2308,7 +2225,7 @@ class MYALGO_TRADING_BOT:
                 if USE_SPOT_FOR_SLTP:
                     try:
                         q = self.client.quotes(symbol=SYMBOL, exchange=EXCHANGE)
-                        self.spot_entry_price = float((q.get("data") or {}).get("ltp", 0) or 0)
+                        self.spot_entry_price = current_ltp
                         base_price = self.spot_entry_price
                         risk_logger.info(f"SL/TP tracking via SPOT | Spot Entry = {base_price:.2f}")
                     except Exception:
@@ -2316,116 +2233,158 @@ class MYALGO_TRADING_BOT:
                         base_price = self.spot_entry_price
                         risk_logger.warning(f"Failed to fetch spot for SL/TP, using cached: {base_price:.2f}")
                 elif USE_OPTION_FOR_SLTP:
-                    # option entry price will be set after execution retrieval; temporarily keep base_price
-                    risk_logger.info("SL/TP tracking via OPTION; option exec price to be recorded after execution")
+                    self.option_entry_price = float(exec_price)
+                    base_price = self.option_entry_price
+                    risk_logger.info(f"SL/TP tracking via OPTION | Option Entry = {base_price:.2f}")
 
-                # Initialize SL/TP using configured method
+                # Get intraday data for SL/TP initialization
+                intraday = intraday_df
+                
+                # Initialize SL/TP using the configured method
                 if SL_TP_METHOD == "Signal_candle_range_SL_TP":
-                    self.initialize_signal_candle_sl_tp(signal, intraday_df, base_price=base_price)
+                    self.initialize_signal_candle_sl_tp(signal, intraday, base_price=base_price)
                 elif SL_TP_METHOD == "CPR_range_SL_TP":
+                    risk_logger.info("Initializing CPR Range SL/TP method")
+                    # Use enhanced method if exclusions or dynamic targeting are enabled
                     if CPR_EXCLUDE_PIVOTS or USE_DYNAMIC_TARGET:
                         risk_logger.info("Using Enhanced CPR method with exclusions/dynamic targeting")
-                        cpr_success = self.initialize_cpr_range_sl_tp_enhanced(signal, intraday_df, base_price=base_price)
+                        cpr_success = self.initialize_cpr_range_sl_tp_enhanced(signal, intraday, base_price=base_price)
                     else:
                         risk_logger.info("Using Standard CPR method")
-                        cpr_success = self.initialize_cpr_range_sl_tp(signal, intraday_df, base_price=base_price)
-
+                        cpr_success = self.initialize_cpr_range_sl_tp(signal, intraday, base_price=base_price)
+                    
                     if not cpr_success:
                         risk_logger.warning("CPR initialization failed, falling back to Signal Candle method")
-                        self.initialize_signal_candle_sl_tp(signal, intraday_df, base_price=base_price)
+                        self.initialize_signal_candle_sl_tp(signal, intraday, base_price=base_price)
                 else:
-                    # fallback: fixed TP/SL
+                    # Override SL with automated 25% SL, keep existing TP logic
+                     # Use automated SL
                     if signal == "BUY":
-                        self.stoploss_price = round(base_price - STOPLOSS, 2)
+                        self.stoploss_price = round(base_price - STOPLOSS, 2) 
                         self.target_price = round(base_price + TARGET, 2)
                     else:
-                        self.stoploss_price = round(base_price + STOPLOSS, 2)
+                        self.stoploss_price = round(base_price + STOPLOSS, 2) 
                         self.target_price = round(base_price - TARGET, 2)
 
-                # finalize basic state vars
+                # Ensure the automated SL is set correctly
+                # self.option_stop_loss = round(sl_price, 2)
                 self.trade_count += 1
-                self.entry_price = round(base_price, 2)
-
-            # Fetch executed price and finalize entry bookkeeping
-            entry_order_id = resp.get("orderid")
-            if entry_order_id:
-                exec_price = self.get_executed_price(entry_order_id)
-                order_logger.info(f"Order id :{entry_order_id}")
-            else:
-                order_logger.info(f"Order not palced find a response here: {resp}")
-                return False
-
-            if exec_price is not None:
-                exec_price = float(exec_price)
-                self.entry_price = exec_price
-                self.option_entry_price = exec_price
+                self.entry_price = round(base_price,2)
+                # re-enable monitoring only after SL/TP set
             
-            # --- 🧩 PLACE STOP LOSS ORDER after confirmed entry ---
-            if SL_ORDER_ENABLED:
-                try:
-                    # Determine which price to use for SL placement
-                    exit_symbol = tradable_symbol
-                    exit_exchange = tradable_exchange
-                    entry_side = signal.upper()
-
-                    # Use existing computed stoploss_price
-                    sl_price = self.compute_25pct_sl(self.entry_price, entry_side)
-
-                    order_logger.info(f"Attempting to place linked SL order after entry confirmation...")
-                    sl_order_id = self.place_and_confirm_stoploss(exit_symbol, exit_exchange, entry_side, sl_price)
-
-                    if sl_order_id:
-                        self.sl_order_id = sl_order_id
-                        order_logger.info(f"✅ Stop Loss Order Placed Successfully | ID={sl_order_id} | SL={sl_price:.2f}")
-                    else:
-                        order_logger.warning("⚠️ Stop Loss order placement failed after entry confirmation.")
-                except Exception:
-                    order_logger.exception("Error placing SL order after entry execution")
-                else:
-                    order_logger.exception("SL order not enabled")
-
-
-            # BUGFIX: Re-enable websocket-based monitoring now that SL/TP and position are initialized.
-            with self._state_lock:
-                self.exit_in_progress = False
-
+            entry_order_id = resp.get("orderid")   
+            exec_price = self.get_executed_price(entry_order_id)
+            self.entry_price = float(exec_price)
+            self.trade_start_time = datetime.now()
+            
             order_logger.info(f"Order ID: {entry_order_id}")
             order_logger.info(f"Order Response: {resp}")
+            order_logger.info("=== ORDER PLACEMENT ===")
+            order_logger.info(f"Symbol: {tradable_symbol}")
+            order_logger.info(f"Exchange: {tradable_exchange}")
+            order_logger.info(f"Action: {signal}")
+            order_logger.info(f"Quantity: {QUANTITY}")
+            order_logger.info(f"Order Type: MARKET")
+            order_logger.info(f"Product: {PRODUCT}")
+            order_logger.info(f"Strategy: {STRATEGY}")
+            order_logger.info("Waiting for order execution confirmation...")
+            
+            
+            if exec_price is None:
+                order_logger.error("Could not confirm executed price for entry order")
+                logger.warning("Could not confirm executed price for entry")
+                return False
+            order_logger.info(f"ORDER EXECUTED: Price = {exec_price:.2f}")
 
-            # final logging and DB record
-            order_logger.info("=== POSITION ESTABLISHED ===")
+            # Stop Loss Automation (25% rule)
+            # sl_price = self.compute_25pct_sl(exec_price, signal)
+            # order_logger.info(f"Calculated 25% SL price: {sl_price:.2f}")
+            
+            # sl_order_id = self.place_and_confirm_stoploss(tradable_symbol, tradable_exchange, signal, sl_price)
+            # if not sl_order_id:
+                # order_logger.error("⚠️ SL not confirmed after retries. Closing entry position.")
+                # try:
+                #     close_action = "SELL" if signal == "BUY" else "BUY"
+                #     close_resp = self.client.placeorder(
+                #         strategy=STRATEGY, 
+                #         symbol=tradable_symbol, 
+                #         exchange=tradable_exchange,
+                #         action=close_action, 
+                #         quantity=QUANTITY, 
+                #         price_type="MARKET", 
+                #         product=PRODUCT
+                #     )
+                #     order_logger.info(f"Emergency close response: {close_resp}")
+                # except Exception:
+                #     order_logger.exception("Failed to close executed entry after SL confirmation failure")
+                # return False
+            
+            # order_logger.info(f"✅ SL order confirmed: {sl_order_id}")
+            
+            # Get option entry price for tracking
+            # q_opt = self.client.quotes(symbol=self.option_symbol, exchange=OPTION_EXCHANGE)
+            self.option_entry_price = exec_price # Option entry price
+
+            # --- Lock and initialize position & SL/TP atomically ---
+
+            # final logging
+            order_logger.info("=== ENHANCED POSITION ESTABLISHED ===")
             order_logger.info(f"Position: {self.position}")
             order_logger.info(f"Entry Price: {self.entry_price:.2f}")
-            order_logger.info(f"Stop Loss: {self.stoploss_price:.2f}")
+            order_logger.info(f"Automated Stop Loss: {self.option_stop_loss:.2f} (25% buffer)")
             order_logger.info(f"Target: {self.target_price:.2f}")
             order_logger.info(f"Quantity: {QUANTITY}")
             order_logger.info(f"Trade Count: {self.trade_count}/{MAX_TRADES_PER_DAY}")
+            # order_logger.info(f"SL Order ID: {sl_order_id}")
 
-            # log trade to DB (existing helper)
+            risk_amount = abs(self.entry_price - (self.stoploss_price or 0))
+            reward_amount = abs((self.target_price or 0) - self.entry_price)
+            try:
+                risk_logger.info(f"Risk Amount: {risk_amount:.2f}")
+                risk_logger.info(f"Reward Amount: {reward_amount:.2f}")
+                if risk_amount > 0:
+                    risk_logger.info(f"Risk:Reward Ratio: 1:{reward_amount/risk_amount:.2f}")
+            except Exception:
+                pass
+
+            # Prepare enhanced trade logging data
             trade_data = {
                 "timestamp": self.trade_start_time,
                 "symbol": tradable_symbol,
-                "spot_price": getattr(self, 'spot_entry_price', 0.0),
+                "spot_price": self.spot_entry_price,
                 "action": "CALL" if signal.upper() == "BUY" else "PUT",
                 "quantity": QUANTITY,
-                "price": getattr(self, 'option_entry_price', self.entry_price),
+                "price": self.option_entry_price,
                 "order_id": entry_order_id,
                 "strategy": STRATEGY,
                 "leg_type": "ENTRY",
                 "leg_status": "open"
             }
+            
+            # Add enhanced trade data with SL automation info
+            if hasattr(self, 'dynamic_target_info') and self.dynamic_target_info:
+                trade_data.update({
+                    "reason": f"Enhanced Entry with 25% SL - {self.dynamic_target_info.get('target_key', 'Unknown')}",
+                    "pnl": float(self.dynamic_target_info.get('risk', 0.0))  # Store risk as initial pnl field
+                })
+            elif hasattr(self, 'excluded_pivots_info') and self.excluded_pivots_info:
+                trade_data.update({
+                    "reason": f"Enhanced Entry with 25% SL - {len(self.excluded_pivots_info)} CPR exclusions"
+                })
+            else:
+                trade_data.update({
+                    "reason": f"Enhanced Entry with 25% SL - {SL_TP_METHOD}"
+                })
+            
             log_trade_db(trade_data)
 
-            logger.info("Entry executed: %s @ %.2f | SL @ %.2f | trade_count=%d",
-                    self.position, self.entry_price, self.stoploss_price, self.trade_count)
+            logger.info("Enhanced entry executed: %s @ %.2f | SL @ %.2f | trade_count=%d", 
+                       self.position, self.entry_price, self.stoploss_price, self.trade_count)
             return True
 
         except Exception:
             logger.exception("place_entry_order failed")
             order_logger.error("Failed to place enhanced entry order", exc_info=True)
-            # ensure flag cleared on error so bot can continue
-            with self._state_lock:
-                self.exit_in_progress = False
             return False
 
     def place_exit_order(self, reason="Manual"):
