@@ -39,11 +39,11 @@ EXCHANGE = "NSE_INDEX"
 PRODUCT = "MIS"
 CANDLE_TIMEFRAME = "5m"
 LOOKBACK_DAYS = 3
-SIGNAL_CHECK_INTERVAL = 1 # minutes (use integer minutes)
+SIGNAL_CHECK_INTERVAL = 5# minutes (use integer minutes)
 # ===============================================================
 # 🔧 Dynamic LTP Breakout Confirmation Config
 # ===============================================================
-LTP_BREAKOUT_ENABLED = True          # enable / disable breakout waiting
+LTP_BREAKOUT_ENABLED = False          # enable / disable breakout waiting
 LTP_BREAKOUT_INTERVAL_MIN = 5        # minutes to wait for LTP breakout confirmatio
 
 # Indicators to compute
@@ -59,9 +59,6 @@ MAX_SIGNAL_RANGE = 50
 # Trade management
 MAX_TRADES_PER_DAY = 3
 STRATEGY = "myalgo_scalping"
-
-# IST timezone
-IST = pytz.timezone("Asia/Kolkata")
 
 # Option trading config
 OPTION_ENABLED = True
@@ -137,6 +134,9 @@ MONTH_MAP = {
     7: "JUL", 8: "AUG", 9: "SEP", 10: "OCT", 11: "NOV", 12: "DEC"
 }
 
+
+# IST timezone
+IST = pytz.timezone("Asia/Kolkata")
 # Enhanced Logging System - Fix import path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.logger import get_logger, log_trade_execution
@@ -483,7 +483,11 @@ class MYALGO_TRADING_BOT:
             dtype = data.get("type")
             symbol = data.get("symbol") or (data.get("data") or {}).get("symbol")
             ltp = data.get("ltp") or (data.get("data") or {}).get("ltp")
-
+            if symbol == self.option_symbol:
+                self.option_ltp = float(ltp)
+                return
+            elif symbol == SYMBOL:
+                self.ltp = float(ltp)
             if symbol is None or ltp is None:
                 position_logger.info("No LTP")
                 return
@@ -504,11 +508,13 @@ class MYALGO_TRADING_BOT:
                 else:
                     if side == "BUY" and self.ltp > high:
                         signal_logger.info(f"✅ LTP breakout confirmed (BUY) at {self.ltp:.2f}")
-                        self.place_entry_order("BUY", None)
+                        intraday = self.get_intraday()
+                        self.place_entry_order("BUY", intraday)
                         self.reset_pending_breakout()
                     elif side == "SELL" and self.ltp < low:
                         signal_logger.info(f"✅ LTP breakout confirmed (SELL) at {self.ltp:.2f}")
-                        self.place_entry_order("SELL", None)
+                        intraday = self.get_intraday()
+                        self.place_entry_order("SELL", intraday)
                         self.reset_pending_breakout()
                     else:
                     # still waiting
@@ -536,13 +542,15 @@ class MYALGO_TRADING_BOT:
             if USE_SPOT_FOR_SLTP:
                 track_ltp = self.ltp
                 tracking_mode = "SPOT"
-                q_opt = self.client.quotes(symbol=option_symbol, exchange=OPTION_EXCHANGE)
-                track_option_ltp = float((q_opt.get("data") or {}).get("ltp", 0) or 0)
+                track_option_ltp = getattr(self, "option_ltp", None)
+                if track_option_ltp is None:
+                    position_logger.debug("Option LTP not available yet, using entry price for PnL placeholder")
+                    track_option_ltp = option_entry_price if option_entry_price else entry_price
                 self.option_ltp = track_option_ltp
             elif USE_OPTION_FOR_SLTP and option_symbol:
                 try:
-                    q_opt = self.client.quotes(symbol=option_symbol, exchange=OPTION_EXCHANGE)
-                    track_ltp = float((q_opt.get("data") or {}).get("ltp", 0) or 0)
+                    # q_opt = self.client.quotes(symbol=option_symbol, exchange=OPTION_EXCHANGE)
+                    track_ltp = getattr(self, "option_ltp", None)
                     tracking_mode = "OPTION"
                     self.option_ltp = track_ltp
                 except Exception:
@@ -677,7 +685,7 @@ class MYALGO_TRADING_BOT:
             self.client.connect()
             try:
                 # SDK variations: try mode argument, otherwise call without
-                self.client.subscribe_quote(self.instrument, on_data_received=self.on_ltp_update, mode=2)
+                self.client.subscribe_ltp(self.instrument, on_data_received=self.on_ltp_update)
             except TypeError:
                 self.client.subscribe_ltp(self.instrument, on_data_received=self.on_ltp_update)
             logger.info("Subscribed to LTP")
@@ -695,52 +703,6 @@ class MYALGO_TRADING_BOT:
             except Exception:
                 pass
             logger.info("websocket closed")
-    # -------------------------
-    # Get Intraday Candle
-    # -------------------------
-    # def get_intraday(self, days=LOOKBACK_DAYS):
-    #     try:
-    #         end_date = datetime.now()
-    #         start_date = end_date - timedelta(days=days)
-    #         raw = self.client.history(symbol=SYMBOL, exchange=EXCHANGE, interval=CANDLE_TIMEFRAME,
-    #                                   start_date=start_date.strftime("%Y-%m-%d"), end_date=end_date.strftime("%Y-%m-%d"))
-    #         if isinstance(raw, pd.DataFrame):
-    #             df = raw.copy()
-    #         elif isinstance(raw, dict) and "data" in raw:
-    #             df = pd.DataFrame(raw["data"])
-    #         else:
-    #             df = pd.DataFrame()
-    #         # ensure numeric columns if present
-    #         for c in ["open", "high", "low", "close", "ltp", "volume"]:
-    #             if c in df.columns:
-    #                 df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    #             # ✅ Fetch current day OHLC from daily interval and store it
-    #         daily_raw = self.client.history(
-    #             symbol=SYMBOL,
-    #             exchange=EXCHANGE,
-    #             interval="D",   # Daily interval
-    #             start_date=datetime.now().strftime("%Y-%m-%d"),
-    #             end_date=datetime.now().strftime("%Y-%m-%d")
-    #         )
-
-    #         if isinstance(daily_raw, pd.DataFrame) and not daily_raw.empty:
-    #             latest = daily_raw.iloc[-1]
-    #             self.current_day_high = float(latest.get("high", self.current_day_high or 0))
-    #             self.current_day_low = float(latest.get("low", self.current_day_low or 0))
-    #             self.current_day_open = float(latest.get("open", 0))
-    #             self.current_day_close = float(latest.get("close", 0))
-
-    #             data_logger.info(
-    #                 f"📅 Updated Current Day OHLC | O={self.current_day_open:.2f} H={self.current_day_high:.2f} "
-    #                 f"L={self.current_day_low:.2f} C={self.current_day_close:.2f}"
-    #             )
-    #         else:
-    #             data_logger.warning("⚠️ Could not update current day OHLC — daily data empty")
-    #         return df
-    #     except Exception:
-    #         logger.exception("get_intraday failed")
-    #         return pd.DataFrame()
     
     def retry_api_call(self, func, max_retries=3, delay=2, description="API call", *args, **kwargs):
         """
@@ -759,6 +721,11 @@ class MYALGO_TRADING_BOT:
                 # ✅ Validate non-empty dict response
                 if isinstance(result, dict) and result.get("data"):
                     logger.info(f"✅ {description} (dict) succeeded on attempt {attempt}")
+                    return result
+
+                # ✅ Case 3: Analyze mode or success response
+                if isinstance(result, dict) and result.get("status") == "success":
+                    logger.info(f"✅ {description} (analyze/success mode) succeeded on attempt {attempt}")
                     return result
 
                 logger.warning(f"⚠️ {description} returned empty on attempt {attempt}")
@@ -840,7 +807,7 @@ class MYALGO_TRADING_BOT:
 
             # DAILY CPR
             if 'DAILY' in CPR:
-                dfdaily = self.get_historical("D",lookback=3)
+                dfdaily = self.get_historical("D",lookback=5)
                 self.static_indicators['DAILY'] = self.compute_cpr(dfdaily, "DAILY")
                 self.static_indicators_date = date.today()
             # WEEKLY CPR
@@ -884,11 +851,25 @@ class MYALGO_TRADING_BOT:
             else:
                 raise ValueError(f"Unsupported interval: {interval}")
 
-            # Fetch base data (OpenAlgo supports up to daily)
-            raw = self.client.history(
+            # # Fetch base data (OpenAlgo supports up to daily)
+            # raw = self.client.history(
+            #     symbol=SYMBOL,
+            #     exchange=EXCHANGE,
+            #     interval="D",   # ✅ always fetch daily for higher aggregation
+            #     start_date=start_date.strftime("%Y-%m-%d"),
+            #     end_date=end_date.strftime("%Y-%m-%d")
+            #     )
+
+            # Use retry_api_call wrapper for robustness
+            description = f"Historical Fetch ({interval})"
+            raw = self.retry_api_call(
+                func=self.client.history,
+                max_retries=3,
+                delay=2,
+                description=description,
                 symbol=SYMBOL,
                 exchange=EXCHANGE,
-                interval="D",   # ✅ always fetch daily for higher aggregation
+                interval="D" if interval in ["W", "M"] else interval,  # fetch daily base for resampling when needed
                 start_date=start_date.strftime("%Y-%m-%d"),
                 end_date=end_date.strftime("%Y-%m-%d")
                 )
@@ -1176,7 +1157,7 @@ class MYALGO_TRADING_BOT:
            # Check EMA200 crossover exit conditions
             if self.position == "BUY":
                 ema_exit_condition = last_close < ema20
-                signal_logger.info(f"BUY Exit Check: Close < EMA200 -> {last_close:.2f} < {ema200:.2f} = {ema_exit_condition}")
+                signal_logger.info(f"BUY Exit Check: Close < EMA20 -> {last_close:.2f} < {ema20:.2f} = {ema_exit_condition}")
                 if ema_exit_condition:
                     signal_logger.info("🔴 EXIT SIGNAL TRIGGERED: CLOSE BELOW EMA200 (BUY Position)")
                     signal_logger.info(f"Exit Context: LTP={current_ltp:.2f}, Close={last_close:.2f}, EMA20={ema20:.2f}, P&L={unrealized_pnl:.2f}")
@@ -1184,11 +1165,11 @@ class MYALGO_TRADING_BOT:
                     
             elif self.position == "SELL":
                 ema_exit_condition = last_close > ema20
-                signal_logger.info(f"SELL Exit Check: Close > ema200 -> {last_close:.2f} > {ema20:.2f} = {ema_exit_condition}")
+                signal_logger.info(f"SELL Exit Check: Close > ema20 -> {last_close:.2f} > {ema20:.2f} = {ema_exit_condition}")
                 if ema_exit_condition:
                     signal_logger.info("🔴 EXIT SIGNAL TRIGGERED: CLOSE ABOVE EMA200 (SELL Position)")
-                    signal_logger.info(f"Exit Context: LTP={current_ltp:.2f}, Close={last_close:.2f}, EMA200={ema200:.2f}, P&L={unrealized_pnl:.2f}")
-                    return f"CLOSE_ABOVE_EMA200 (close={last_close:.2f}, EMA200={ema200:.2f})"
+                    signal_logger.info(f"Exit Context: LTP={current_ltp:.2f}, Close={last_close:.2f}, EMA20={ema20:.2f}, P&L={unrealized_pnl:.2f}")
+                    return f"CLOSE_ABOVE_EMA20 (close={last_close:.2f}, EMA20={ema20:.2f})"
             
             signal_logger.info("⚪ NO EXIT SIGNAL - Position maintained")
             return None
@@ -1383,7 +1364,7 @@ class MYALGO_TRADING_BOT:
             signal_logger.info(f"  6. Close > Open: {close:.2f} > {open_:.2f} = {long_cond6}")
             signal_logger.info(f"  7. Close > EMA50: {close:.2f} > {ema50:.2f} = {long_cond7}")
             signal_logger.info(f"  8. Close > EMA200: {close:.2f} > {ema200:.2f} = {long_cond8}")
-            signal_logger.info(f"  9. LTP > last candle high: {self.ltp:.2f} > {high:.2f} = {long_cond9}")
+            signal_logger.info(f"  9. LTP > last candle high: {current_ltp:.2f} > {high:.2f} = {long_cond9}")
             signal_logger.info(f"  10. Close > current day high: {close:.2f} > {self.current_day_high :.2f} = {long_cond10}")
             signal_logger.info(f"  LONG Signal Valid: {long_cond}")
 
@@ -1396,7 +1377,7 @@ class MYALGO_TRADING_BOT:
             signal_logger.info(f"  6. Close < Open: {close:.2f} < {open_:.2f} = {short_cond6}")
             signal_logger.info(f"  7. Close < EMA50: {close:.2f} < {ema50:.2f} = {short_cond7}")
             signal_logger.info(f"  8. Close < EMA200: {close:.2f} < {ema200:.2f} = {short_cond8}")
-            signal_logger.info(f"  9. LTP < last candle low: {self.ltp:.2f} < {low:.2f} = {short_cond9}")
+            signal_logger.info(f"  9. LTP < last candle low: {current_ltp:.2f} < {low:.2f} = {short_cond9}")
             signal_logger.info(f"  10. Close < current day low: {close:.2f} < {self.current_day_low :.2f} = {short_cond10}")
             signal_logger.info(f"  SHORT Signal Valid: {short_cond}")
 
@@ -2127,29 +2108,39 @@ class MYALGO_TRADING_BOT:
         try:
             if expiry_date is None or strike is None:
                 return None
-            # build expiry token like '30OCT25'
+
             expiry_token = f"{expiry_date.day:02d}{MONTH_MAP[expiry_date.month]}{str(expiry_date.year)[-2:]}"
-            suffix = "CE" if opt_type == "CE" else "PE"
+            suffix = "CE" if opt_type.upper() == "CE" else "PE"
             candidate = f"{SYMBOL}{expiry_token}{strike}{suffix}"
-            # use search API to find tradable symbol
+
+            # 🔹 Step 1: search candidate
             resp = self.client.search(query=candidate, exchange=OPTION_EXCHANGE)
             if isinstance(resp, dict) and resp.get("data"):
-                # return first match's symbol (field names vary: 'symbol' or 'tradingsymbol')
-                d = resp["data"][0]
-                return d.get("symbol") or d.get("tradingsymbol")
-            # fallback: try a looser search with symbol+expiry
+                for d in resp["data"]:
+                    sym = (d.get("symbol") or d.get("tradingsymbol") or "").upper()
+                # ✅ Only return if it *starts* with the correct symbol
+                    if sym.startswith(SYMBOL.upper()) and suffix in sym and str(strike) in sym:
+                        return sym
+
+            # 🔹 Step 2: fallback to broader expiry search
             resp2 = self.client.search(query=f"{SYMBOL}{expiry_token}", exchange=OPTION_EXCHANGE)
             if isinstance(resp2, dict) and resp2.get("data"):
-                # find nearest strike in returned list
                 rows = resp2["data"]
-                # find exact strike & type if present
+                # Find strike and CE/PE match
                 for r in rows:
                     name = (r.get("symbol") or r.get("tradingsymbol") or "").upper()
-                    if str(strike) in name and (suffix in name):
+                    if name.startswith(SYMBOL.upper()) and str(strike) in name and suffix in name:
                         return r.get("symbol") or r.get("tradingsymbol")
-                # else return first row symbol
-                return rows[0].get("symbol") or rows[0].get("tradingsymbol")
+
+                # If nothing exact, fallback to first *valid* match that starts with SYMBOL
+                for r in rows:
+                    name = (r.get("symbol") or r.get("tradingsymbol") or "").upper()
+                    if name.startswith(SYMBOL.upper()):
+                        return r.get("symbol") or r.get("tradingsymbol")
+
+            logger.warning(f"No valid {SYMBOL} {suffix} found for {expiry_token} {strike}")
             return None
+
         except Exception:
             logger.exception("resolve_option_symbol_via_search failed")
             return None
@@ -2157,21 +2148,118 @@ class MYALGO_TRADING_BOT:
     # Order functions - Place entry/exit order - Get existing order price
     # -------------------------
     def get_executed_price(self, order_id):
-        for _ in range(5):
+        """
+        Poll order status up to 5 times (2s interval) until executed price is available.
+        Returns float price or None if never filled.
+        """
+        for attempt in range(5):
             time.sleep(2)
             try:
                 resp = self.client.orderstatus(order_id=order_id, strategy=STRATEGY)
-                if isinstance(resp, dict) and resp.get("status") == "success":
-                    data = resp.get("data", {})
-                    if data.get("order_status") == "complete":
-                        return float(data.get("average_price", 0) or 0)
-            except Exception:
-                logger.exception("get_executed_price attempt failed")
+                if not isinstance(resp, dict):
+                    continue
+
+                if resp.get("status") != "success":
+                    continue
+
+                data = resp.get("data", {})
+                order_status = str(data.get("order_status", "")).lower()
+
+                if order_status in ("complete", "completed", "filled"):
+                    avg_price = float(data.get("average_price", 0) or 0)
+                    if avg_price > 0:
+                        order_logger.info(f"✅ Executed price fetched on attempt {attempt+1}: {avg_price}")
+                        return avg_price
+            except Exception as e:
+                order_logger.warning(f"⚠️ get_executed_price attempt {attempt+1} failed: {e}")
+
+        order_logger.error(f"❌ Executed price still None after 5 retries for order {order_id}")
         return None
 
     # ===============================================================
     # 🔒 ENHANCEMENT: HELPER FUNCTIONS FOR STOP LOSS AUTOMATION & ENTRY RESTRICTIONS
     # ===============================================================
+    def place_order_with_execution_retry(
+        self,
+        strategy,
+        symbol,
+        exchange,
+        action,
+        quantity,
+        product="MIS",
+        price_type="MARKET",
+        max_order_attempts=3,
+        max_exec_retries=5,
+        retry_delay=2,
+        ):
+        """
+        Places an order with full retry and execution confirmation.
+
+         1️⃣ Retry API call if network or request fails.
+         2️⃣ Poll order status until executed_price is available.
+         3️⃣ Retry placing order again if still not executed after polling.
+
+        Returns:
+            (order_id, executed_price) or (None, None)
+            """
+
+        for order_attempt in range(1, max_order_attempts + 1):
+            description = f"Placing order attempt {order_attempt} ({symbol} x {quantity})"
+
+            # --- Step 1: Try placing order via retry_api_call
+            try:
+                order_resp = self.retry_api_call(
+                    func=self.client.placeorder,
+                    max_retries=3,
+                    delay=retry_delay,
+                    description=description,
+                    strategy=strategy,
+                    symbol=symbol,
+                    exchange=exchange,
+                    action=action,
+                    quantity=quantity,
+                    price_type=price_type,
+                    product=product,
+                )
+            except Exception as e:
+                order_logger.warning(f"⚠️ Attempt {order_attempt}: placeorder failed: {e}")
+                continue
+                
+            # --- Step 2: Validate order response
+            if not order_resp or "orderid" not in order_resp:
+                order_logger.warning(f"⚠️ Attempt {order_attempt}: Missing orderid. Retrying...")
+                time.sleep(retry_delay)
+                continue
+
+            order_id = order_resp["orderid"]
+            order_logger.info(f"✅ Order response: {order_resp}")
+            order_logger.info(f"✅ Order placed successfully (attempt {order_attempt}) ID={order_id}")
+
+            # --- Step 3: Confirm executed price using get_executed_price
+            exec_price = None
+            for exec_attempt in range(max_exec_retries):
+                exec_price = self.get_executed_price(order_id)
+                if exec_price is not None and exec_price > 0:
+                    order_logger.info(
+                        f"✅ Executed price confirmed (order {order_id}) = {exec_price}"
+                    )
+                    return order_id, exec_price
+
+                order_logger.warning(
+                    f"⚠️ Exec check {exec_attempt+1}/{max_exec_retries}: No fill yet. Retrying in {retry_delay}s..."
+                )
+                time.sleep(retry_delay)
+
+            # --- Step 4: Re-attempt order if execution failed
+            order_logger.warning(
+                f"⚠️ Order {order_id} did not execute after {max_exec_retries} polls. Retrying new order..."
+            )
+            time.sleep(retry_delay)
+
+        # --- Final fallback
+        order_logger.error("❌ All attempts failed: Order not executed after retries.")
+        order_logger.error(f"❌ Order response: {order_resp}")
+        return None, None
     
     def compute_25pct_sl(self, exec_price: float, side: str) -> float:
         """Compute 25% stop loss price based on executed price and side"""
@@ -2200,6 +2288,8 @@ class MYALGO_TRADING_BOT:
                     product=PRODUCT,
                     trigger_price=str(sl_price)
                 )
+
+                
                 order_logger.info(f"SL place order response (attempt {attempt}): {resp}")
 
                 if not isinstance(resp, dict) or resp.get("status") != "success":
@@ -2254,7 +2344,7 @@ class MYALGO_TRADING_BOT:
                 return False
 
             order_logger.info(f"Trade Count: {self.trade_count}/{MAX_TRADES_PER_DAY}")
-            current_ltp = self.ltp if self.ltp else 0.0
+            current_ltp = self.ltp if self.ltp else 25980
             order_logger.info(f"Current {SYMBOL} LTP: {current_ltp:.2f}")
 
             tradable_symbol = SYMBOL
@@ -2266,8 +2356,7 @@ class MYALGO_TRADING_BOT:
                 order_logger.info("=== OPTION SYMBOL RESOLUTION ===")
                 opt_type = "CE" if signal == "BUY" else "PE"
                 try:
-                    q = self.client.quotes(symbol=SYMBOL, exchange=EXCHANGE)
-                    spot_ltp = float((q.get("data") or {}).get("ltp", 0) or 0)
+                    spot_ltp = current_ltp
                     order_logger.info(f"Fetched Spot LTP: {spot_ltp:.2f}")
                 except Exception:
                     spot_ltp = self.ltp or 0.0
@@ -2288,14 +2377,18 @@ class MYALGO_TRADING_BOT:
                 order_logger.info(f"Option Exchange: {tradable_exchange}")
                 logger.info("Placing %s option order -> %s (%s) strike=%s", opt_type, tradable_symbol, tradable_exchange, strike)
 
-            resp = self.client.placeorder(strategy=STRATEGY, symbol=tradable_symbol, exchange=tradable_exchange,
+            # resp = self.client.placeorder(strategy=STRATEGY, symbol=tradable_symbol, exchange=tradable_exchange,
+            #                           action=signal, quantity=QUANTITY, price_type="MARKET", product=PRODUCT)
+            # order_logger.info(f"Order placed successfully. dynamic SL/TP calculation started {resp}")
+            entry_order_id, exec_price = self.place_order_with_execution_retry(strategy=STRATEGY, symbol=tradable_symbol, exchange=tradable_exchange,
                                       action=signal, quantity=QUANTITY, price_type="MARKET", product=PRODUCT)
 
-            if not isinstance(resp, dict) or resp.get("status") != "success":
-                order_logger.error(f"Entry order failed: {resp}")
-                logger.warning("Entry order failed: %s", resp)
-                return False
+            # resp = self.client.placeorder(strategy=STRATEGY, symbol=tradable_symbol, exchange=tradable_exchange,
+            #                           action=signal, quantity=QUANTITY, price_type="MARKET", product=PRODUCT)
 
+            if entry_order_id is None or exec_price is None:
+                order_logger.error(f"Entry order failed")
+                return False
             order_logger.info(f"Order placed successfully. dynamic SL/TP calculation started")
             self.trade_start_time = datetime.now()
             # mark that we are initializing (prevent concurrent monitoring during setup)
@@ -2307,9 +2400,10 @@ class MYALGO_TRADING_BOT:
                 base_price = self.entry_price
                 if USE_SPOT_FOR_SLTP:
                     try:
-                        q = self.client.quotes(symbol=SYMBOL, exchange=EXCHANGE)
-                        self.spot_entry_price = float((q.get("data") or {}).get("ltp", 0) or 0)
+                        # q = self.client.quotes(symbol=SYMBOL, exchange=EXCHANGE)
+                        self.spot_entry_price = self.ltp
                         base_price = self.spot_entry_price
+                        self.subscribe_option_ltp()
                         risk_logger.info(f"SL/TP tracking via SPOT | Spot Entry = {base_price:.2f}")
                     except Exception:
                         self.spot_entry_price = self.ltp or self.entry_price
@@ -2346,15 +2440,6 @@ class MYALGO_TRADING_BOT:
                 self.trade_count += 1
                 self.entry_price = round(base_price, 2)
 
-            # Fetch executed price and finalize entry bookkeeping
-            entry_order_id = resp.get("orderid")
-            if entry_order_id:
-                exec_price = self.get_executed_price(entry_order_id)
-                order_logger.info(f"Order id :{entry_order_id}")
-            else:
-                order_logger.info(f"Order not palced find a response here: {resp}")
-                return False
-
             if exec_price is not None:
                 exec_price = float(exec_price)
                 self.entry_price = exec_price
@@ -2369,7 +2454,7 @@ class MYALGO_TRADING_BOT:
                     entry_side = signal.upper()
 
                     # Use existing computed stoploss_price
-                    sl_price = self.compute_25pct_sl(self.entry_price, entry_side)
+                    sl_price = self.compute_25pct_sl(exec_price, entry_side)
 
                     order_logger.info(f"Attempting to place linked SL order after entry confirmation...")
                     sl_order_id = self.place_and_confirm_stoploss(exit_symbol, exit_exchange, entry_side, sl_price)
@@ -2383,6 +2468,7 @@ class MYALGO_TRADING_BOT:
                     order_logger.exception("Error placing SL order after entry execution")
                 else:
                     order_logger.exception("SL order not enabled")
+            
 
 
             # BUGFIX: Re-enable websocket-based monitoring now that SL/TP and position are initialized.
@@ -2390,7 +2476,6 @@ class MYALGO_TRADING_BOT:
                 self.exit_in_progress = False
 
             order_logger.info(f"Order ID: {entry_order_id}")
-            order_logger.info(f"Order Response: {resp}")
 
             # final logging and DB record
             order_logger.info("=== POSITION ESTABLISHED ===")
@@ -2427,6 +2512,21 @@ class MYALGO_TRADING_BOT:
             with self._state_lock:
                 self.exit_in_progress = False
             return False
+    
+    def subscribe_option_ltp(self):
+        """Subscribe dynamically to option LTP once order is placed."""
+        if not getattr(self, "option_symbol", None):
+            return
+        try:
+            self.client.subscribe_ltp(
+                [
+                    {"exchange": OPTION_EXCHANGE, "symbol": self.option_symbol}
+                ],
+                on_data_received=self.on_ltp_update
+            )
+            signal_logger.info(f"🧩 Subscribed to Option LTP: {self.option_symbol}")
+        except Exception as e:
+            signal_logger.warning(f"⚠️ Failed to subscribe option symbol: {e}")
 
     def place_exit_order(self, reason="Manual"):
         try:
@@ -2471,18 +2571,16 @@ class MYALGO_TRADING_BOT:
             order_logger.info(f"Exit Action: {action}")
             order_logger.info(f"Exit Quantity: {QUANTITY}")
             
-            # Place exit order
-            resp = self.client.placeorder(strategy=STRATEGY, symbol=exit_symbol, exchange=exit_exchange,
-                                          action=action, quantity=QUANTITY, price_type="MARKET", product=PRODUCT)
-            self.cancel_pending_sl_orders(exit_symbol)
-            order_logger.info(f"Exit Order Response: {resp}")
+            # # Place exit order
+            # resp = self.client.placeorder(strategy=STRATEGY, symbol=exit_symbol, exchange=exit_exchange,
+            #                               action=action, quantity=QUANTITY, price_type="MARKET", product=PRODUCT)
 
-            if isinstance(resp, dict) and resp.get("status") == "success":
-                order_id = resp.get("orderid")
-                order_logger.info(f"Exit Order ID: {order_id}")
+            order_id, exit_price = self.place_order_with_execution_retry(strategy=STRATEGY, symbol=exit_symbol, exchange=exit_exchange,
+                                      action=action, quantity=QUANTITY, price_type="MARKET", product=PRODUCT)          
+
+            if order_id is not None or exit_price is not None:
+                order_logger.error(f"Exit Order Success: {order_id}")
                 
-                # Try to get execution price
-                exit_price = self.get_executed_price(order_id)
                 if self.option_ltp is None:
                     self.option_ltp = self.option_entry_price
 
@@ -2530,11 +2628,9 @@ class MYALGO_TRADING_BOT:
                     })
                    
                 else:
-                    order_logger.warning("Could not confirm exit execution price")                    
+                    order_logger.warning("Could not confirm exit execution price or unable to log db ")                    
             else:
-                order_logger.error(f"Exit order failed: {resp}")
-                
-            logger.info("Exit order resp: %s", resp)
+                order_logger.error(f"Exit order failed")
             
             # Clear position data
             previous_position = self.position
@@ -2562,9 +2658,10 @@ class MYALGO_TRADING_BOT:
             # Reset enhanced CPR attributes
             self.dynamic_target_info = None
             self.excluded_pivots_info = None
+            self.reset_pending_breakout()
             
             order_logger.info("Position cleared and reset (including CPR state)")
-            # main_logger.info(f"Position {previous_position} @ {previous_entry:.2f} exited due to: {reason}")
+            main_logger.info(f"Position {previous_position} @ {previous_entry:.2f} exited due to: {reason}")
             
             return True
         except Exception:
