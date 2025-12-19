@@ -39,14 +39,14 @@ from typing import Dict, List, Optional
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-SIMULATION_DATE: Optional[str] = "12-12-2025" # Example: "28-11-2025" or None
+SIMULATION_DATE: Optional[str] = "28-11-2025" # Example: "28-11-2025" or None
 MODE = "BACKTESTING" # Example: LIVE or BACKTESTING
 # ----------------------------
 # Configuration
 # ----------------------------
-API_KEY = "d511c29b04361e592efb603b7510a0369140f1c09fc4b6e0ce70fadf710703f7"
-API_HOST = "http://127.0.0.1:5000"
-WS_URL = "ws://127.0.0.1:8765"
+API_KEY = "6fb3e0c7b256b90192a29e6592e363510d055f70cde5aea43bed88145d00637e"
+API_HOST = "https://vbot.vralgo.com/"
+WS_URL = "wss://vbot.vralgo.com/ws"
 
 client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL)
 
@@ -79,11 +79,19 @@ PIVOT_TOUCH_BUFFER_PCT = None     # optional: use percentage buffer (e.g. 0.001 
 
 # Risk settings
 STOPLOSS = 0
-TARGET = 5
+TARGET = 0
 MAX_SIGNAL_RANGE = 50
+MIN_SL_POINTS = 5 # absolute minimum SL points
+MAX_RISK_POINTS = 30   # absolute safety on option premium
+SL_PERCENT = 0.12   # 12% of option premium
+MIN_REWARD_PCT_OF_RISK = 0.5 # at least 50% reward of risk
+MIN_REWARD_FOR_SL_MOVE = 0.7 #TSL Move only if reward is at least 70% of initial target 
+MIN_ABSOLUTE_REWARD = 5 
+
+
 # Trade management
-MAX_TRADES_PER_DAY = 5
-STRATEGY = "myalgo_scalping"
+MAX_TRADES_PER_DAY = 3
+STRATEGY = "myalgo_scalping_"+SYMBOL
 
 # Option trading config
 OPTION_ENABLED = True
@@ -120,10 +128,10 @@ TSL_METHOD = "TSL_CPR_range_SL_TP" # trailing method for this enhancement
 # Stop Loss automation constants
 MAX_SL_RETRIES = 1              # Maximum retry attempts for SL confirmation
 SL_RETRY_DELAY = 2              # Seconds between SL retry attempts
-SL_BUFFER_PCT = 0.25            # 25% buffer for automatic SL placement
+SL_BUFFER_PCT = 0.12           # 25% buffer for automatic SL placement
 
 # Entry restrictions configuration
-DAY_HIGH_LOW_VALIDATION_FROM_TRADE = 3  # Apply day high/low validation from this trade count onward
+DAY_HIGH_LOW_VALIDATION_FROM_TRADE = 2  # Apply day high/low validation from this trade count onward
 
 # ===============================================================
 # 🎯 CPR PIVOT EXCLUSION CONFIGURATION
@@ -470,7 +478,9 @@ class TradeLog(Base):
     leg_status: str = Column(String(20), default="open")
 
 # ✅ Proper engine and session setup
-DB_PATH = os.path.join(os.getcwd(), "myalgo.db")
+# DB_PATH = os.path.join(os.getcwd(), "myalgo.db")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "myalgo.db")
 engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
@@ -608,6 +618,7 @@ class MYALGO_TRADING_BOT:
         self.dynamic_target_info = None
         self.excluded_pivots_info = None
         self.dynamic_indicators_option = None
+        self.initial_stoploss_price = 0.0
         # Gatekeeper state
         self.ltp_pivot_breakout = False        # becomes True when LTP touched a qualifying pivot
         self.ltp_pivot_info = None             # dict: {"pivot":value, "identifier":"DAILY_R1", "period":"DAILY", "matched_at": timestamp}
@@ -1857,22 +1868,25 @@ class MYALGO_TRADING_BOT:
                 signal_logger.warning("Failed to compute dynamic indicators for exit evaluation")
                 return None
                 
-            last = dyn.get("last_candle", {})
-            last_close = float(last.get("close", 0.0))
-            last_close_option = float(dyn_option.get("close", 0.0))
+            last_candle = dyn.get("last_candle", {})
+            last_option = dyn_option.get("last_candle", 0.0)
+            last_candle_close = float(last_candle.get("close", 0.0))
+            last_close_option = float(last_option.get("close", 0.0))
             ema20 = float(dyn.get("EMA_20", 0.0))
             ema20_option = float(dyn_option.get("EMA_20", 0.0))
-            ema50 = float(dyn.get("EMA_20", 0.0))
-            ema200 = float(dyn.get("EMA_20", 0.0))
+            ema50 = float(dyn.get("EMA_50", 0.0))
+            ema200 = float(dyn.get("EMA_200", 0.0))
 
             
             signal_logger.info(f"Exit Signal Evaluation Data:")
-            signal_logger.info(f"  Last Candle Close: {last_close:.2f}")
+            signal_logger.info(f"  Last Candle Close: {last_candle_close:.2f}")
             signal_logger.info(f"  EMA20: {ema20:.2f}")
             
             # Calculate current P&L for context
             if self.option_ltp is None:
-                self.option_ltp = 0.00
+                signal_logger.warning("Option LTP not available for P&L calculation")
+                return None
+            # self.option_ltp = self.ltp_option if self.ltp_option else 0.
             if self.position == "BUY":
                 unrealized_pnl = (self.option_ltp - self.option_entry_price) * QUANTITY
             else:
@@ -1882,18 +1896,18 @@ class MYALGO_TRADING_BOT:
             
            # Check EMA20 crossover exit conditions
             if self.position == "BUY":
-                ema_exit_condition = last_close < ema20 or last_close_option < ema20_option
-                signal_logger.info(f"BUY Exit Check Spot: Close < EMA20 -> {last_close:.2f} < {ema20:.2f} = {ema_exit_condition}; BUY Exit Check Option: Close < EMA20 -> {last_close_option:.2f} < {ema20_option:.2f} = {ema_exit_condition}")
+                ema_exit_condition = last_candle_close < ema20 or last_close_option < ema20_option
+                signal_logger.info(f"BUY Exit Check Spot: Close < EMA20 -> {last_candle_close:.2f} < {ema20:.2f} = {ema_exit_condition}; BUY Exit Check Option: Close < EMA20 -> {last_close_option:.2f} < {ema20_option:.2f} = {ema_exit_condition}")
                 if ema_exit_condition:
                     signal_logger.info("🔴 EXIT SIGNAL TRIGGERED: CLOSE BELOW EMA20 (BUY Position)")
-                    return f"CLOSE_BELOW_EMA20 (close={last_close:.2f}, EMA20={ema20:.2f})"
+                    return f"CLOSE_BELOW_EMA20 (close={last_candle_close:.2f}, EMA20={ema20:.2f}, option_close={last_close_option:.2f}, EMA20_option={ema20_option:.2f})"
                     
             elif self.position == "SELL":
-                ema_exit_condition = last_close > ema20 or last_close_option > ema20_option
-                signal_logger.info(f"SELL Exit Check Spot: Close > EMA20 -> {last_close:.2f} > {ema20:.2f} = {ema_exit_condition} ; SELL Exit Check Option: Close > EMA20 -> {last_close_option:.2f} > {ema20_option:.2f} = {ema_exit_condition}")
+                ema_exit_condition = last_candle_close > ema20 or last_close_option > ema20_option
+                signal_logger.info(f"SELL Exit Check Spot: Close > EMA20 -> {last_candle_close:.2f} > {ema20:.2f} = {ema_exit_condition} ; SELL Exit Check Option: Close > EMA20 -> {last_close_option:.2f} > {ema20_option:.2f} = {ema_exit_condition}")
                 if ema_exit_condition:
                     signal_logger.info("🔴 EXIT SIGNAL TRIGGERED: CLOSE ABOVE EMA20 (SELL Position)")
-                    return f"CLOSE_ABOVE_EMA20 (close={last_close:.2f}, EMA20={ema20:.2f})"
+                    return f"CLOSE_ABOVE_EMA20 (close={last_candle_close:.2f}, EMA20={ema20:.2f}, option_close={last_close_option:.2f}, EMA20_option={ema20_option:.2f})"
             
             signal_logger.info("⚪ NO EXIT SIGNAL - Position maintained")
             return None
@@ -2021,7 +2035,7 @@ class MYALGO_TRADING_BOT:
             if not dyn:
                 signal_logger.warning("Failed to compute dynamic indicators")
                 return None
-
+            
             last = dyn["last_candle"]
             prev = dyn["prev_candle"]
 
@@ -2078,8 +2092,8 @@ class MYALGO_TRADING_BOT:
             long_cond11 = (close > prev_high) 
              
             # long_cond = long_cond6
-            # long_cond = long_cond1 and long_cond2 and long_cond3 and long_cond4 and long_cond5 and long_cond6 and long_cond7 and long_cond8 and long_cond11
-            long_cond = long_cond6 
+            long_cond = long_cond2 and long_cond3 and long_cond4 and long_cond5 and long_cond6 and long_cond7 and long_cond8 and long_cond11
+            # long_cond = long_cond6 
             # Evaluate Short conditions step by step
             short_cond1 = (close < weekly_pivot)
             short_cond2 = (close < daiily_pivot)
@@ -2093,7 +2107,7 @@ class MYALGO_TRADING_BOT:
             short_cond10 = current_low_ok
             short_cond11 = (close < prev_low) 
 
-            # short_cond =  short_cond1 and short_cond2 and  short_cond3 and short_cond4 and short_cond5 and short_cond6 and short_cond7 and short_cond8 and short_cond11
+            # short_cond =  short_cond2 and  short_cond3 and short_cond4 and short_cond5 and short_cond6 and short_cond7 and short_cond8 and short_cond11
             short_cond = short_cond6 
             # Log detailed condition evaluation
             signal_logger.info("=== LONG Signal Conditions ===")
@@ -2312,7 +2326,7 @@ class MYALGO_TRADING_BOT:
         try:
             position_logger.info(f"Initializing Enhanced CPR Range SL/TP for {signal} signal")
             position_logger.info(f"Features: Exclusion Filter={'ON' if CPR_EXCLUDE_PIVOTS else 'OFF'}, Dynamic Target={'ON' if USE_DYNAMIC_TARGET else 'OFF'}")
-            
+            position_logger.info("Option premimum: {:.2f}".format(float(base_price or 0.0)))
             # Get signal candle data for initial SL
             if intraday_df is None:
                 position_logger.warning("No signal candle data available for enhanced CPR initialization")
@@ -2347,20 +2361,24 @@ class MYALGO_TRADING_BOT:
                 
             # Set entry price and initial SL
             if base_price is None:
-                base_price = float(self.entry_price or 0.0)
+                base_price = float(self.option_entry_price or 0.0)
             self.entry_price = float(base_price)
             self.cpr_side = signal.upper()
             
             # Calculate initial SL from signal candle
+            position_logger.info(f"Calculating initial SL using Option signal candle range: Low={signal_candle_low:.2f}, High={signal_candle_high:.2f}, Range={signal_candle_range:.2f}")
+            premium_based_range = self.entry_price * SL_PERCENT
+            max_allowed_range = max(MIN_SL_POINTS, min(signal_candle_range, premium_based_range, MAX_RISK_POINTS))
+            position_logger.info(f"Calculated max allowed SL range: {max_allowed_range:.2f} (SignalCandleRange={signal_candle_range:.2f}, PremiumBasedRange={premium_based_range:.2f})")
             if self.cpr_side == "BUY":
-                raw_sl = round(signal_candle_low - STOPLOSS, 2)
-                initial_sl = signal_candle_high - MAX_SIGNAL_RANGE if signal_candle_range > MAX_SIGNAL_RANGE else raw_sl
+                initial_sl = round(self.entry_price - max_allowed_range, 2)
+                # initial_sl = signal_candle_high - MAX_SIGNAL_RANGE if signal_candle_range > MAX_SIGNAL_RANGE else raw_sl
             else:  # SELL
-                raw_sl = round(signal_candle_high + STOPLOSS, 2)
-                initial_sl = signal_candle_low + MAX_SIGNAL_RANGE if signal_candle_range > MAX_SIGNAL_RANGE else raw_sl
-                
+                initial_sl = round(self.entry_price + max_allowed_range, 2)
+                # initial_sl = signal_candle_low + MAX_SIGNAL_RANGE if signal_candle_range > MAX_SIGNAL_RANGE else raw_sl  
             self.cpr_sl = initial_sl
             self.stoploss_price = initial_sl
+            self.initial_stoploss_price = initial_sl
             
             # Enhanced target selection with dynamic risk:reward
             if USE_DYNAMIC_TARGET:
@@ -2444,55 +2462,122 @@ class MYALGO_TRADING_BOT:
             return float(self.cpr_targets[idx])
         return None
         
+    # def handle_cpr_tp_hit(self, hit_price):
+    #     """
+    #     Handle CPR target hit - advance trailing stop loss:
+    #     Rule 1: After first TP hit -> move SL to entry (breakeven)
+    #     Rule 2: After second TP hit -> move SL to first TP price
+    #     Rule 3+: Continue rolling SL to last TP price
+    #     """
+    #     try:
+    #         with self._state_lock:
+    #             self.cpr_tp_hit_count += 1
+    #             prev_idx = self.current_tp_index
+                
+    #             position_logger.info(f"CPR TP Hit #{self.cpr_tp_hit_count}: {hit_price:.2f}")
+                
+    #             # Advance SL based on TP hit count
+    #             if self.cpr_tp_hit_count == 1:
+    #                 # First TP hit -> move SL to breakeven (entry price)
+    #                 self.cpr_sl = round(float(self.entry_price), 2)
+    #                 position_logger.info(f"First CPR TP hit - SL moved to breakeven: {self.cpr_sl:.2f}")
+    #             elif prev_idx >= 0 and prev_idx < len(self.cpr_targets):
+    #                 # Subsequent TP hits -> move SL to previous TP price
+    #                 self.cpr_sl = round(float(self.cpr_targets[prev_idx]), 2)
+    #                 position_logger.info(f"CPR TP hit #{self.cpr_tp_hit_count} - SL moved to previous TP: {self.cpr_sl:.2f}")
+                
+    #             # Move to next target
+    #             self.current_tp_index = prev_idx + 1
+                
+    #             # Update WebSocket monitoring variables
+    #             self.stoploss_price = self.cpr_sl
+                
+    #             if self.current_tp_index >= len(self.cpr_targets):
+    #                 # No more targets - final exit
+    #                 self.current_tp_index = -1
+    #                 position_logger.info("Final CPR target reached - will exit on next update")
+    #                 return True  # Signal for final exit
+    #             else:
+    #                 # Set next target
+    #                 next_tp = self.cpr_targets[self.current_tp_index]
+    #                 self.target_price = round(float(next_tp), 2)
+    #                 position_logger.info(f"Next CPR Target: {self.target_price:.2f}")
+                    
+    #                 # Log CPR TP hit to database
+    #                 self._log_cpr_tp_hit(hit_price)
+                    
+    #             return False  # Continue trading
+                    
+    #     except Exception as e:
+    #         position_logger.error(f"Error handling CPR TP hit: {e}", exc_info=True)
+    #         return True  # Exit on error
+        
     def handle_cpr_tp_hit(self, hit_price):
         """
-        Handle CPR target hit - advance trailing stop loss:
-        Rule 1: After first TP hit -> move SL to entry (breakeven)
-        Rule 2: After second TP hit -> move SL to first TP price
-        Rule 3+: Continue rolling SL to last TP price
-        """
+        Handle CPR target hit with institutional SL logic.
+        Returns:
+            "IGNORED"     → weak CPR hit (no SL / TP advance)
+            "SL_MOVED"    → SL progressed
+            "FINAL_EXIT"  → no more targets
+            """
         try:
             with self._state_lock:
-                self.cpr_tp_hit_count += 1
                 prev_idx = self.current_tp_index
-                
-                position_logger.info(f"CPR TP Hit #{self.cpr_tp_hit_count}: {hit_price:.2f}")
-                
-                # Advance SL based on TP hit count
+
+                # --- Risk / Reward calculation ---
+                risk = abs(self.entry_price - self.initial_stoploss_price)
+                reward = abs(hit_price - self.entry_price)
+                reward_r = reward / max(risk, 1e-6)
+
+                position_logger.info(
+                    f"CPR HIT @ {hit_price:.2f} | RewardR={reward_r:.2f}"
+                )
+                #--- RULE 1: Ignore weak CPR reactions closer levels ---
+                if reward_r < MIN_REWARD_FOR_SL_MOVE:
+                    position_logger.info(
+                            f"Weak CPR hit ignored (reward {reward_r:.2f}R < {MIN_REWARD_FOR_SL_MOVE}R)"
+                        )
+                    return "IGNORED"
+                # --- Meaningful move → allow SL progression ---
+                self.cpr_tp_hit_count += 1
+
                 if self.cpr_tp_hit_count == 1:
-                    # First TP hit -> move SL to breakeven (entry price)
+                    # First CPR hit → Move SL to breakeven
                     self.cpr_sl = round(float(self.entry_price), 2)
-                    position_logger.info(f"First CPR TP hit - SL moved to breakeven: {self.cpr_sl:.2f}")
+                    position_logger.info(
+                        f"First CPR hit → SL moved to Breakeven {self.cpr_sl:.2f}"
+                    )
                 elif prev_idx >= 0 and prev_idx < len(self.cpr_targets):
-                    # Subsequent TP hits -> move SL to previous TP price
+                    # Subsequent meaningful hits → SL to previous TP
                     self.cpr_sl = round(float(self.cpr_targets[prev_idx]), 2)
-                    position_logger.info(f"CPR TP hit #{self.cpr_tp_hit_count} - SL moved to previous TP: {self.cpr_sl:.2f}")
-                
-                # Move to next target
-                self.current_tp_index = prev_idx + 1
-                
-                # Update WebSocket monitoring variables
+                    position_logger.info(
+                        f"CPR hit #{self.cpr_tp_hit_count} → SL moved to prev TP {self.cpr_sl:.2f}"
+                    )
+
+                # Update SL
                 self.stoploss_price = self.cpr_sl
-                
+
+                # Advance target index ONLY on meaningful move
+                self.current_tp_index = prev_idx + 1
+
+                # Final target reached
                 if self.current_tp_index >= len(self.cpr_targets):
-                    # No more targets - final exit
                     self.current_tp_index = -1
-                    position_logger.info("Final CPR target reached - will exit on next update")
-                    return True  # Signal for final exit
-                else:
-                    # Set next target
-                    next_tp = self.cpr_targets[self.current_tp_index]
-                    self.target_price = round(float(next_tp), 2)
-                    position_logger.info(f"Next CPR Target: {self.target_price:.2f}")
-                    
-                    # Log CPR TP hit to database
-                    self._log_cpr_tp_hit(hit_price)
-                    
-                return False  # Continue trading
-                    
+                    position_logger.info("Final CPR target reached - exit next update")
+                    return "FINAL_EXIT"
+
+                # Set next target
+                next_tp = self.cpr_targets[self.current_tp_index]
+                self.target_price = round(float(next_tp), 2)
+                position_logger.info(f"Next CPR Target: {self.target_price:.2f}")
+
+                self._log_cpr_tp_hit(hit_price)
+                return "SL_MOVED"
+
         except Exception as e:
             position_logger.error(f"Error handling CPR TP hit: {e}", exc_info=True)
-            return True  # Exit on error
+            return "FINAL_EXIT"
+
             
     def check_cpr_sl_tp_conditions(self, current_ltp):
         """
@@ -2517,16 +2602,21 @@ class MYALGO_TRADING_BOT:
             # Check TP conditions
             if current_tp is not None:
                 if side == "BUY" and current_ltp >= current_tp:
-                    position_logger.info(f"CPR BUY TP Hit: {current_ltp:.2f} >= {current_tp:.2f}")
-                    
+                    position_logger.info(f"CPR BUY TP Hit: {current_ltp:.2f} >= {current_tp:.2f}")     
                     # Check TSL_ENABLED to determine behavior
                     if not TSL_ENABLED:
                         position_logger.info("TSL disabled - sending FINAL_EXIT signal on TP hit")
                         return "FINAL_EXIT"
                     else:
                         # TSL enabled - proceed with trailing logic
-                        final_exit = self.handle_cpr_tp_hit(current_tp)
-                        return "FINAL_EXIT" if final_exit else "TP_HIT"
+                        tp_result = self.handle_cpr_tp_hit(current_tp)
+                        if tp_result == "FINAL_EXIT":
+                            return "FINAL_EXIT"
+                        elif tp_result == "SL_MOVED":
+                            return "TP_HIT"
+                        elif tp_result == "IGNORED":
+                            position_logger.info("Weak CPR hit ignored - continuing trade")
+                            return None     
                         
                 elif side == "SELL" and current_ltp <= current_tp:
                     position_logger.info(f"CPR SELL TP Hit: {current_ltp:.2f} <= {current_tp:.2f}")
@@ -2537,8 +2627,14 @@ class MYALGO_TRADING_BOT:
                         return "FINAL_EXIT"
                     else:
                         # TSL enabled - proceed with trailing logic
-                        final_exit = self.handle_cpr_tp_hit(current_tp)
-                        return "FINAL_EXIT" if final_exit else "TP_HIT"
+                        tp_result = self.handle_cpr_tp_hit(current_tp)
+                        if tp_result == "FINAL_EXIT":
+                            return "FINAL_EXIT"
+                        elif tp_result == "SL_MOVED":
+                            return "TP_HIT"
+                        elif tp_result == "IGNORED":
+                            position_logger.info("Weak CPR hit ignored - continuing trade")
+                            return None  
                     
             return None
             
@@ -2607,7 +2703,7 @@ class MYALGO_TRADING_BOT:
             position_logger.info(f"Dynamic Target Calculation:")
             position_logger.info(f"  Signal: {signal} | Entry: {entry_price:.2f} | SL: {sl_price:.2f}")
             position_logger.info(f"  Risk: {risk:.2f} | RR Ratio: {RISK_REWARD_RATIO:.2f} | Required Reward: {reward_distance:.2f}")
-            position_logger.info(f"  Required Target: {required_target:.2f}")
+            position_logger.info(f"  Required Target based on entry price + reward distance: {required_target:.2f}")
             
             if not available_levels:
                 position_logger.warning("No CPR levels available; using computed target")
@@ -2617,19 +2713,21 @@ class MYALGO_TRADING_BOT:
             valid_candidates = []
             
             for level_value in available_levels:
-                level_id = level_mapping.get(level_value, f"UNKNOWN_{level_value:.2f}")
+                level_id = level_mapping.get(level_value, f"MIDPOINT_{level_value:.2f}")
                 
-                if signal == "BUY":
+                if signal == "BUY" and level_value > entry_price:
                     # For BUY: level must be above entry AND meet minimum reward requirement
-                    if level_value > entry_price and level_value >= required_target:
-                        distance_from_entry = level_value - entry_price
-                        valid_candidates.append((level_value, level_id, distance_from_entry))
-                else:  # SELL
+                    # if level_value > entry_price and level_value >= required_target:
+                    reward = level_value - entry_price
+                    if reward >= max(risk * MIN_REWARD_PCT_OF_RISK, MIN_ABSOLUTE_REWARD):
+                        valid_candidates.append((level_value, level_id, reward))
+                elif signal == "SELL" and level_value < entry_price:  # SELL
                     # For SELL: level must be below entry AND meet minimum reward requirement  
-                    if level_value < entry_price and level_value <= required_target:
-                        distance_from_entry = entry_price - level_value
-                        valid_candidates.append((level_value, level_id, distance_from_entry))
-            
+                    # if level_value < entry_price and level_value <= required_target:
+                    reward = entry_price - level_value
+                    if reward >= max(risk * MIN_REWARD_PCT_OF_RISK, MIN_ABSOLUTE_REWARD):
+                        valid_candidates.append((level_value, level_id, reward))
+
             if not valid_candidates:
                 position_logger.warning("No valid CPR levels meet minimum reward requirement; using computed target")
                 return required_target, risk, reward_distance, "COMPUTED", "No CPR levels meet minimum reward"
@@ -2923,6 +3021,7 @@ class MYALGO_TRADING_BOT:
 
          # 🎯 LIVE MODE: Real SL placement
         sl_action = "SELL" 
+         
         order_logger.info(f"Placing SL order -> Action={sl_action} | Trigger/SL={sl_price:.2f} | Symbol={exit_symbol}")
         # -------------------------------
         # 🧩SL (Stop Loss Limit)
@@ -3060,7 +3159,10 @@ class MYALGO_TRADING_BOT:
                     # Determine which price to use for SL placement
                     exit_symbol = tradable_symbol
                     exit_exchange = tradable_exchange
-                    entry_side = signal.upper()
+                    if USE_OPTION_FOR_SLTP:
+                        entry_side = "BUY"
+                    else:
+                        entry_side = signal.upper()
 
                     # Use existing computed stoploss_price
                     sl_price = self.compute_25pct_sl(exec_price, entry_side)

@@ -1,0 +1,173 @@
+{
+    "INSTRUMENT": {
+        "STRATEGY": "myalgo_scalping",
+        "SYMBOL": "NIFTY",
+        "EXCHANGE": "NSE_INDEX",
+        "PRODUCT": "MIS",
+        "CANDLE_TIMEFRAME": "5m",
+        "LOOKBACK_DAYS": 10,
+        "SIGNAL_CHECK_INTERVAL": 5,
+        "MAX_SIGNAL_RANGE": 50
+    },
+    "API": {
+        "API_KEY": "112c4900f6b2d83b7d812921de13d36898116fd79a592d96cec666dfbbc389f8",
+        "API_HOST": "http://127.0.0.1:5000",
+        "WS_URL": "ws://127.0.0.1:8765",
+        "AUTO_RECONNECT_WS": true,
+        "RECONNECT_DELAY": 5,
+        "MAX_RECONNECT_ATTEMPTS": 10
+    },
+    "OPTIONS": {
+        "ENABLED": true,
+        "OPTION_EXCHANGE": "NFO",
+        "STRIKE_INTERVAL": 50,
+        "OPTION_EXPIRY_TYPE": "WEEKLY",
+        "OPTION_STRIKE_SELECTION": "OTM8",
+        "EXPIRY_LOOKAHEAD_DAYS": 30,
+        "LOT_QUANTITY": 75,
+        "QUANTITY": 75,
+        "LOT": 1
+    },
+    "BREAKOUT": {
+        "LTP_BREAKOUT_ENABLED": true,
+        "LTP_BREAKOUT_INTERVAL_MIN": 5
+    },
+    "INDICATORS": {
+        "EMA_PERIODS": [
+            9,
+            20,
+            50,
+            200
+        ],
+        "SMA_PERIODS": [
+            9,
+            20,
+            50,
+            200
+        ],
+        "RSI_PERIODS": [
+            14,
+            21
+        ],
+        "CPR": [
+            "DAILY",
+            "WEEKLY",
+            "MONTHLY"
+        ],
+        "sma": {
+            "enabled": true,
+            "description": "Simple Moving Average",
+            "timeframe": "5m",
+            "periods": [
+                9,
+                20,
+                50,
+                200
+            ]
+        },
+        "ema": {
+            "enabled": true,
+            "description": "Exponential Moving Average",
+            "timeframe": "5m",
+            "periods": [
+                9,
+                20,
+                50,
+                200
+            ]
+        },
+        "rsi": {
+            "enabled": true,
+            "description": "Relative Strength Index",
+            "timeframe": "5m",
+            "periods": [
+                14,
+                21
+            ]
+        },
+        "pivot": {
+            "cpr": {
+                "enabled": true,
+                "description": "Central Pivot Range",
+                "enabled_timeframes": [
+                    "Daily",
+                    "Weekly",
+                    "Monthly"
+                ]
+            }
+        }
+    },
+    "RISK": {
+        "STOPLOSS": 0,
+        "TARGET": 5,
+        "MAX_TRADES_PER_DAY": 3,
+        "RISK_REWARD_RATIO": 2.0,
+        "USE_DYNAMIC_TARGET": true,
+        "DYNAMIC_TARGET_METHOD": "NEAREST_VALID",
+        "VALID_TARGET_LEVELS": [
+            "pivot",
+            "bc",
+            "tc",
+            "r1",
+            "r2",
+            "s1",
+            "s2"
+        ]
+    },
+    "TRADE_MANAGEMENT": {
+        "SL_ORDER_ENABLED": false,
+        "USE_SPOT_FOR_SLTP": true,
+        "USE_OPTION_FOR_SLTP": false,
+        "SL_TP_METHOD": "CPR_range_SL_TP",
+        "TSL_ENABLED": true,
+        "TSL_METHOD": "TSL_CPR_range_SL_TP"
+    },
+    "STOPLOSS_AUTOMATION": {
+        "MAX_SL_RETRIES": 3,
+        "SL_RETRY_DELAY": 2,
+        "SL_BUFFER_PCT": 0.25,
+        "DAY_HIGH_LOW_VALIDATION_FROM_TRADE": 1
+    },
+    "CPR_EXCLUDE_PIVOTS": [
+        "WEEKLY_TC",
+        "WEEKLY_BC",
+        "MONTHLY_TC",
+        "MONTHLY_BC"
+    ],
+    "DATABASE": {
+        "DB_PATH": "./myalgo.db",
+        "ENABLE_DB_LOGGING": true
+    },
+    "SCHEDULER": {
+        "ENABLED": true,
+        "TIMEZONE": "Asia/Kolkata"
+    },
+    "LOGGING": {
+        "LOG_LEVEL": "INFO",
+        "ENABLE_FILE_LOGGING": true,
+        "LOG_FILE": "./logs/NIFTY.log"
+    },
+    "MONTH_MAP": {
+        "1": "JAN",
+        "2": "FEB",
+        "3": "MAR",
+        "4": "APR",
+        "5": "MAY",
+        "6": "JUN",
+        "7": "JUL",
+        "8": "AUG",
+        "9": "SEP",
+        "10": "OCT",
+        "11": "NOV",
+        "12": "DEC"
+    },
+    "NOTIFICATIONS": {
+        "ENABLED": true,
+        "NOTIFY_ON_ERROR": true,
+        "NOTIFY_ON_TRADE": true,
+        "CHANNELS": [
+            "console",
+            "email"
+        ]
+    }
+}
