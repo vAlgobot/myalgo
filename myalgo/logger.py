@@ -15,7 +15,6 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 import threading
 
-
 class PerformanceLogger:
     """
     Context manager for performance logging.
