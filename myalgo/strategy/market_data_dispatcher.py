@@ -206,7 +206,7 @@ class MarketDataDispatcher:
         Return nearest weekly expiry using OpenAlgo Expiry API.
         Cache is locked per symbol per trading day to avoid expiry mixing.
         """
-
+        logger.info(f"[CACHE] Expiry paramters:{symbol} {exchange} {instrumenttype} ")
         today = datetime.now().strftime("%Y-%m-%d")
 
         # -------------------------------------------------
@@ -412,7 +412,7 @@ class MarketDataDispatcher:
         else:
             start_date = market_date
             end_date = market_date
-
+        logger.error(f"[LIVE][OPTIONS] compute [SPOT] strike {symbol}")
         # ---- Step 1: Fetch daily SPOT candle
         day_df = self.retry_api_call(
             self.client.history,
@@ -430,19 +430,18 @@ class MarketDataDispatcher:
         day_high = day_df["high"].iloc[0]
         day_low = day_df["low"].iloc[0]
 
+        opt_exchange = "BFO" if symbol.upper() == "SENSEX" else self.option_exchange
         # ---- Step 2: Expiry (nearest weekly) Expiry (cached, locked)
-        expiry = self.get_expiry_cached(symbol, self.option_exchange, "options")
+        expiry = self.get_expiry_cached(symbol, opt_exchange, "options")
 
         # # ---- Step 3: Generate symbols
         option_symbols = self.generate_option_symbols(
              symbol, day_high, day_low, expiry
-        )
-        opt_exchange = "BFO" if symbol.upper() == "SENSEX" else self.spot_exchange
+        )  
         # ---- Step 4: Fetch option candles
         for opt_symbol in option_symbols:
             for tf in timeframes:
                 logger.info(f"[LIVE][OPTIONS] {opt_symbol} {tf}")
-
                 df = self.retry_api_call(
                     self.client.history,
                     symbol=opt_symbol,
@@ -610,7 +609,7 @@ class MarketDataDispatcher:
                 market_date=MARKET_DATE
                 )
             for sym in self.symbol: #----Option data fetching---#
-                exchange = "BSE_INDEX" if sym.upper() == "SENSEX" else exchange
+                exchange = "BSE_INDEX" if sym.upper() == "SENSEX" else self.spot_exchange
                 self.fetch_and_store_options_live(
                     symbol= sym,
                     exchange=exchange,
