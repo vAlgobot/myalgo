@@ -15,7 +15,6 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 import threading
 
-
 class PerformanceLogger:
     """
     Context manager for performance logging.
@@ -66,13 +65,17 @@ class LoggerManager:
             return
         
         self.initialized = True
-        self.logs_dir = Path("logs")
-        self.loggers: Dict[str, logging.Logger] = {}
-        
+         # ✅ FIXED BASE DIRECTORY (project root)
+        BASE_DIR = Path(__file__).resolve().parents[1]
+
+        today_folder = datetime.now().strftime("%d-%m-%y")
+        self.logs_dir = BASE_DIR / "logs" / today_folder
+    
         # Create timestamped log file for this session
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        timestamp = datetime.now().strftime("%H-%M-%S")
         self.log_file = self.logs_dir / f"myalgo_{timestamp}.log"
         
+        self.loggers: Dict[str, logging.Logger] = {}
         self._setup_directories()
         self._setup_root_logger()
     

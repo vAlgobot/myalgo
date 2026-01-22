@@ -16,6 +16,7 @@ Created: June 27, 2025
 """
 
 import logging
+import re
 from typing import Dict, List, Optional, Any, Tuple, Union
 import pandas as pd
 from datetime import datetime, timedelta
@@ -23,13 +24,14 @@ import os
 from pathlib import Path
 import time
 import threading
-
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     import duckdb
 except ImportError:
     raise ImportError("DuckDB library not installed. Run: pip install duckdb")
 
-from logger import get_logger
+from core.logger import get_logger
 
 
 class DatabaseManager:
@@ -78,6 +80,10 @@ class DatabaseManager:
         
         self.db_path = db_path
         self.connection = None
+
+        # Add thread lock for DB operations (for v2 method)
+        import threading
+        self._db_lock = threading.Lock()
         
         # Database configuration
         self.spot_table = "spot_data"
@@ -89,6 +95,93 @@ class DatabaseManager:
         
         self.logger.info(f"DatabaseManager singleton initialized with database: {self.db_path}")
         DatabaseManager._initialized = True
+        
+    def get_ohlcv_data_v2(
+            self,
+            symbol: str,
+            exchange: str,
+            timeframe: str,
+            start_date: str,
+            end_date: str,
+            instrument_type: str = "SPOT",
+            expiry: Optional[str] = None,
+            underlying: Optional[str] = None
+        ) -> 'pd.DataFrame':
+            """
+            Alternative OHLCV data retrieval method using explicit SQL and thread lock.
+            Args:
+                symbol: Trading symbol
+                exchange: Exchange name
+                timeframe: Time interval
+                start_date: Start date (YYYY-MM-DD)
+                end_date: End date (YYYY-MM-DD)
+                instrument_type: "SPOT" or "OPTIONS"
+                expiry: Expiry date (dd-mm-YYYY) for options
+                strike: Strike price for options
+                underlying: Underlying symbol for options
+            Returns:
+                pd.DataFrame: OHLCV data indexed by timestamp
+            """
+            instrument_type = instrument_type.upper()
+            timeframe = timeframe.lower()
+
+            start_ts = f"{start_date} 00:00:00"
+            end_ts = f"{end_date} 23:59:59"
+
+            if instrument_type == "SPOT":
+                query = f"""
+                    SELECT timestamp, open, high, low, close, volume
+                    FROM {self.spot_table}
+                    WHERE symbol = ?
+                      AND exchange = ?
+                      AND timeframe = ?
+                      AND timestamp BETWEEN ? AND ?
+                    ORDER BY timestamp
+                """
+                params = [
+                    symbol.upper(),
+                    exchange.upper(),
+                    timeframe,
+                    start_ts,
+                    end_ts,
+                ]
+
+            else:
+                strike = extract_strike_from_symbol(symbol)
+                if not all([expiry, strike, underlying]):
+                    raise ValueError("OPTIONS require expiry, strike, underlying")
+                query = f"""
+                    SELECT timestamp, open, high, low, close, volume, oi
+                    FROM {self.options_table}
+                    WHERE symbol = ?
+                      AND expiry = ?
+                      AND strike = ?
+                      AND timeframe = ?
+                      AND exchange = ?
+                      AND underlying = ?
+                      AND timestamp BETWEEN ? AND ?
+                    ORDER BY timestamp
+                """
+
+                params = [
+                    symbol.upper(),
+                    datetime.strptime(expiry, "%d-%m-%Y").date(),
+                    strike,
+                    timeframe,
+                    exchange.upper(),
+                    underlying.upper(),
+                    start_ts,
+                    end_ts,
+                ]
+
+            with self._db_lock:
+                df = self.connection.execute(query, params).fetchdf()
+
+            if df.empty:
+                return pd.DataFrame()
+
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            return df.set_index("timestamp")
     
     def _initialize_database(self) -> None:
         """Initialize database connection and create tables if they don't exist."""
@@ -249,6 +342,7 @@ class DatabaseManager:
                 self.spot_table = self.options_table    
             else:
                 self.spot_table = self.spot_table
+            
             # Prepare data for insertion
             df_to_store = self._prepare_data_for_storage(symbol, exchange, timeframe, data)
             
@@ -256,24 +350,11 @@ class DatabaseManager:
                 self.logger.warning(f"No valid data after preparation for {symbol}")
                 return False
             
-            # Incremental loading: Only delete existing data if replace=True
-            if replace:
-                # Delete existing data for this symbol only
-                self._delete_existing_data(symbol, exchange, timeframe)
-                self.logger.info(f"Replaced existing data for {symbol} ({exchange}, {timeframe})")
-            
-            # Filter out existing records for incremental loading
-            if not replace:
-                df_to_store = self._filter_existing_records(df_to_store, symbol, exchange, timeframe, instrument_type)
-                if df_to_store.empty:
-                    self.logger.info(f"No new records to insert for {symbol} - all data already exists")
-                    return True
-            
-            # Insert data (only new records if replace=False)
-            insert_count = self._insert_ohlcv_data(df_to_store, instrument_type)
+            # Use safe upsert/insert logic directly
+            insert_count = self._insert_ohlcv_data(df_to_store, instrument_type, replace=replace)
             
             # Update metadata
-            self._update_metadata(symbol, exchange, timeframe, df_to_store)
+            # self._update_metadata(symbol, exchange, timeframe, df_to_store)
             
             self.logger.info(f"Stored {insert_count} records for {symbol} ({exchange}, {timeframe})")
             return True
@@ -453,80 +534,70 @@ class DatabaseManager:
         except Exception as e:
             self.logger.error(f"Error validating OHLCV data: {e}")
             return df
-    
-    
-    def _delete_existing_data(self, symbol: str, exchange: str, timeframe: str) -> None:
-        """Delete existing data for symbol/exchange/timeframe combination."""
-        delete_sql = f"""
-        DELETE FROM {self.spot_table} 
-        WHERE symbol = ? AND exchange = ? AND timeframe = ?
+
+    def _insert_ohlcv_data(self, df: pd.DataFrame, instrument_type, replace: bool = False) -> int:
         """
+        Insert OHLCV data into database using efficient Upsert (ON CONFLICT) logic.
         
-        self.connection.execute(delete_sql, [symbol.upper(), exchange.upper(), timeframe.lower()])
-        self.logger.debug(f"Deleted existing data for {symbol} ({exchange}, {timeframe})")
-    
-    def _insert_ohlcv_data(self, df: pd.DataFrame, instrument_type) -> int:
-        """
-        Insert OHLCV data into database with minimal filtering.
-        
-        PRESERVE API DATA: Only remove truly invalid records (null timestamps).
+        Args:
+            df: DataFrame to insert
+            instrument_type: Type of instrument (SPOT/OPTIONS)
+            replace: If True, update existing records. If False, ignore duplicates.
         """
         try:
             if df.empty:
                 self.logger.warning("No data to insert")
                 return 0
+                
             if instrument_type == 'OPTIONS':
                 self.spot_table = self.options_table
-                self.logger.info("Inserting OPTION data - skipping duplicate filtering")
+                target_table = self.options_table
+                columns = ['symbol', 'exchange', 'underlying', 'strike', 'expiry', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi']
+                conflict_targets = "symbol, exchange, timeframe, timestamp" 
+                # Note: Options PK in schema is (symbol, exchange, timeframe, timestamp)
             else:
                 self.spot_table = self.spot_table
+                target_table = self.spot_table
+                columns = ['symbol', 'exchange', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume']
+                conflict_targets = "symbol, exchange, timeframe, timestamp"
+
             # Log what we're inserting
-            self.logger.info(f"Inserting {len(df)} records to database")
-            if 'timestamp' in df.columns and not df.empty:
-                timestamp_range = f"{df['timestamp'].min()} to {df['timestamp'].max()}"
-                self.logger.info(f"Timestamp range: {timestamp_range}")
+            self.logger.info(f"Inserting {len(df)} records into {target_table} (replace={replace})")
             
             # Minimal validation - only remove null timestamps
             valid_mask = df['timestamp'].notna()
             df_clean = df[valid_mask].copy()
             
-            removed_count = len(df) - len(df_clean)
-            if removed_count > 0:
-                self.logger.info(f"Removed {removed_count} records with null timestamps")
-            
             if df_clean.empty:
-                self.logger.warning("No valid data to insert after removing null timestamps")
                 return 0
             
-            # Use DuckDB's efficient DataFrame insertion with duplicate handling
+            # Use DuckDB's efficient DataFrame insertion
             self.connection.register('temp_df', df_clean)
 
-            try:
-                if instrument_type == "OPTIONS":
-                    insert_sql = f"""
-                        INSERT INTO {self.spot_table} 
-                        (symbol, exchange, underlying, strike, expiry, timeframe, timestamp, open, high, low, close, volume, oi)
-                        SELECT symbol, exchange, underlying, strike, expiry, timeframe, timestamp, open, high, low, close, volume, oi 
-                        FROM temp_df
-                        """
-                else:
-                    insert_sql = f"""
-                        INSERT INTO {self.spot_table} 
-                        (symbol, exchange, timeframe, timestamp, open, high, low, close, volume)
-                        SELECT symbol, exchange, timeframe, timestamp, open, high, low, close, volume 
-                        FROM temp_df
-                        """
-                self.connection.execute(insert_sql)
-                    
-            except Exception as regular_error:
-                    # If regular INSERT also fails, it's likely due to duplicates that weren't filtered
-                if "violates primary key constraint" in str(regular_error) or "Duplicate key" in str(regular_error):
-                    self.logger.error(f"Primary key constraint violation detected: {regular_error}")
-                        # Re-raise with more context
-                    raise Exception(f"Duplicate filtering failed - records already exist in database: {regular_error}")
-                else:
-                        # Other error, re-raise as is
-                    raise regular_error         
+            # Construct SQL
+            col_str = ", ".join(columns)
+            
+            if replace:
+                # Upsert: Update conflicting records
+                # Exclude primary key columns from UPDATE SET
+                update_cols = [c for c in columns if c not in ['symbol', 'exchange', 'timeframe', 'timestamp']]
+                update_set = ", ".join([f"{c} = EXCLUDED.{c}" for c in update_cols])
+                
+                insert_sql = f"""
+                    INSERT INTO {target_table} ({col_str})
+                    SELECT {col_str} FROM temp_df
+                    ON CONFLICT ({conflict_targets}) DO UPDATE SET
+                    {update_set}
+                """
+            else:
+                # Insert safe: Update nothing on conflict
+                insert_sql = f"""
+                    INSERT INTO {target_table} ({col_str})
+                    SELECT {col_str} FROM temp_df
+                    ON CONFLICT ({conflict_targets}) DO NOTHING
+                """
+                
+            self.connection.execute(insert_sql)
             
             # Clean up temporary registration
             self.connection.unregister('temp_df')
@@ -537,96 +608,7 @@ class DatabaseManager:
             self.logger.error(f"Error inserting data: {e}")
             raise
     
-    def _filter_existing_records(self, df: pd.DataFrame, symbol: str, exchange: str, timeframe: str, instrument_type: str) -> pd.DataFrame:
-        """
-        Filter out records that already exist in the database.
-        
-        Args:
-            df: DataFrame with new records to check
-            symbol: Trading symbol
-            exchange: Exchange name
-            timeframe: Timeframe
-            
-        Returns:
-            pd.DataFrame: Filtered DataFrame with only new records
-        """
-        try:
-            if df.empty:
-                return df
-            
-            if instrument_type == 'OPTIONS':
-                self.spot_table = self.options_table
-            else:
-                self.spot_table = self.spot_table
 
-            self.logger.info(f"Filtering existing records for {symbol} - input: {len(df)} records")
-            
-            # Ensure timestamps are in proper format
-            if 'timestamp' not in df.columns:
-                self.logger.error(f"No timestamp column found in DataFrame for {symbol}")
-                return pd.DataFrame()
-            
-            # Normalize DataFrame timestamps to ensure consistency
-            df_timestamps = pd.to_datetime(df['timestamp'])
-            
-            # Log sample timestamps from DataFrame
-            if not df_timestamps.empty:
-                sample_df_ts = df_timestamps.iloc[0]
-                self.logger.info(f"Sample DataFrame timestamp: {sample_df_ts} (type: {type(sample_df_ts)})")
-            
-            # Get existing timestamps for this symbol/exchange/timeframe
-            existing_query = f"""
-            SELECT DISTINCT timestamp 
-            FROM {self.spot_table} 
-            WHERE symbol = ? AND exchange = ? AND timeframe = ?
-            """
-            
-            existing_result = self.connection.execute(existing_query, [
-                symbol.upper(), exchange.upper(), timeframe.lower()
-            ]).fetchall()
-            
-            if not existing_result:
-                # No existing data, return all records
-                self.logger.info(f"No existing data for {symbol} - inserting all {len(df)} records")
-                return df
-            
-            # Convert existing timestamps to pandas datetime and create set
-            existing_timestamps_raw = [row[0] for row in existing_result]
-            existing_timestamps = set(pd.to_datetime(existing_timestamps_raw))
-            
-            # Log sample timestamps from database
-            if existing_timestamps:
-                sample_db_ts = next(iter(existing_timestamps))
-                self.logger.info(f"Sample database timestamp: {sample_db_ts} (type: {type(sample_db_ts)})")
-                self.logger.info(f"Total existing timestamps in DB: {len(existing_timestamps)}")
-            
-            # Create mask to filter out existing records
-            new_records_mask = ~df_timestamps.isin(existing_timestamps)
-            filtered_df = df[new_records_mask].copy()
-            
-            existing_count = len(df) - len(filtered_df)
-            self.logger.info(f"Filtering results for {symbol}: {existing_count} existing, {len(filtered_df)} new records")
-            
-            # Additional validation: check if any duplicates remain
-            if not filtered_df.empty:
-                remaining_timestamps = set(pd.to_datetime(filtered_df['timestamp']))
-                overlap = remaining_timestamps.intersection(existing_timestamps)
-                if overlap:
-                    self.logger.warning(f"Found {len(overlap)} timestamp overlaps after filtering for {symbol}")
-                    # Remove the overlapping records manually
-                    final_mask = ~pd.to_datetime(filtered_df['timestamp']).isin(overlap)
-                    filtered_df = filtered_df[final_mask].copy()
-                    self.logger.info(f"After overlap removal: {len(filtered_df)} records remain")
-            
-            return filtered_df
-            
-        except Exception as e:
-            self.logger.error(f"Error filtering existing records for {symbol}: {e}")
-            import traceback
-            self.logger.error(f"Traceback: {traceback.format_exc()}")
-            # On error, return empty DataFrame to avoid duplicates
-            self.logger.warning(f"Returning empty DataFrame for {symbol} due to filtering error")
-            return pd.DataFrame()
     
     def _update_metadata(self, symbol: str, exchange: str, timeframe: str, df: pd.DataFrame) -> None:
         """Update metadata table with data information (incremental-friendly)."""
@@ -750,7 +732,7 @@ class DatabaseManager:
         return results
     
     def get_ohlcv_data(self, symbol: str, exchange: str, timeframe: str,
-                      start_date: Optional[str] = None, end_date: Optional[str] = None, instrument_type: str = "SPOT") -> pd.DataFrame:
+                      start_date: Optional[str] = None, end_date: Optional[str] = None, instrument_type: str = "SPOT", underlying_symbol: str = "NIFTY", expiry_date: Optional[str] = None) -> pd.DataFrame:
         """
         Retrieve OHLCV data for backtesting.
         
@@ -766,24 +748,37 @@ class DatabaseManager:
         """
         try:
             # TABLE ASSIGNMENT BASED ON INSTRUMENT TYPE
+
             if instrument_type.upper() == "SPOT":
                 self.spot_table = self.spot_table  # Main OHLCV table
-            elif instrument_type.upper() == "OPTIONS":
-                self.spot_table = self.options_table  # Options-specific table    
-            
-            # Build query
-            where_conditions = [
+                # Build query
+                where_conditions = [
                 "symbol = ?",
                 "exchange = ?", 
                 "LOWER(timeframe) = ?"
-            ]
-            
-            params = [symbol.upper(), exchange.upper(), timeframe.lower()]
-            
+                ]
+                params = [symbol.upper(), exchange.upper(), timeframe.lower()]
+                
+            elif instrument_type.upper() == "OPTIONS":
+                self.spot_table = self.options_table  # Options-specific table    
+                # Build query
+                where_conditions = [
+                "underlying = ?",
+                "exchange = ?",
+                "expiry = ?",
+                "strike = ?",
+                "symbol = ?",
+                "LOWER(timeframe) = ?"
+                ]
+                strike_price = extract_strike_from_symbol(symbol)
+                params = [underlying_symbol.upper(), exchange.upper(), expiry_date, strike_price, symbol.upper(), timeframe.lower()]
+            else:
+                self.logger.error(f"Invalid instrument type: {instrument_type}")
+                return pd.DataFrame()
+            # Build query conditions
             if start_date:
                 where_conditions.append("timestamp >= ?")
                 params.append(start_date)
-            
             if end_date:
                 where_conditions.append("timestamp <= ?")
                 # Fix: For same-day queries or single day backtesting, extend end_date to include full day
@@ -793,15 +788,23 @@ class DatabaseManager:
                     self.logger.debug(f"Extended end_date for full day coverage: {end_date_extended}")
                 else:
                     params.append(end_date)
-            
-            query = f"""
-            SELECT timestamp, open, high, low, close, volume
-            FROM {self.spot_table}
-            WHERE {' AND '.join(where_conditions)}
-            ORDER BY timestamp ASC
-            """
-
             # Execute query
+
+            if instrument_type.upper() == "OPTIONS":
+                query = f"""
+                SELECT timestamp, open, high, low, close, volume, oi, strike, expiry, underlying
+                FROM {self.spot_table}
+                WHERE {' AND '.join(where_conditions)}
+                ORDER BY timestamp ASC
+                """
+            else:
+                query = f"""
+                SELECT timestamp, open, high, low, close, volume
+                FROM {self.spot_table}
+                WHERE {' AND '.join(where_conditions)}
+                ORDER BY timestamp ASC
+                """
+
             df = self.connection.execute(query, params).df()
             
             if df.empty:
@@ -1501,6 +1504,47 @@ def get_quick_data(symbol: str, timeframe: str = '5m', days: int = 30) -> pd.Dat
         end_date=end_date.strftime('%Y-%m-%d')
     )
 
+def extract_strike_from_symbol(symbol: str) -> int:
+    """
+    Extract strike from option symbol.
+    Example: NIFTY20JAN2625550PE -> 25550
+    """
+    symbol = symbol.upper()
+
+    if not symbol.endswith(("CE", "PE")):
+        raise ValueError(f"Invalid option symbol: {symbol}")
+
+    core = symbol[:-2]  # remove CE / PE
+
+    # Find last month occurrence (JAN, FEB, ...)
+    months = ("JAN","FEB","MAR","APR","MAY","JUN",
+              "JUL","AUG","SEP","OCT","NOV","DEC")
+
+    month_pos = -1
+    for m in months:
+        pos = core.rfind(m)
+        if pos > month_pos:
+            month_pos = pos
+
+    if month_pos == -1:
+        raise ValueError(f"Cannot locate expiry month in {symbol}")
+
+    # Expiry format = DDMMMYY → strike starts after that
+    strike_part = core[month_pos + 5:]  # 3 (MMM) + 2 (YY)
+
+    if not strike_part.isdigit():
+        raise ValueError(f"Invalid strike section: {strike_part}")
+
+    return int(strike_part)
+
 
 # Global instance for backward compatibility
 database_manager = get_database_manager()
+
+if __name__ == "__main__":
+    # Simple test of DatabaseManager functionality
+    db_manager = get_database_manager()
+
+    df = db_manager.get_ohlcv_data('BANKNIFTY', 'NSE_INDEX', '1m', '2026-01-16', '2026-01-16', instrument_type="SPOT")
+    # df = db_manager.get_ohlcv_data(symbol='NIFTY20JAN2625650PE', exchange='NFO', timeframe='D', start_date='2025-12-01', end_date='2026-01-15', instrument_type="OPTIONS", underlying_symbol="NIFTY", expiry_date="20-01-2026")
+    print(df.count())

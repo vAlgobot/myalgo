@@ -41,20 +41,21 @@ from openalgo import ta
 from typing import Dict, List, Optional
 import io
 import time
-import platform
+
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger import get_logger, log_trade_execution
-# ----------------------------
-# Global Constants
+import platform
+
+
 os_name = platform.system()
 MARKET_OPEN  = dt_time(9, 15)   # 09:15 AM Market open time
 MARKET_CLOSE = dt_time(15, 20)  # 03:20 PM Market close time
-ENTRY_CUTOFF_TIME = dt_time(15, 00) # 03:00 PM No new entry orders after this time
+ENTRY_CUTOFF_TIME = dt_time(14, 30) # 02:30 PM No new entry orders after this time
 
 dispatcher = MarketDataDispatcher()
 
-SIMULATION_DATE: Optional[str] = None            # Example: "28-11-2025" or None
+SIMULATION_DATE: Optional[str] = None           # Example: "28-11-2025" or None
 MODE = "LIVE"                                    # Example: LIVE or BACKTESTING
 # ----------------------------
 # Configuration
@@ -119,13 +120,13 @@ TARGET = 0                        #Target
 MAX_SIGNAL_RANGE = 50             #Maximum signal range
 MIN_SL_POINTS = 5                 #Absolute minimum SL points
 MAX_RISK_POINTS = 15              #Absolute safety on option premium
-SL_PERCENT = 0.12                 #12% of option premium
+SL_PERCENT = 0.10                 #10% of option premium
 MIN_REWARD_PCT_OF_RISK = 0.5      #At least 50% reward of risk
 MIN_REWARD_FOR_SL_MOVE = 0.5      #TSL Move only if reward is at least 50% of initial target 
 MIN_ABSOLUTE_REWARD = 5           #Minimum absolute reward in points
 ENTRY_CONFIRM_SECONDS = 1         #Seconds to confirm entry
 EXIT_CONFIRM_SECONDS = 5          #Seconds to confirm exit    
-SL_BUFFER_PCT = 0.15              #15% buffer from premium automatic SL placement in broker
+SL_BUFFER_PCT = 0.12              #12% buffer from premium automatic SL placement in broker
 SL_BUFFER_POINT = 1               #Buffer in points from premium in CPR SL placement
 
 # Trade management
@@ -830,20 +831,20 @@ class MYALGO_TRADING_BOT:
         if SL_TP_METHOD not in valid_methods:
             main_logger.warning(f"⚠️ Unknown SL_TP_METHOD: {SL_TP_METHOD}. Valid options: {valid_methods}")
         else:
-            main_logger.debug(f"✅ Valid SL/TP Method configured: {SL_TP_METHOD}")
+            main_logger.info(f"✅ Valid SL/TP Method configured: {SL_TP_METHOD}")
             
         # Log CPR enhancement features
         if SL_TP_METHOD == "CPR_range_SL_TP":
-            main_logger.debug("=== ℹ️ CPR Enhancement Features ===")
-            main_logger.debug(f"📐 Pivot Exclusion: {'Enabled' if CPR_EXCLUDE_PIVOTS else 'Disabled'}")
+            main_logger.info("=== ℹ️ CPR Enhancement Features ===")
+            main_logger.info(f"📐 Pivot Exclusion: {'Enabled' if CPR_EXCLUDE_PIVOTS else 'Disabled'}")
             if CPR_EXCLUDE_PIVOTS:
-                main_logger.debug(f"  📐 Excluded Levels: {len(CPR_EXCLUDE_PIVOTS)} ({', '.join(CPR_EXCLUDE_PIVOTS[:3])}...)")
-            main_logger.debug(f"⚖️ Dynamic Risk:Reward: {'Enabled' if USE_DYNAMIC_TARGET else 'Disabled'}")
+                main_logger.info(f"  📐 Excluded Levels: {len(CPR_EXCLUDE_PIVOTS)} ({', '.join(CPR_EXCLUDE_PIVOTS[:3])}...)")
+            main_logger.info(f"⚖️ Dynamic Risk:Reward: {'Enabled' if USE_DYNAMIC_TARGET else 'Disabled'}")
             if USE_DYNAMIC_TARGET:
-                main_logger.debug(f"  ⚖️ RR Ratio: 1:{RISK_REWARD_RATIO:.2f}")
-                main_logger.debug(f"  Target Method: {DYNAMIC_TARGET_METHOD}")
-                main_logger.debug(f"  Valid Target Levels: {', '.join(VALID_TARGET_LEVELS)}")
-            main_logger.debug("===============================")
+                main_logger.info(f"  ⚖️ RR Ratio: 1:{RISK_REWARD_RATIO:.2f}")
+                main_logger.info(f"  Target Method: {DYNAMIC_TARGET_METHOD}")
+                main_logger.info(f"  Valid Target Levels: {', '.join(VALID_TARGET_LEVELS)}")
+            main_logger.info("===============================")
 
     # =========================================================
     # 💰 Auto PnL Reconciliation Helper
@@ -969,10 +970,10 @@ class MYALGO_TRADING_BOT:
                         self.exit_in_progress = True
                         threading.Thread(target=self.place_exit_order, args=(reason,), daemon=True).start()
 
-            if not market_is_open():
-                logger.info("🛑 Market closed. close all active positions and shutdown a system")
-                self.shutdown_gracefully()
-                return
+                if not market_is_open():
+                    logger.info("🛑 Market closed right now. Please schedule the bot to run during market hours.")
+                    self.shutdown_gracefully()
+                    return
 
         except Exception as e:
             logger.exception("strategy_job execution failed", exc_info=e)
@@ -1213,7 +1214,7 @@ class MYALGO_TRADING_BOT:
         Handle ENTRY confirmation via LTP breakout
         (Triggered after reversal candle detection)
         """
-        signal_logger.debug(f"✅ LTP breakout check " +  
+        signal_logger.info(f"✅ LTP breakout check " +  
                            f"| Pending Breakout: {self.pending_breakout} " +
                            f"| Expiry: {self.pending_breakout_expiry} " +
                            f"| Side: {self.breakout_side}"
@@ -1242,7 +1243,7 @@ class MYALGO_TRADING_BOT:
                 # signal_logger.info("⚠️ OPTION LTP not available yet for breakout check")
                 return
             break_level = high
-            logger.debug(f"🔔 OPTION MODE BREAKOUT CHECK | Side: {side} | Current Option LTP: {current_opt_ltp:.2f} | Break Level: {break_level:.2f}")
+            logger.info(f"🔔 OPTION MODE BREAKOUT CHECK | Side: {side} | Current Option LTP: {current_opt_ltp:.2f} | Break Level: {break_level:.2f}")
             # For Options, BOTH Calls (BUY) and Puts (SELL) must break HIGH to enter
             if current_opt_ltp > break_level:
                  logger.info(f"🔔 OPTION LTP above break level for {side} side")
@@ -1768,7 +1769,6 @@ class MYALGO_TRADING_BOT:
                     if not result or "orderid" not in result or not result.get("status") == "success":
                         order_logger.warning(f"❌ Missing orderid on attempt {attempt}")
                         order_logger.warning(f"❌ ORDER RESPONSE {result}")
-                        time.sleep(delay) 
                         continue  
                     order_id = result["orderid"] 
 
@@ -1781,7 +1781,6 @@ class MYALGO_TRADING_BOT:
                             result["exec_price"] = exec_price
                         else:
                             order_logger.error(f"❌ Executed price not confirmed on attempt {attempt}")
-                            time.sleep(delay) 
                             continue
 
                 if isinstance(result, pd.DataFrame) and not result.empty:
@@ -1801,8 +1800,9 @@ class MYALGO_TRADING_BOT:
                 logger.warning(f"⚠️ {description} returned empty on attempt {attempt}")
             except Exception as e:
                 logger.warning(f"⚠️ {description} failed on attempt {attempt}: {e}")
-                if attempt < max_retries:
-                    time.sleep(delay)
+
+            if attempt < max_retries:
+                time.sleep(delay)
 
         logger.error(f"❌ {description} failed after {max_retries} attempts")
         return None
@@ -3798,7 +3798,7 @@ class MYALGO_TRADING_BOT:
         position_size=0,
         product="MIS",
         price_type="MARKET",
-        max_order_attempts=5,
+        max_order_attempts=3,
         max_exec_retries=3,
         retry_delay=2,
         ):
@@ -4760,12 +4760,9 @@ class MYALGO_TRADING_BOT:
                     )
                 )
             # Attempt to cancel all orders and close position via API (best-effort)
-            if BACKTESTING_MANAGER.active:
-                logger.info("📋 [SIMULATION] Skipping final order cancellation and position close API calls")
-            else:
-                logger.info("Attempting final order cancellations and position close via API")
-                client.cancelallorders(strategy=STRATEGY)
-                client.closeposition(strategy=STRATEGY)
+            logger.info("Attempting final order cancellations and position close via API")
+            client.cancelallorders(strategy=STRATEGY)
+            client.closeposition(strategy=STRATEGY)
         except Exception:
             logger.exception("Error while logging final status")
 

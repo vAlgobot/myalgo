@@ -1,7 +1,6 @@
 """
 OpenAlgo Dynamic Market Data Dispatcher
 ---------------------------------------
-
 Author: OpenAlgo Core Engineering
 Role  : Lead Algo Trading Systems Engineer
 
@@ -11,11 +10,11 @@ Supports:
 - DuckDB backend
 - Gap validation & patching
 """
-
 from datetime import datetime, timedelta
 from typing import List, Dict
 import sys
 import pandas as pd
+import pytz
 from openalgo import api
 import time
 import os
@@ -29,27 +28,27 @@ logger = get_logger("market_data_dispatcher")
 # =====================================================================
 # 🔹 GLOBAL CONFIGURATION (DRIVER VARIABLES)
 # =====================================================================
-
 MODE = "LIVE"                  # LIVE | BACKTESTING
-INSTRUMENT_TYPE = "OPTIONS"       # SPOT | OPTIONS
+INSTRUMENT_TYPE = "SPOT"       # SPOT | OPTIONS
 SYMBOL = ["NIFTY","BANKNIFTY","SENSEX"]  # For SPOT mode ["NIFTY","BANKNIFTY","SENSEX"]
 SPOT_EXCHANGE = "NSE_INDEX"
 OPTION_EXCHANGE = "NFO"
 TIMEFRAMES = ["1m", "5m", "D"]  # List of timeframes to fetch
 
 #---Backtesting configuration-----#
-START_DATE = "2024-01-01"
-END_DATE = "2024-01-31"
+START_DATE = "2025-12-21"
+END_DATE = "2026-01-31"
 EXCHANGE = "NSE_INDEX"
 
 #---Openalgo api-----#
-API_KEY = "6fb3e0c7b256b90192a29e6592e363510d055f70cde5aea43bed88145d00637e"
-API_HOST = "https://vbot.vralgo.com/"
-WS_URL = "wss://vbot.vralgo.com/ws"
-MARKET_DATE = None
+API_KEY = "45428a0d1b460d2b7a29cfcc71df97d296e63f6155a3a8282a741b5879fa99d9"
+API_HOST = "https://myalgo.vralgo.com/"
+WS_URL = "wss://myalgo.vralgo.com/ws"
 
-
-client = client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL)  # Placeholder for your market data API client
+MARKET_DATE = None  # Optional: Specific market date for LIVE mode (YYYY-MM-DD) or None
+LOOKBACK_DAYS = 70          # Lookback days for LIVE mode
+client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL)  # Placeholder for your market data API client
+IST = pytz.timezone("Asia/Kolkata")
 
 class MarketDataDispatcher:
 
@@ -328,31 +327,37 @@ class MarketDataDispatcher:
         day_low: float,
         expiry: str
     ) -> List[str]:
-        """Generate option symbols based on day range + buffer."""
-        symbol = symbol.upper()
+        """Generate option symbols based on day range + buffer (robust)."""
 
+        symbol = symbol.upper()
         strike_interval = 50 if symbol == "NIFTY" else 100
 
-        base_low = int(day_low // strike_interval * strike_interval)
-        base_high = int(day_high // strike_interval * strike_interval)
+        # ✅ Round LOW down, HIGH up
+        base_low = int((day_low // strike_interval) * strike_interval)
+        base_high = int(((day_high + strike_interval - 1) // strike_interval) * strike_interval)
 
-        strikes = list(range(base_low, base_high + strike_interval, strike_interval))
+        # Core strikes fully covering day range
+        core_strikes = list(range(base_low, base_high + strike_interval, strike_interval))
 
-        # Buffer
+        # Buffer ±5 strikes
+        buffer = 5
         strikes = (
-            [strikes[0] - i * strike_interval for i in range(5, 0, -1)] +
-            strikes +
-            [strikes[-1] + i * strike_interval for i in range(1, 6)]
+            [core_strikes[0] - i * strike_interval for i in range(buffer, 0, -1)] +
+            core_strikes +
+            [core_strikes[-1] + i * strike_interval for i in range(1, buffer + 1)]
         )
 
-        option_symbols = []
-        for strike in strikes:
-            option_symbols.append(f"{symbol}{expiry}{strike}CE")
-            option_symbols.append(f"{symbol}{expiry}{strike}PE")
+        # Generate CE & PE symbols
+        option_symbols = [
+            f"{symbol}{expiry}{strike}{opt_type}"
+            for strike in strikes
+            for opt_type in ("CE", "PE")
+        ]
 
         logger.info(
             f"[OPTIONS] Generated {len(option_symbols)} option symbols "
-            f"({symbol}, strikes={len(strikes)})"
+            f"({symbol}, strikes={len(strikes)}, "
+            f"range={base_low}-{base_high})"
         )
 
         return option_symbols
@@ -367,6 +372,13 @@ class MarketDataDispatcher:
             start_date = market_date
             end_date = market_date
 
+        today = datetime.now(IST)
+        end_date = today
+        start_date = end_date - timedelta(days=LOOKBACK_DAYS)
+
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
+
         for symbol in symbols:
             for tf in timeframes:
                 logger.info(f"[LIVE][SPOT] Fetching {symbol} {tf}")
@@ -376,8 +388,8 @@ class MarketDataDispatcher:
                     symbol=symbol,
                     exchange=exchange,
                     interval=tf,
-                    start_date=start_date,
-                    end_date=end_date
+                    start_date=start_str,
+                    end_date=end_str
                 )
 
                 if df is None or df.empty:
@@ -391,11 +403,12 @@ class MarketDataDispatcher:
                     exchange=exchange,
                     timeframe=tf,
                     data=df,
+                    replace=True,
                     instrument_type="SPOT"
                 )
 
                 db_df = DB_MANAGER.get_ohlcv_data(
-                    symbol, exchange, tf, start_date, end_date, "SPOT"
+                    symbol, exchange, tf, start_str, end_str, "SPOT"
                 )
 
                 logger.info(
@@ -412,6 +425,8 @@ class MarketDataDispatcher:
         else:
             start_date = market_date
             end_date = market_date
+        
+
         logger.error(f"[LIVE][OPTIONS] compute [SPOT] strike {symbol}")
         # ---- Step 1: Fetch daily SPOT candle
         day_df = self.retry_api_call(
@@ -438,6 +453,13 @@ class MarketDataDispatcher:
         option_symbols = self.generate_option_symbols(
              symbol, day_high, day_low, expiry
         )  
+
+        today = datetime.now(IST)
+        end_date = today
+        start_date = end_date - timedelta(days=LOOKBACK_DAYS)
+
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
         # ---- Step 4: Fetch option candles
         for opt_symbol in option_symbols:
             for tf in timeframes:
@@ -447,8 +469,8 @@ class MarketDataDispatcher:
                     symbol=opt_symbol,
                     exchange=opt_exchange,
                     interval=tf,
-                    start_date=start_date,
-                    end_date=end_date
+                    start_date=start_str,
+                    end_date=end_str
                 )
 
                 if df is None or df.empty:
@@ -468,11 +490,12 @@ class MarketDataDispatcher:
                     exchange=self.option_exchange,
                     timeframe=tf,
                     data=df,
+                    replace=True,
                     instrument_type="OPTIONS"
                 )
 
                 db_df = DB_MANAGER.get_ohlcv_data(
-                    opt_symbol, self.option_exchange, tf, start_date, end_date, "OPTIONS"
+                    opt_symbol, self.option_exchange, tf, start_str, end_str, "OPTIONS"
                 )
 
                 logger.info(
@@ -500,7 +523,6 @@ class MarketDataDispatcher:
             start_date, end_date,
             instrument_type
         )
-
         # ---- Case 1: DB empty
         if df.empty:
             logger.warning(f"[BACKTEST] DB EMPTY → API FETCH")
@@ -549,7 +571,12 @@ class MarketDataDispatcher:
             logger.error("[BACKTEST] Cannot validate gaps (daily API empty)")
             sys.exit(1)
 
-        api_dates = set(pd.to_datetime(api_daily["timestamp"]).dt.date)
+        api_daily = self.normalize_df(api_daily)
+        if isinstance(api_daily.index, pd.DatetimeIndex):
+            api_dates = set(api_daily.index.normalize().date)
+        else:
+            raise ValueError("api_daily index is not DatetimeIndex")
+        
         db_dates = set(df.index.normalize().date)
 
         missing_dates = sorted(api_dates - db_dates)

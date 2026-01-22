@@ -22,8 +22,9 @@ import os
 from pathlib import Path
 from datetime import datetime, timedelta
 import pandas as pd
+import io
 from typing import Dict, List, Any, Optional
-
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 # Add vAlgo to path (go up one level from data folder)
 sys.path.append(str(Path(__file__).parent.parent))
 
