@@ -72,8 +72,10 @@ class LoggerManager:
         self.logs_dir = BASE_DIR / "logs" / today_folder
     
         # Create timestamped log file for this session
-        timestamp = datetime.now().strftime("%H-%M-%S")
-        self.log_file = self.logs_dir / f"myalgo_{timestamp}.log"
+        self.timestamp = datetime.now().strftime("%H-%M-%S")
+        self.strategy_name = None
+        # Default file (no strategy appended yet)
+        self.log_file = self.logs_dir / f"myalgo_{self.timestamp}.log"
         
         self.loggers: Dict[str, logging.Logger] = {}
         self._setup_directories()
@@ -104,6 +106,28 @@ class LoggerManager:
         
         # File handler - single file for all logs
         file_handler = logging.FileHandler(str(self.log_file), mode='w', encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter(
+            '[%(asctime)s,%(msecs)03d] %(levelname)s in %(module)s: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(file_formatter)
+        root_logger.addHandler(file_handler)
+
+    def _replace_file_handler(self, new_path: Path):
+        """Replace existing file handler on root logger with a new one pointing to new_path."""
+        root_logger = logging.getLogger()
+        # Remove and close existing FileHandler(s)
+        for h in root_logger.handlers[:]:
+            try:
+                if isinstance(h, logging.FileHandler):
+                    h.close()
+                    root_logger.removeHandler(h)
+            except Exception:
+                continue
+
+        # Add a new file handler
+        file_handler = logging.FileHandler(str(new_path), mode='w', encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
         file_formatter = logging.Formatter(
             '[%(asctime)s,%(msecs)03d] %(levelname)s in %(module)s: %(message)s',
@@ -210,6 +234,25 @@ class LoggerManager:
     def get_log_file_path(self) -> str:
         """Get the current log file path."""
         return str(self.log_file)
+
+    def set_strategy_name(self, name: Optional[str]):
+        """Set the strategy name to include in the session log filename.
+
+        This will replace the active file handler so subsequent logs go to the
+        strategy-specific file: myalgo_{STRATEGY}_{HH-MM-SS}.log
+        """
+        if not name:
+            return
+        safe_name = str(name).replace(' ', '_')
+        self.strategy_name = safe_name
+        new_file = self.logs_dir / f"myalgo_{safe_name}_{self.timestamp}.log"
+        # Update stored path and replace handler
+        self.log_file = new_file
+        try:
+            self._replace_file_handler(new_file)
+        except Exception:
+            # Best-effort: ignore failures so logger still works
+            pass
     
     def shutdown(self):
         """Shutdown all loggers and handlers."""
@@ -261,6 +304,19 @@ def log_trade_execution(trade_data: Dict[str, Any]):
 def get_log_file_path() -> str:
     """Get the current log file path."""
     return _logger_manager.get_log_file_path()
+
+def set_strategy_name(name: Optional[str]):
+    """Set the strategy name to include in the log filename for this session.
+
+    Usage: call this from main after `STRATEGY` is defined:
+        from logger import set_strategy_name
+        set_strategy_name(STRATEGY)
+    """
+    try:
+        _logger_manager.set_strategy_name(name)
+    except Exception:
+        # best-effort
+        pass
 
 
 if __name__ == "__main__":

@@ -22,31 +22,34 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger import get_logger
 from db.database_main import get_database_manager
 
-DB_MANAGER = get_database_manager()
+DB_MANAGER = get_database_manager(read_only=False)
 logger = get_logger("market_data_dispatcher")
 
 # =====================================================================
 # 🔹 GLOBAL CONFIGURATION (DRIVER VARIABLES)
 # =====================================================================
-MODE = "LIVE"                  # LIVE | BACKTESTING
+MODE = "BACKTESTING"                  # LIVE | BACKTESTING
 INSTRUMENT_TYPE = "SPOT"       # SPOT | OPTIONS
-SYMBOL = ["NIFTY","BANKNIFTY","SENSEX"]  # For SPOT mode ["NIFTY","BANKNIFTY","SENSEX"]
+SYMBOL = ["NIFTY"]  # For SPOT mode ["NIFTY","BANKNIFTY","SENSEX"]
 SPOT_EXCHANGE = "NSE_INDEX"
 OPTION_EXCHANGE = "NFO"
 TIMEFRAMES = ["1m", "5m", "D"]  # List of timeframes to fetch
 
 #---Backtesting configuration-----#
-START_DATE = "2025-12-21"
-END_DATE = "2026-01-31"
+START_DATE = "2026-01-01"
+END_DATE = "2026-02-06"
+BATCH_DATES = []
 EXCHANGE = "NSE_INDEX"
 
 #---Openalgo api-----#
-API_KEY = "45428a0d1b460d2b7a29cfcc71df97d296e63f6155a3a8282a741b5879fa99d9"
+API_KEY = "076b15b4998ba741e0f12a49ef2befbd9cb11483a1a66fba50163c87a8453dc0"
 API_HOST = "https://myalgo.vralgo.com/"
 WS_URL = "wss://myalgo.vralgo.com/ws"
 
+
 MARKET_DATE = None  # Optional: Specific market date for LIVE mode (YYYY-MM-DD) or None
-LOOKBACK_DAYS = 70          # Lookback days for LIVE mode
+DAY_CANDLE_LOOKBACK_DAYS = 70
+LOOKBACK_DAYS = 10          # Lookback days for LIVE mode
 client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL)  # Placeholder for your market data API client
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -61,6 +64,7 @@ class MarketDataDispatcher:
         self.timeframes = TIMEFRAMES
         self.start_date = START_DATE
         self.end_date = END_DATE
+        self.batch_dates = BATCH_DATES
         self.client = client
 
         # ==============================
@@ -69,11 +73,25 @@ class MarketDataDispatcher:
         self.expiry_cache = {}   # { "NIFTY": "30DEC25", "BANKNIFTY": "30DEC25" }
         self.strike_cache = {}   # { ("NIFTY", "2025-12-01"): [22000, 22050, ...] }
 
+        # ==============================
+        # 📊 Execution Metrics Tracking
+        # ==============================
+        self.metrics = {
+            "spot_data": {},      # { "NIFTY": { "1m": 650, "3m": 600, ... }, ... }
+            "option_data": {},    # { "NIFTY24JAN25C24000": { "1m": 100, ... }, ... }
+            "timeframe_totals": {},  # { "1m": 5000, "3m": 4800, ... }
+            "gaps_detected": 0,
+            "gaps_patched": 0,
+            "api_calls": 0,
+            "api_failures": 0,
+            "start_time": datetime.now(IST),
+            "end_time": None,
+        }
 
         logger.info(
-            f"[INIT] MODE={self.mode} | "
+            f"🚀 [INIT] MODE={self.mode} | "
             f"INSTRUMENT={self.instrument_type} | "
-            f"SYMBOL={self.symbol}")
+            f"SYMBOLS={self.symbol}")
     
     def retry_api_call(self, func, max_retries=3, delay=2, description="API call", *args, **kwargs):
         """
@@ -292,6 +310,92 @@ class MarketDataDispatcher:
             self.expiry_cache[cache_key] = fallback
             return fallback
     
+    def generate_execution_summary(self):
+        """Generate and log comprehensive execution summary."""
+        self.metrics["end_time"] = datetime.now(IST)
+        execution_time = (self.metrics["end_time"] - self.metrics["start_time"]).total_seconds()
+        
+        # Calculate totals
+        total_spot_records = sum(sum(tfs.values()) for tfs in self.metrics["spot_data"].values())
+        total_option_records = sum(sum(tfs.values()) for tfs in self.metrics["option_data"].values())
+        total_records = total_spot_records + total_option_records
+        
+        # Log summary header
+        logger.info("╔════════════════════════════════════════════════════════════════╗")
+        logger.info("║               📊 EXECUTION SUMMARY REPORT                       ║")
+        logger.info("╚════════════════════════════════════════════════════════════════╝")
+        
+        # 1️⃣ Symbol-wise breakdown
+        if self.metrics["spot_data"]:
+            logger.info("\n🎯 SPOT DATA SUMMARY")
+            logger.info("─" * 60)
+            for symbol, timeframes in self.metrics["spot_data"].items():
+                total = sum(timeframes.values())
+                tf_breakdown = " | ".join([f"{tf}:{cnt}" for tf, cnt in timeframes.items()])
+                logger.info(f"  ✓ {symbol:12} → Total: {total:6} records | {tf_breakdown}")
+        
+        # 2️⃣ Timeframe-wise breakdown
+        if self.metrics["timeframe_totals"]:
+            logger.info("\n⏱️  TIMEFRAME SUMMARY")
+            logger.info("─" * 60)
+            for tf in self.timeframes:
+                count = self.metrics["timeframe_totals"].get(tf, 0)
+                bar = "█" * (count // 200) if count > 0 else ""
+                logger.info(f"  ⏰ {tf:4} → {count:6} records")
+        
+        # 3️⃣ Options summary (if applicable)
+        if self.metrics["option_data"]:
+            opt_count = len(self.metrics["option_data"])
+            opt_total = total_option_records
+            logger.info(f"\n📈 OPTIONS DATA SUMMARY")
+            logger.info("─" * 60)
+            logger.info(f"  ✓ Total Option Symbols: {opt_count}")
+            logger.info(f"  ✓ Total Option Records: {opt_total:,}")
+        
+        # 4️⃣ Data quality metrics
+        logger.info(f"\n🔍 DATA QUALITY METRICS")
+        logger.info("─" * 60)
+        logger.info(f"  ✓ Gaps Detected: {self.metrics['gaps_detected']}")
+        logger.info(f"  ✓ Gaps Patched: {self.metrics['gaps_patched']}")
+        logger.info(f"  ✓ API Calls: {self.metrics['api_calls']}")
+        logger.info(f"  ✓ API Failures: {self.metrics['api_failures']}")
+        
+        # 5️⃣ Overall summary
+        logger.info(f"\n✅ OVERALL SUMMARY")
+        logger.info("─" * 60)
+        logger.info(f"  📦 Total Records Inserted: {total_records:,}")
+        logger.info(f"    ├─ SPOT: {total_spot_records:,}")
+        logger.info(f"    └─ OPTIONS: {total_option_records:,}")
+        logger.info(f"  ⏱️  Execution Time: {execution_time:.2f} seconds")
+        logger.info(f"  🎯 Symbols Processed: {len(self.metrics['spot_data'])}")
+        logger.info(f"  📊 Timeframes: {', '.join(self.timeframes)}")
+        logger.info(f"  🔧 Mode: {self.mode} | Instrument: {self.instrument_type}")
+        
+        # 6️⃣ Final status
+        logger.info(f"\n{'='*60}")
+        logger.info(f"✅ DISPATCHER EXECUTION COMPLETE AT {self.metrics['end_time'].strftime('%Y-%m-%d %H:%M:%S IST')}")
+        logger.info(f"{'='*60}\n")
+
+    def track_spot_data(self, symbol: str, timeframe: str, record_count: int):
+        """Track SPOT data metrics."""
+        if symbol not in self.metrics["spot_data"]:
+            self.metrics["spot_data"][symbol] = {}
+        self.metrics["spot_data"][symbol][timeframe] = record_count
+        
+        if timeframe not in self.metrics["timeframe_totals"]:
+            self.metrics["timeframe_totals"][timeframe] = 0
+        self.metrics["timeframe_totals"][timeframe] += record_count
+
+    def track_option_data(self, option_symbol: str, timeframe: str, record_count: int):
+        """Track OPTIONS data metrics."""
+        if option_symbol not in self.metrics["option_data"]:
+            self.metrics["option_data"][option_symbol] = {}
+        self.metrics["option_data"][option_symbol][timeframe] = record_count
+        
+        if timeframe not in self.metrics["timeframe_totals"]:
+            self.metrics["timeframe_totals"][timeframe] = 0
+        self.metrics["timeframe_totals"][timeframe] += record_count
+
     def get_strikes_cached(self, symbol, high, low, trade_date):
         """
         Build & cache strike ladder per symbol per day.
@@ -314,10 +418,11 @@ class MarketDataDispatcher:
             strikes +
             [strikes[-1] + i * interval for i in range(1, 6)]
         )
-
+        logger.debug(f"📊 [{symbol}] Strike ladder locked: {len(strikes)} strikes ({base_low}-{base_high})")
+        return strikes
         self.strike_cache[key] = strikes
 
-        logger.info(f"[CACHE] Strike ladder locked for {symbol} {trade_date} → {len(strikes)} strikes")
+        logger.debug(f"📊 [{symbol}] Strike ladder locked: {len(strikes)} strikes ({base_low}-{base_high})")
         return strikes
 
     def generate_option_symbols(
@@ -372,16 +477,21 @@ class MarketDataDispatcher:
             start_date = market_date
             end_date = market_date
 
-        today = datetime.now(IST)
-        end_date = today
-        start_date = end_date - timedelta(days=LOOKBACK_DAYS)
-
-        start_str = start_date.strftime("%Y-%m-%d")
-        end_str = end_date.strftime("%Y-%m-%d")
-
         for symbol in symbols:
             for tf in timeframes:
-                logger.info(f"[LIVE][SPOT] Fetching {symbol} {tf}")
+                today = datetime.now(IST)
+                end_date = today
+                if tf == "D":
+                    lookback_filter_days = DAY_CANDLE_LOOKBACK_DAYS
+                elif tf == "1m":
+                    lookback_filter_days = 0
+                else:
+                    lookback_filter_days = LOOKBACK_DAYS
+
+                start_date = end_date - timedelta(days=lookback_filter_days)                            
+                start_str = start_date.strftime("%Y-%m-%d")
+                end_str = end_date.strftime("%Y-%m-%d")
+
                 exchange = "BSE_INDEX" if symbol.upper() == "SENSEX" else exchange
                 df = self.retry_api_call(
                     self.client.history,
@@ -389,14 +499,16 @@ class MarketDataDispatcher:
                     exchange=exchange,
                     interval=tf,
                     start_date=start_str,
-                    end_date=end_str
+                    end_date=end_str,
+                    description=f"SPOT {symbol} {tf}"
                 )
 
                 if df is None or df.empty:
-                    logger.warning(f"[LIVE][SPOT] Empty API data: {symbol} {tf}")
+                    logger.warning(f"⚠️  [{symbol}:{tf}] No data from API")
                     continue
 
                 df = self.normalize_df(df)
+                self.metrics["api_calls"] += 1
 
                 DB_MANAGER.store_ohlcv_data(
                     symbol=symbol,
@@ -411,10 +523,10 @@ class MarketDataDispatcher:
                     symbol, exchange, tf, start_str, end_str, "SPOT"
                 )
 
-                logger.info(
-                    f"[LIVE][SPOT] {symbol} {tf} {start_date} | "
-                    f"Inserted={len(df)} | DB={len(db_df)}"
-                )
+                record_count = len(db_df)
+                self.track_spot_data(symbol, tf, record_count)
+                
+                logger.debug(f"✓ [{symbol:12}:{tf:3}] {record_count:5} records stored")
 
     def fetch_and_store_options_live(self, symbol: str, exchange: str, timeframes: List[str], market_date: str = None):
         """Fetch and store option market data for LIVE mode."""
@@ -425,9 +537,7 @@ class MarketDataDispatcher:
         else:
             start_date = market_date
             end_date = market_date
-        
 
-        logger.error(f"[LIVE][OPTIONS] compute [SPOT] strike {symbol}")
         # ---- Step 1: Fetch daily SPOT candle
         day_df = self.retry_api_call(
             self.client.history,
@@ -435,50 +545,59 @@ class MarketDataDispatcher:
             exchange=exchange,
             interval="D",
             start_date=start_date,
-            end_date=end_date
+            end_date=end_date,
+            description=f"SPOT Daily for {symbol}"
         )
 
         if day_df is None or day_df.empty:
-            logger.error(f"[LIVE][OPTIONS] No day candle for compute [SPOT] strike {symbol}")
-            sys.exit(1)
+            logger.error(f"❌ [{symbol}] Cannot compute strikes - no daily candle")
+            return
 
         day_high = day_df["high"].iloc[0]
         day_low = day_df["low"].iloc[0]
+        self.metrics["api_calls"] += 1
 
         opt_exchange = "BFO" if symbol.upper() == "SENSEX" else self.option_exchange
-        # ---- Step 2: Expiry (nearest weekly) Expiry (cached, locked)
+        # ---- Step 2: Expiry (nearest weekly) - cached
         expiry = self.get_expiry_cached(symbol, opt_exchange, "options")
 
-        # # ---- Step 3: Generate symbols
-        option_symbols = self.generate_option_symbols(
-             symbol, day_high, day_low, expiry
-        )  
+        # ---- Step 3: Generate symbols
+        option_symbols = self.generate_option_symbols(symbol, day_high, day_low, expiry)
+        logger.info(f"📈 [{symbol}] Generated {len(option_symbols)} option symbols for {expiry}")
 
-        today = datetime.now(IST)
-        end_date = today
-        start_date = end_date - timedelta(days=LOOKBACK_DAYS)
-
-        start_str = start_date.strftime("%Y-%m-%d")
-        end_str = end_date.strftime("%Y-%m-%d")
         # ---- Step 4: Fetch option candles
         for opt_symbol in option_symbols:
             for tf in timeframes:
-                logger.info(f"[LIVE][OPTIONS] {opt_symbol} {tf}")
+                today = datetime.now(IST)
+                end_date = today
+                if tf == "D":
+                    lookback_filter_days = DAY_CANDLE_LOOKBACK_DAYS
+                elif tf == "1m":
+                    lookback_filter_days = 0
+                else:
+                    lookback_filter_days = LOOKBACK_DAYS
+
+                start_date = end_date - timedelta(days=lookback_filter_days)
+                start_str = start_date.strftime("%Y-%m-%d")
+                end_str = end_date.strftime("%Y-%m-%d")
+                
                 df = self.retry_api_call(
                     self.client.history,
                     symbol=opt_symbol,
                     exchange=opt_exchange,
                     interval=tf,
                     start_date=start_str,
-                    end_date=end_str
+                    end_date=end_str,
+                    description=f"OPTIONS {opt_symbol} {tf}"
                 )
 
                 if df is None or df.empty:
-                    logger.warning(f"[LIVE][OPTIONS] Empty: {opt_symbol} {tf}")
                     continue
                 
+                self.metrics["api_calls"] += 1
                 df = self.normalize_df(df)
-                #-----Get expiry strike opt_type underlying----#
+                
+                # Parse option symbol
                 underlying, expiry_str, strike, opt_type = self.parse_option_symbol(opt_symbol)
                 df["underlying"] = underlying
                 df["expiry"] = expiry_str
@@ -495,13 +614,14 @@ class MarketDataDispatcher:
                 )
 
                 db_df = DB_MANAGER.get_ohlcv_data(
-                    opt_symbol, self.option_exchange, tf, start_str, end_str, "OPTIONS"
+                    opt_symbol, self.option_exchange, tf, start_str, end_str, "OPTIONS", 
+                    underlying_symbol=underlying, expiry_date=expiry_str
                 )
 
-                logger.info(
-                    f"[LIVE][OPTIONS] {opt_symbol} {tf} {start_date} | "
-                    f"Inserted={len(df)} | DB={len(db_df)}"
-                )
+                record_count = len(db_df)
+                self.track_option_data(opt_symbol, tf, record_count)
+                
+                logger.debug(f"✓ [{opt_symbol:20}:{tf:3}] {record_count:5} records stored")
 
     def backtest_data_loader_with_gap_validation(
         self,
@@ -512,167 +632,121 @@ class MarketDataDispatcher:
         end_date: str,
         instrument_type: str
     ) -> pd.DataFrame:
-        """Universal backtest loader with gap detection & patching."""
-        logger.info(
-            f"[BACKTEST] Loading {symbol} {timeframe} "
-            f"{start_date} → {end_date}"
-        )
+        """Universal backtest loader (Gap Validation Removed)."""
+        logger.debug(f"📥 [{symbol}:{timeframe}] Loading backtest data")
 
         df = DB_MANAGER.get_ohlcv_data(
             symbol, exchange, timeframe,
             start_date, end_date,
             instrument_type
         )
-        # ---- Case 1: DB empty
-        if df.empty:
-            logger.warning(f"[BACKTEST] DB EMPTY → API FETCH")
+        logger.debug(f"📥 [{symbol}:{timeframe}] fetching from API")
 
-            api_df = self.retry_api_call(
-                self.client.history,
-                symbol=symbol,
-                exchange=exchange,
-                interval=timeframe,
-                start_date=start_date,
-                end_date=end_date
-            )
-
-            if api_df is None or api_df.empty:
-                logger.error(f"[BACKTEST][FATAL] API EMPTY → STOP BOT")
-                sys.exit(1)
-
-            api_df = self.normalize_df(api_df)
-
-            DB_MANAGER.store_ohlcv_data(
-                symbol, exchange, timeframe,
-                api_df, instrument_type=instrument_type
-            )
-
-            df = DB_MANAGER.get_ohlcv_data(
-                symbol, exchange, timeframe,
-                start_date, end_date, instrument_type
-            )
-
-            logger.info(f"[BACKTEST] Loaded {len(df)} rows")
-            return df
-
-        # ---- Case 2: Validate gaps
-        logger.info("[BACKTEST] Validating date completeness")
-
-        api_daily = self.retry_api_call(
+        api_df = self.retry_api_call(
             self.client.history,
             symbol=symbol,
             exchange=exchange,
-            interval="D",
+            interval=timeframe,
             start_date=start_date,
-            end_date=end_date
+            end_date=end_date,
+            description=f"BACKTEST {symbol} {timeframe}"
         )
 
-        if api_daily is None or api_daily.empty:
-            logger.error("[BACKTEST] Cannot validate gaps (daily API empty)")
-            sys.exit(1)
+        if api_df is None or api_df.empty:
+            logger.error(f"❌ [{symbol}:{timeframe}] API returned empty - STOP")
+            # sys.exit(1)
 
-        api_daily = self.normalize_df(api_daily)
-        if isinstance(api_daily.index, pd.DatetimeIndex):
-            api_dates = set(api_daily.index.normalize().date)
-        else:
-            raise ValueError("api_daily index is not DatetimeIndex")
-        
-        db_dates = set(df.index.normalize().date)
+        self.metrics["api_calls"] += 1
+        api_df = self.normalize_df(api_df)
 
-        missing_dates = sorted(api_dates - db_dates)
-
-        if missing_dates:
-            logger.warning(f"[BACKTEST] Missing dates detected: {missing_dates}")
-
-        for miss_date in missing_dates:
-            miss_date_str = miss_date.strftime("%Y-%m-%d")
-
-            logger.info(
-                f"[BACKTEST] Patching {symbol} {timeframe} {miss_date_str}"
-            )
-
-            patch_df = self.retry_api_call(
-                self.client.history,
-                symbol=symbol,
-                exchange=exchange,
-                interval=timeframe,
-                start_date=miss_date_str,
-                end_date=miss_date_str
-            )
-
-            if patch_df is None or patch_df.empty:
-                logger.error(
-                    f"[BACKTEST][FATAL] Missing intraday data: {miss_date_str}"
-                )
-                sys.exit(1)
-
-            patch_df = self.normalize_df(patch_df)
-
-            DB_MANAGER.store_ohlcv_data(
-                symbol, exchange, timeframe,
-                patch_df, instrument_type=instrument_type
-            )
+        DB_MANAGER.store_ohlcv_data(
+            symbol, exchange, timeframe,
+            api_df, instrument_type=instrument_type
+        )
 
         df = DB_MANAGER.get_ohlcv_data(
             symbol, exchange, timeframe,
             start_date, end_date, instrument_type
         )
 
-        logger.info(f"[BACKTEST] Final rows={len(df)}")
+        self.track_spot_data(symbol, timeframe, len(df))
+        logger.debug(f"✓ [{symbol}:{timeframe}] Loaded {len(df)} rows from API")
         return df
 
     def run(self):
         """Main dispatcher entry point."""
         logger.info(
-            f"[DISPATCHER] MODE={self.mode} | "
-            f"INSTRUMENT={self.instrument_type} | SYMBOL={self.symbol}"
+            f"🎯 [DISPATCHER] MODE={self.mode} | "
+            f"INSTRUMENT={self.instrument_type} | SYMBOLS={self.symbol}"
         )
 
-        if self.mode == "LIVE":
-            self.fetch_and_store_spot_live(
-                symbols= self.symbol,
-                exchange= self.spot_exchange,
-                timeframes=self.timeframes,
-                market_date=MARKET_DATE
-                )
-            for sym in self.symbol: #----Option data fetching---#
-                exchange = "BSE_INDEX" if sym.upper() == "SENSEX" else self.spot_exchange
-                self.fetch_and_store_options_live(
-                    symbol= sym,
-                    exchange=exchange,
+        try:
+            if self.mode == "LIVE":
+                logger.info(f"📡 Starting LIVE data fetch...")
+                self.fetch_and_store_spot_live(
+                    symbols=self.symbol,
+                    exchange=self.spot_exchange,
                     timeframes=self.timeframes,
                     market_date=MARKET_DATE
-                    )
+                )
                 
-        elif self.mode == "BACKTESTING":
-            if self.instrument_type == "SPOT":
                 for sym in self.symbol:
                     exchange = "BSE_INDEX" if sym.upper() == "SENSEX" else self.spot_exchange
-                    for tf in self.timeframes:
-                        self.backtest_data_loader_with_gap_validation(
-                            symbol=sym,
-                            exchange=exchange,
-                            timeframe=tf,
-                            start_date=self.start_date,
-                            end_date=self.end_date,
-                            instrument_type=self.instrument_type
-                        )
-            elif self.instrument_type == "OPTIONS":
-                for tf in self.timeframes:
-                    self.backtest_data_loader_with_gap_validation(
-                        symbol=self.symbol,
-                        exchange=self.option_exchange,
-                        timeframe=tf,
-                        start_date=self.start_date,
-                        end_date=self.end_date,
-                        instrument_type=self.instrument_type
+                    self.fetch_and_store_options_live(
+                        symbol=sym,
+                        exchange=exchange,
+                        timeframes=self.timeframes,
+                        market_date=MARKET_DATE
                     )
-        else:
-            raise ValueError(f"Invalid MODE: {self.mode}")
+                    
+            elif self.mode == "BACKTESTING":
+                logger.info(f"🔄 Starting BACKTEST data loading...")
+                
+                # Use BATCH_DATES if available, else fall back to start/end range
+                dates_to_process = []
+                if self.batch_dates:
+                    dates_to_process = [(d, d) for d in self.batch_dates]
+                else:
+                    dates_to_process = [(self.start_date, self.end_date)]
+
+                for s_date, e_date in dates_to_process:
+                    logger.info(f"📅 Processing range: {s_date} to {e_date}")
+                    if self.instrument_type == "SPOT":
+                        for sym in self.symbol:
+                            exchange = "BSE_INDEX" if sym.upper() == "SENSEX" else self.spot_exchange
+                            for tf in self.timeframes:
+                                self.backtest_data_loader_with_gap_validation(
+                                    symbol=sym,
+                                    exchange=exchange,
+                                    timeframe=tf,
+                                    start_date=s_date,
+                                    end_date=e_date,
+                                    instrument_type=self.instrument_type
+                                )
+                    elif self.instrument_type == "OPTIONS_DATA":
+                        for tf in self.timeframes:
+                            self.backtest_data_loader_with_gap_validation(
+                                symbol=self.symbol,
+                                exchange=self.option_exchange,
+                                timeframe=tf,
+                                start_date=s_date,
+                                e_date=e_date,
+                                instrument_type=self.instrument_type
+                            )
+            else:
+                raise ValueError(f"Invalid MODE: {self.mode}")
+        
+        finally:
+            # Generate summary regardless of success/failure
+            self.generate_execution_summary()
 
 if __name__ == "__main__":
-    MarketDataDispatcher().run()
-    logger.info("Dispatched completed")
+    try:
+        dispatcher = MarketDataDispatcher()
+        dispatcher.run()
+    except Exception as e:
+        logger.error(f"❌ DISPATCHER FAILED: {e}", exc_info=True)
+        sys.exit(1)
 
 
 #                                ┌────────────────────────────┐

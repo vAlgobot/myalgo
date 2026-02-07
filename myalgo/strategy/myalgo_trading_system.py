@@ -31,7 +31,7 @@ import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 # Directly call the helper from MarketDataDispatcher
-from market_data_dispatcher import MarketDataDispatcher
+# from market_data_dispatcher import MarketDataDispatcher
 import pytz
 import re
 import sys
@@ -44,7 +44,8 @@ import time
 import platform
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from logger import get_logger, log_trade_execution
+from logger import get_logger, log_trade_execution, set_strategy_name
+from db.expiry_list import EXPIRY_LIST_DDMMYYYY
 # ----------------------------
 # Global Constants
 os_name = platform.system()
@@ -52,10 +53,29 @@ MARKET_OPEN  = dt_time(9, 15)   # 09:15 AM Market open time
 MARKET_CLOSE = dt_time(15, 20)  # 03:20 PM Market close time
 ENTRY_CUTOFF_TIME = dt_time(15, 00) # 03:00 PM No new entry orders after this time
 
-dispatcher = MarketDataDispatcher()
+# dispatcher = MarketDataDispatcher()
 
 SIMULATION_DATE: Optional[str] = None            # Example: "28-11-2025" or None
-MODE = "LIVE"                                    # Example: LIVE or BACKTESTING
+# ==============================================================  
+# MODE CONFIGURATION
+# ==============================================================
+# Available modes:
+# - "LIVE": Real-time trading with WebSocket
+# - "BACKTESTING": Single-day simulation
+# - "BACKTESTING_RANGE": Multi-day simulation (NEW)
+
+MODE = "BACKTESTING_RANGE"  # Change this to switch modes # Example: LIVE or BACKTESTING or BACKTESTING_RANGE
+
+# ─────────────────────────────────────────────────────────────
+# BACKTESTING_RANGE Configuration (NEW)
+# ─────────────────────────────────────────────────────────────
+START_DATE: Optional[str] = "01-01-2025"  # DD-MM-YYYY format
+END_DATE: Optional[str] = "31-12-2025"    # DD-MM-YYYY format
+
+# ─────────────────────────────────────────────────────────────
+# BACKTESTING (Single Day) Configuration (EXISTING)
+# ─────────────────────────────────────────────────────────────
+SIMULATION_DATE: Optional[str] = "31-12-2025"  # DD-MM-YYYY or None       
 # ----------------------------
 # Configuration
 # ----------------------------
@@ -67,9 +87,9 @@ if os_name.upper == "OS LINUX" or os_name.upper() == "LINUX":
     WS_URL = "wss://myalgo.vralgo.com/ws"
 else:
     logging.info("🖥️ Running on Windows - using local API settings")
-    API_KEY = "44594f88f9f8dec784ae99da67bcea129c794005186c0b8eb0d6af542df1a56c"
-    API_HOST = "http://127.0.0.1:5000"
-    WS_URL = "ws://127.0.0.1:8765"
+    API_KEY = "076b15b4998ba741e0f12a49ef2befbd9cb11483a1a66fba50163c87a8453dc0"
+    API_HOST = "https://myalgo.vralgo.com/"
+    WS_URL = "wss://myalgo.vralgo.com/ws"
 
 # API_KEY = "7773b590c743c9184fb1bb74830091a379f88c2035a2203e2b40d24cb2f86711"
 # API_HOST = "http://127.0.0.1:5000"
@@ -77,9 +97,13 @@ else:
 
 # ==============================================================  
 try:
-    logging.info("🔌 Initializing OpenAlgo API client")
-    client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL) # Initialize openalgo API client
-    logging.info("✅ 🚀 OpenAlgo API client initialized successfully")
+    if MODE == "LIVE":
+        logging.info("🔌 Initializing OpenAlgo API client")
+        client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL) # Initialize openalgo API client
+        logging.info("✅ 🚀 OpenAlgo API client initialized successfully")
+    elif MODE in ["BACKTESTING", "BACKTESTING_RANGE"]:
+        logging.info("🔌 Backtesting mode - OPENALGO API client not required")
+        client = None
 except Exception as e:
     logging.error(f"❌ 🚨 Failed to initialize OpenAlgo API client: {e}")
     sys.exit(1)
@@ -91,7 +115,7 @@ EXCHANGE = "NSE_INDEX"                            #Exchange
 PRODUCT = "MIS"                                   #Product
 CANDLE_TIMEFRAME = "5m"                           #Candle timeframe
 LOOKBACK_DAYS = 10                                #Lookback days
-SIGNAL_CHECK_INTERVAL = 5                         # minutes (use integer minutes)
+SIGNAL_CHECK_INTERVAL = 5                         #minutes (use integer minutes)
 MIN_TP_SEPARATION_R = 0.5                         #Minimum TP separation ratio is to avoid closer pivot with previous target
 # ===============================================================
 # 🔧 Dynamic LTP Breakout Confirmation Config
@@ -99,7 +123,7 @@ MIN_TP_SEPARATION_R = 0.5                         #Minimum TP separation ratio i
 
 LTP_BREAKOUT_ENABLED = True                         # enable / disable breakout waiting
 LTP_BREAKOUT_INTERVAL_MIN = 5                       # minutes to wait for LTP breakout confirmation
-ENTRY_BREAKOUT_MODE = "OPTIONS"                     # "SPOT" or "OPTIONS" (For breakout validation)
+ENTRY_BREAKOUT_MODE = "SPOT"                     # "SPOT" or "OPTIONS" (For breakout validation)
 
 # Indicators to compute
 EMA_PERIODS = [9, 20, 50, 200]                      #EMA Periods
@@ -108,7 +132,7 @@ RSI_PERIODS = [14, 21]                              #RSI Periods
 CPR = ['DAILY', 'WEEKLY','MONTHLY']                 #CPR Periods
 
 # === LTP Pivot Touch Gatekeeper (new) ===
-ENABLE_LTP_PIVOT_GATE = True                        # master switch for this gatekeeper
+ENABLE_LTP_PIVOT_GATE = False                        # master switch for this gatekeeper
 PIVOT_TOUCH_BUFFER_PTS = 0.5                        # absolute buffer in price units (points). adjust for NIFTY ~0.5
 PIVOT_TOUCH_BUFFER_PCT = None                       # optional: use percentage buffer (e.g. 0.001 for 0.1%). If set, overrides PIVOT_TOUCH_BUFFER_PTS
 # --------------------------------------
@@ -117,27 +141,31 @@ PIVOT_TOUCH_BUFFER_PCT = None                       # optional: use percentage b
 STOPLOSS = 0                      #Stoploss
 TARGET = 0                        #Target
 MAX_SIGNAL_RANGE = 50             #Maximum signal range
-MIN_SL_POINTS = 5                 #Absolute minimum SL points
-MAX_RISK_POINTS = 15              #Absolute safety on option premium
-SL_PERCENT = 0.12                 #12% of option premium
-MIN_REWARD_PCT_OF_RISK = 0.5      #At least 50% reward of risk
-MIN_REWARD_FOR_SL_MOVE = 0.5      #TSL Move only if reward is at least 50% of initial target 
-MIN_ABSOLUTE_REWARD = 5           #Minimum absolute reward in points
-ENTRY_CONFIRM_SECONDS = 1         #Seconds to confirm entry
+MIN_SL_POINTS = 10                 #Absolute minimum SL points
+MAX_RISK_POINTS = 30              #Absolute safety on option premium
+SL_PERCENT = 0.25                 #12% of option premium
+MIN_REWARD_PCT_OF_RISK = 0.7      #At least 50% reward of risk
+MIN_REWARD_FOR_SL_MOVE = 0.7      #TSL Move only if reward is at least 50% of initial target 
+MIN_ABSOLUTE_REWARD = 15           #Minimum absolute reward in points
+ENTRY_CONFIRM_SECONDS = 5         #Seconds to confirm entry
 EXIT_CONFIRM_SECONDS = 5          #Seconds to confirm exit    
 SL_BUFFER_PCT = 0.15              #15% buffer from premium automatic SL placement in broker
-SL_BUFFER_POINT = 1               #Buffer in points from premium in CPR SL placement
-
+SL_BUFFER_POINT = 0               #Buffer in points from premium in CPR SL placement
+CPR_MIDPOINTS_ENABLED = False      #Enable CPR Midpoints for SL/TP calculation
+# Backtesting confirmation candles for exit LTP breakout (set to 1 for immediate confirmation)
+EXIT_BREAKOUT_CONFIRM_CANDLES = 0  # Backtesting default
+# Backtesting confirmation candles for entry LTP breakout (set to 1 for immediate confirmation)
+ENTRY_BREAKOUT_CONFIRM_CANDLES = 0
 # Trade management
-MAX_TRADES_PER_DAY = 3              #Maximum trades per day
-STRATEGY = "myalgo_scalping_" + SYMBOL
+MAX_TRADES_PER_DAY = 3            #Maximum trades per day
 
+EXIT_LTP_BREAKOUT_MODE = "SPOT"    # "SPOT" or "OPTIONS" or "SPOT_OPTIONS" (For exit breakout validation)
 # Option trading config
 OPTION_ENABLED = True               #Enable option trading
 OPTION_EXCHANGE = "NFO"             #Option exchange
 STRIKE_INTERVAL = 50                #Strike interval
 OPTION_EXPIRY_TYPE = "WEEKLY"       #Option expiry type
-OPTION_STRIKE_SELECTION = "OTM1"    # "ATM", "ITM1", "OTM2", etc.
+OPTION_STRIKE_SELECTION = "OTM1"    # "ATM", "ITM1", "OTM1", etc.
 EXPIRY_LOOKAHEAD_DAYS = 30          #Expiry look ahead days
 LOT_QUANTITY =65                    #Lot size
 LOT = 1                             #Lot size
@@ -149,23 +177,23 @@ RECONNECT_BASE = 1.0                # seconds
 RECONNECT_MAX = 60.0                # seconds
 
 # Stoploss/Target tracking configuration
-USE_SPOT_FOR_SLTP = False           # If True → uses spot price for SL/TP tracking
-USE_OPTION_FOR_SLTP = True          # If True → uses option position LTP for SL/TP tracking
+USE_SPOT_FOR_SLTP = True           # If True → uses spot price for SL/TP tracking
+USE_OPTION_FOR_SLTP = False          # If True → uses option position LTP for SL/TP tracking
 
 # SL/TP Enhancement config
 # Available Methods:
 # - "Signal_candle_range_SL_TP": Uses signal candle range for SL/TP with TSL
 # - "CPR_range_SL_TP": Uses CPR pivot levels as dynamic targets with trailing
 SL_TP_METHOD = "CPR_range_SL_TP" # current active method #CPR_range_SL_TP #Signal_candle_range_SL_TP
-TSL_ENABLED = True # enable trailing stoploss behavior
+TSL_ENABLED = False # enable trailing stoploss behavior
 TSL_METHOD = "TSL_CPR_range_SL_TP" # trailing method for this enhancement
-
+STRATEGY = "Scalping_" + SYMBOL
 # ===============================================================
 # 🔒 STOP LOSS AUTOMATION & ENTRY RESTRICTIONS
 # ===============================================================
 
 # Entry restrictions configuration
-DAY_HIGH_LOW_VALIDATION_FROM_TRADE = 5  # Apply day high/low validation from this trade count onward
+DAY_HIGH_LOW_VALIDATION_FROM_TRADE = 2  # Apply day high/low validation from this trade count onward
 
 # ===============================================================
 # 🎯 CPR PIVOT EXCLUSION CONFIGURATION
@@ -196,6 +224,8 @@ MONTH_MAP = {
 IST = pytz.timezone("Asia/Kolkata")
 
 # Enhanced Logging System
+# Include strategy name in logfile (if provided) so filenames include strategy
+set_strategy_name(STRATEGY)
 # Module-specific loggers for detailed tracking
 main_logger = get_logger("trading_engine")
 signal_logger = get_logger("signals") 
@@ -220,6 +250,8 @@ class BacktestingManager:
     def __init__(self):
         self.active = False
         self.df: Optional[pd.DataFrame] = None
+        self.df_strategy_5m: Optional[pd.DataFrame] = None  # Cache for strategy
+        self.option_cache: Dict[tuple, pd.DataFrame] = {}   # Key: (symbol, timeframe) -> DF
         self.sim_index: int = 0  # next row to be emitted
         self.simulate_date_str: Optional[str] = None
         self.lock = threading.RLock()
@@ -227,19 +259,18 @@ class BacktestingManager:
 
     def start(self, simulate_date_str: str, symbol: str, exchange: str, timeframe: str):
         """
-        Load 1-minute OHLC for the given date using client.history(..., interval='1m').
-        Normalizes timestamp column to tz-aware IST and keeps rows >= 09:15.
+        Load 1-minute OHLC for the given date (Replay) AND 5-minute historical data (Strategy).
         """
         with self.lock:
             dt = self._parse_date(simulate_date_str)
             trade_date = dt.strftime("%Y-%m-%d")
             main_logger.info(f"🎬 Loading simulation data for {trade_date}")
-            logger.info("🛰️ Fetching 1-minute OHLC for %s", trade_date)
-
-            # -----------------------------
+            
+            # ─────────────────────────────────────────────────────────────
+            # 1. LOAD REPLAY DATA (1-minute, Single Day)
+            # ─────────────────────────────────────────────────────────────
+            logger.info("🛰️ [Replay] Fetching 1-minute OHLC for %s", trade_date)
             # 2️⃣ DuckDB FIRST
-            # -----------------------------
-
             df = DB_MANAGER.get_ohlcv_data(
                 symbol=symbol,
                 exchange=exchange,
@@ -247,65 +278,44 @@ class BacktestingManager:
                 start_date=trade_date,
                 end_date=trade_date
                 )
-            # -----------------------------
-            # 3️⃣ API FALLBACK (ONLY IF NEEDED)
-            # -----------------------------
+            # 3️⃣ API FALLBACK
             if df is None or df.empty:
-                main_logger.warning(
-                f"⚠️ [Backtesting][Data missing] {symbol} {timeframe} {trade_date} → fetching from OpenAlgo"
-                )
                 try:
                     raw = client.history(symbol=symbol, exchange=exchange, interval=timeframe,
                                      start_date=trade_date, end_date=trade_date)
+                    df_openalgo_historical = normalize_df(raw)
+                    if df_openalgo_historical.empty:
+                        raise RuntimeError("No usable 1-minute rows at/after 09:15 for " + trade_date)
+                    # Store into DuckDB
+                    df_openalgo_historical = df_openalgo_historical.reset_index()
+                    DB_MANAGER.store_ohlcv_data(
+                        symbol=symbol,
+                        exchange=exchange,
+                        timeframe=timeframe,
+                        data=df_openalgo_historical,
+                        replace=False
+                    )
+                    # Re-query
+                    df = DB_MANAGER.get_ohlcv_data(
+                        symbol=symbol,
+                        exchange=exchange,
+                        timeframe=timeframe,
+                        start_date=trade_date,
+                        end_date=trade_date
+                    )
                 except Exception as e:
-                    logger.exception("❌ 🚨 client.history failed: %s", e)
-                    raise RuntimeError("History fetch failed") from e
-                # Normalize to DataFrame
-                df_openalgo_historical = normalize_df(raw)
-                # Cache to DuckDB for future use
+                    logger.exception("❌ [Replay] Data fetch failed: %s", e)
+                    raise
 
-                if df_openalgo_historical.empty:
-                    raise RuntimeError("No usable 1-minute rows at/after 09:15 for " + trade_date)
-                
-                # DuckDB expects timestamp as column
-                df_openalgo_historical = df_openalgo_historical.reset_index()
-                logger.info("🛰️ Fetched %d rows from OpenAlgo for %s", len(df_openalgo_historical), trade_date)
-                # Store into DuckDB
-                DB_MANAGER.store_ohlcv_data(
-                    symbol=symbol,
-                    exchange=exchange,
-                    timeframe=timeframe,
-                    data=df_openalgo_historical,
-                    replace=False
-                    )
-                logger.info("💾 Stored historical data into DuckDB for %s", trade_date)
-                
-                # Re-query DuckDB (single source of truth)
-                df = DB_MANAGER.get_ohlcv_data(
-                    symbol=symbol,
-                    exchange=exchange,
-                    timeframe=timeframe,
-                    start_date=trade_date,
-                    end_date=trade_date
-                    )
-                logger.info("💾 Re-queried DuckDB, got %d rows for %s", len(df), trade_date)
-
-                if df is None or df.empty:
-                    raise RuntimeError("Simulation data unavailable after DB + API fallback")
-            # -----------------------------
-            # Normalize DB output
-            # -----------------------------
+            # Normalize
             if isinstance(df.index, pd.DatetimeIndex):
                 df = df.reset_index()
-
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-
             if df["timestamp"].dt.tz is None:
                 df["timestamp"] = df["timestamp"].dt.tz_localize(IST)
             else:
                 df["timestamp"] = df["timestamp"].dt.tz_convert(IST)
        
-            # Filter to trading start (09:15 or later)
             start_time = datetime.strptime("09:15", "%H:%M").time()
             df = df[df["timestamp"].dt.time >= start_time].reset_index(drop=True)
 
@@ -314,20 +324,121 @@ class BacktestingManager:
 
             self.df = df
             self.sim_index = 0
+            
+            # ─────────────────────────────────────────────────────────────
+            # 2. LOAD STRATEGY DATA (5-minute, History + Today)
+            # ─────────────────────────────────────────────────────────────
+            # Determine start date for history (using LOOKBACK_DAYS)
+            history_start_dt = dt - timedelta(days=LOOKBACK_DAYS)
+            history_start_str = history_start_dt.strftime("%Y-%m-%d")
+            
+            logger.info(f"🛰️ [Strategy] Caching {CANDLE_TIMEFRAME} data: {history_start_str} to {trade_date}")
+            
+            df_5m = DB_MANAGER.get_ohlcv_data(
+                symbol=symbol,
+                exchange=exchange,
+                timeframe=CANDLE_TIMEFRAME,
+                start_date=history_start_str,
+                end_date=trade_date
+            )
+            
+            # normalize 5m cache
+            if df_5m is not None and not df_5m.empty:
+                if isinstance(df_5m.index, pd.DatetimeIndex):
+                    df_5m = df_5m.reset_index()
+                df_5m["timestamp"] = pd.to_datetime(df_5m["timestamp"])
+                if df_5m["timestamp"].dt.tz is None:
+                    df_5m["timestamp"] = df_5m["timestamp"].dt.tz_localize(IST)
+                else:
+                    df_5m["timestamp"] = df_5m["timestamp"].dt.tz_convert(IST)
+                
+                # Make index accessible for searching if needed, or sort
+                df_5m = df_5m.sort_values("timestamp").reset_index(drop=True)
+                self.df_strategy_5m = df_5m
+                logger.info(f"💾 [Strategy] Cached {len(df_5m)} rows ({CANDLE_TIMEFRAME}) for fast slicing")
+            else:
+                logger.warning("⚠️ [Strategy] Could not preload 5m history from DB. get_intraday() may fail or fallback.")
+                self.df_strategy_5m = pd.DataFrame()
+
             self.simulate_date_str = simulate_date_str
             self.active = True
+            main_logger.info(f"✅ Simulation loaded: {len(df)} ticks (1m) | {len(self.df_strategy_5m)} candles (5m)")
+
+    def get_data_slice(self, current_time: datetime) -> pd.DataFrame:
+        """
+        Return cached 5m data up to current_time (inclusive).
+        Optimized for speed (in-memory filtering).
+        """
+        if self.df_strategy_5m is None or self.df_strategy_5m.empty:
+            return pd.DataFrame()
             
-            main_logger.info(f"✅ Simulation loaded: {len(df)} candles from {df['timestamp'].min()} to {df['timestamp'].max()}")
-            logger.info("🎬 Simulation loaded for %s | rows=%d", simulate_date_str, len(df))
+        # Ensure current_time is tz-aware IST
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=IST)
+            
+        mask = self.df_strategy_5m["timestamp"] <= current_time
+        sliced_df = self.df_strategy_5m[mask].copy()
+        
+        # Set index to timestamp as expected by strategy
+        sliced_df.set_index("timestamp", inplace=True)
+        return sliced_df
+
+    def get_option_data_slice(self, symbol: str, timeframe: str, current_time: datetime) -> Optional[pd.DataFrame]:
+        """
+        Return cached option data up to current_time.
+        Returns None if not in cache (signaling caller to fetch & cache).
+        """
+        with self.lock:
+            key = (symbol, timeframe)
+            if key not in self.option_cache:
+                return None
+            
+            df = self.option_cache[key]
+            
+        # Ensure current_time is tz-aware IST
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=IST)
+            
+        # Filter (df is already sorted and normalized)
+        mask = df["timestamp"] <= current_time
+        sliced_df = df[mask].copy()
+        sliced_df.set_index("timestamp", inplace=True)
+        return sliced_df
+
+    def cache_option_data(self, symbol: str, timeframe: str, df: pd.DataFrame):
+        """
+        Store option dataframe in cache.
+        Expects normalized df with 'timestamp' column.
+        """
+        with self.lock:
+            if df is None or df.empty:
+                return
+            
+            # Ensure timestamp logic
+            if "timestamp" not in df.columns and isinstance(df.index, pd.DatetimeIndex):
+                df = df.reset_index()
+            
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                if df["timestamp"].dt.tz is None:
+                    df["timestamp"] = df["timestamp"].dt.tz_localize(IST)
+                else:
+                    df["timestamp"] = df["timestamp"].dt.tz_convert(IST)
+                
+                df = df.sort_values("timestamp").reset_index(drop=True)
+                key = (symbol, timeframe)
+                self.option_cache[key] = df
+                main_logger.info(f"💾 [BacktestCache] Cached option {symbol} ({timeframe}): {len(df)} rows")
 
     def stop(self):
         with self.lock:
             self.active = False
             self.df = None
+            self.df_strategy_5m = None
+            self.option_cache.clear()
             self.sim_index = 0
             self.simulate_date_str = None
             main_logger.info("🛑 Simulation stopped")
-            logger.info("🛑 Simulation stopped")
 
     def _parse_date(self, dstr: str) -> datetime:
         for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
@@ -415,7 +526,7 @@ class DateReplayClient:
                 
                 # SIMULATION PAUSE DURING EXIT
                 while self.BACKTESTING_MANAGER.pause_ticks:
-                     time.sleep(0.01)
+                    #  time.sleep(0.01)
                      if self._stop_event.is_set() or not self.BACKTESTING_MANAGER.active:
                         break
                 if self._stop_event.is_set() or not self.BACKTESTING_MANAGER.active:
@@ -458,7 +569,7 @@ class DateReplayClient:
                     "close": float(row.get("close", 0)),
                     "volume": float(row.get("volume", 0)),
                     "timestamp": ts.isoformat()
-                }
+                    }
                 
                 # Add option-specific fields if present
                 if instrument_type == "OPTION":
@@ -505,6 +616,33 @@ class DateReplayClient:
 
                     if run_strategy and (ts.minute % SIGNAL_CHECK_INTERVAL == 0 and ts.second == 0):
                         main_logger.info(f"⏰ Signal trigger at {ts.strftime('%H:%M:%S')}")
+                        
+                        # 🔧 PRE-CHECK: Validate breakout expiry BEFORE strategy evaluation
+                        # This prevents "STALE DATA" warnings when breakout window expires at signal time
+                        if strategy_fn and hasattr(strategy_fn, '__self__'):
+                            bot = strategy_fn.__self__
+                            
+                            # Check ENTRY breakout expiry
+                            if hasattr(bot, 'pending_breakout_expiry') and bot.pending_breakout_expiry:
+                                if ts >= bot.pending_breakout_expiry:
+                                    signal_logger.info("❌ Entry breakout window expired (pre-check) | clearing pending signal.")
+                                    
+                                    # Unsubscribe from option LTP if subscribed
+                                    if hasattr(bot, 'option_symbol') and bot.option_symbol:
+                                        if bot.option_symbol in bot.ws_subscriptions:
+                                            bot.ws_subscriptions.discard(bot.option_symbol)
+                                            main_logger.info(f"🔌 Unsubscribed from option LTP: {bot.option_symbol}")
+                                    
+                                    bot.reset_timer()
+                                    bot.reset_pending_breakout()
+                            
+                            # Check EXIT breakout expiry
+                            if hasattr(bot, 'pending_exit_breakout_expiry') and bot.pending_exit_breakout_expiry:
+                                if ts >= bot.pending_exit_breakout_expiry:
+                                    signal_logger.info("❌ Exit breakout window expired (pre-check) | clearing.")
+                                    bot.pending_exit_breakout = None
+                                    bot.exit_breakout_side = None
+                                    bot.reset_timer()
                         if strategy_fn:
                             try:
                                # Run the strategy and check if signal was generated
@@ -524,7 +662,7 @@ class DateReplayClient:
                 
                 if should_advance_candle:
                     idx += 1 # Move to next candle only if intrabar finished
-                # time.sleep(0.05)  # small delay to simulatFetching 1-minute OHLCe real ticks
+                # time.sleep(0.05)  # small delay to simulate fetching 1-minute OHLCe real ticks
         # -------------------------------------------------------------
         # LOOP END — only stop when ALL candles replayed
         # -------------------------------------------------------------
@@ -601,17 +739,18 @@ def normalize_df(raw):
     return df
 
 # Simulation instances for Market Spot data OHLC
-if MODE == "BACKTESTING" and SIMULATION_DATE is not None:
+if MODE in ["BACKTESTING", "BACKTESTING_RANGE"] and SIMULATION_DATE is not None:
     main_logger.info(f"🚀 Starting in BACKTESTING mode for date {SIMULATION_DATE}")
     from db.database_main import get_database_manager
     BACKTESTING_MANAGER = BacktestingManager()
     REPLAY_CLIENT = DateReplayClient(BACKTESTING_MANAGER)
-    DB_MANAGER = get_database_manager()
+    DB_MANAGER = get_database_manager(read_only=True)
 else:
     main_logger.info("🚀 Starting in LIVE mode")
+    from db.database_main import get_database_manager
     BACKTESTING_MANAGER = BacktestingManager()  # inactive in live mode
     REPLAY_CLIENT = None
-    DB_MANAGER = None
+    DB_MANAGER = get_database_manager(read_only=True)
 # =========================================================
 # 📘 SQLAlchemy Dataclass Setup for Trade Logging
 # =========================================================
@@ -659,9 +798,9 @@ def log_trade_db(trade_data: dict):
         record = TradeLog(**trade_data)
         session.add(record)
         session.commit()
-        print(f"✅ Trade logged: {trade_data['symbol']} | {trade_data['action']} @ {trade_data['price']}")
+        # logger.info(f"✅ Trade logged: {trade_data['symbol']} | {trade_data['action']} @ {trade_data['price']}")
     except Exception as e:
-        print(f"⚠️ DB Logging Error: {e}")
+        logger.info(f"⚠️ DB Logging Error: {e}")
         session.rollback()
     finally:
         session.close()
@@ -772,6 +911,11 @@ class MYALGO_TRADING_BOT:
         self.pending_breakout = None
         self.pending_breakout_expiry = None
         self.breakout_side = None
+        self.entry_breakout_candle_count = 0  # 🎯 Track consecutive candles for entry breakout
+        self.exit_breakout_candle_count = 0   # 🎯 Track consecutive candles for exit breakout
+        self.pending_exit_breakout = None
+        self.pending_exit_breakout_expiry = None
+        self.exit_breakout_side = None
         self._state_lock = threading.Lock()
         self.cpr_levels_sorted = []
         self.cpr_targets = []
@@ -803,6 +947,13 @@ class MYALGO_TRADING_BOT:
         self.entry_timer_start_ts = None
         self.entry_timer_start_ts = None
         self.cpr_tp_hits = []
+        self.last_ltp_time = {}  # {symbol: last_tick_timestamp}
+        self.ws_subscription_lock = threading.Lock()
+
+        # Backtesting-configurable required candles for exit breakout confirmation
+        self.exit_breakout_required_candles = EXIT_BREAKOUT_CONFIRM_CANDLES
+        # Backtesting-configurable required candles for entry breakout confirmation
+        self.entry_breakout_required_candles = ENTRY_BREAKOUT_CONFIRM_CANDLES
 
         # --- Intrabar control ---
         self._option_intrabar_stage = 0
@@ -810,6 +961,11 @@ class MYALGO_TRADING_BOT:
     
         # 🗓️ Expiry Cache
         self.expiry_cache = {"date": None, "is_expiry": False, "expiry_dt": None}
+        # Instance-level TSL flag (per-trade) and cached dynamic indicators
+        self.tsl_enabled = False
+        self.cached_dyn_spot = None
+        self.cached_dyn_option = None
+        self.cached_last_close = None
 
         # 🎯 Log mode selection
         mode_str = MODE
@@ -821,7 +977,7 @@ class MYALGO_TRADING_BOT:
         
         main_logger.info(f"🧠 Strategy: {STRATEGY} | Symbol: {SYMBOL} | Timeframe: {CANDLE_TIMEFRAME}")
         main_logger.info(f"⚖️ Risk Management: SL={STOPLOSS}, TP={TARGET} | Max Trades: {MAX_TRADES_PER_DAY}")
-        main_logger.info(f"🔒 SL/TP Method: {SL_TP_METHOD} | TSL Enabled: {TSL_ENABLED}")
+        main_logger.info(f"🔒 SL/TP Method: {SL_TP_METHOD} | TSL Enabled: {self.tsl_enabled}")
         main_logger.info(f"📝 Options Enabled: {OPTION_ENABLED} | Strike Selection: {OPTION_STRIKE_SELECTION}")
         main_logger.info(f"⏰ Signal Check Interval: {SIGNAL_CHECK_INTERVAL} minutes")
         
@@ -863,7 +1019,7 @@ class MYALGO_TRADING_BOT:
                 session.query(TradeLog)
                 .filter(TradeLog.symbol == symbol)
                 .filter(TradeLog.strategy == strategy)
-                .filter(TradeLog.leg_status == "open")
+                .filter(TradeLog.leg_status == "Open")
                 .order_by(TradeLog.id.desc())
                 .first()
             )
@@ -872,15 +1028,22 @@ class MYALGO_TRADING_BOT:
                 exit_price = float(exit_trade.get("price", 0))
                 entry_price = float(open_leg.price or 0)
                 qty = float(exit_trade.get("quantity", 0))
-
+            
                 # Calculate PnL (for long vs short)
                 if open_leg.action.upper() == "CALL":
                     pnl = (exit_price - entry_price) * qty
                 else:
-                    pnl = (entry_price - exit_price) * qty
+                    pnl = (exit_price - entry_price) * qty
 
-                open_leg.pnl = pnl
-                open_leg.leg_status = "closed"
+                
+                if self.cpr_tp_hit_count > 0 and not pnl > 0:
+                    reason = "Breakeven"
+                else:
+                    reason = "TP Hit" if pnl > 0 else "SL Hit" if pnl < 0 else "Breakeven Exit"
+
+                open_leg.pnl = float(f"{pnl:.2f}")
+                open_leg.leg_status = "Closed"
+                open_leg.reason = reason
                 session.commit()
 
                 order_logger.info(
@@ -967,10 +1130,19 @@ class MYALGO_TRADING_BOT:
                     if reason:
                         logger.info("Exit triggered: %s", reason)
                         self.exit_in_progress = True
-                        threading.Thread(target=self.place_exit_order, args=(reason,), daemon=True).start()
+                        if BACKTESTING_MANAGER.active:
+                            self.place_exit_order(reason)
+                        else:
+                            threading.Thread(target=self.place_exit_order, args=(reason,), daemon=True).start()
 
             if not market_is_open():
+                reason = "Market closed"    
                 logger.info("🛑 Market closed. close all active positions and shutdown a system")
+                self.exit_in_progress = True
+                if BACKTESTING_MANAGER.active:
+                    self.place_exit_order(reason)
+                else:
+                    threading.Thread(target=self.place_exit_order, args=(reason,), daemon=True).start()
                 self.shutdown_gracefully()
                 return
 
@@ -993,7 +1165,7 @@ class MYALGO_TRADING_BOT:
             
         try:
             while not self.stop_event.is_set() and self.running:
-                time.sleep(1)
+                time.sleep(0.1)
         except KeyboardInterrupt:
             logger.info("Manual stop requested")
             self.shutdown_gracefully()
@@ -1007,6 +1179,8 @@ class MYALGO_TRADING_BOT:
         self.pending_breakout = None
         self.pending_breakout_expiry = None
         self.breakout_side = None
+        self.entry_breakout_candle_count = 0
+        self.exit_breakout_candle_count = 0
         # with self._pivot_gate_lock:
         #     self.ltp_pivot_breakout = False
         #     self.ltp_pivot_info = None
@@ -1025,89 +1199,111 @@ class MYALGO_TRADING_BOT:
                 return False
 
             # Expiry check
-            if current_time > self.pending_exit_breakout_expiry:
+            if current_time >= self.pending_exit_breakout_expiry:
                 signal_logger.info("❌ Exit breakout window expired clearing.")
                 self.pending_exit_breakout = None
                 self.exit_breakout_side = None
                 self.reset_timer()
                 return False
 
-            # We always use OPTION LTP for exit confirmation
+            # Read configured mode for exit breakout validation
+            mode = EXIT_LTP_BREAKOUT_MODE.upper()
+
+            # Acquire current LTPs
+            spot_ltp = getattr(self, "ltp", None)
             option_ltp = getattr(self, "option_ltp", None)
-            if option_ltp is None:
-                return False
 
             side = self.exit_breakout_side
-            high = self.pending_exit_breakout.get("high")
-            low = self.pending_exit_breakout.get("low")
-            
             now_ts = current_time
-            # -------------------------------
-            # EXIT CALL → LTP breaks BELOW low
-            # -------------------------------
-            if side == "EXIT_BUY":
-                if option_ltp < low:
-                    if not self.entry_timer_started:
-                        self.start_timer(now_ts)
-                        return False
-                    elapsed = (now_ts - self.entry_timer_start_ts).total_seconds()
-                    if elapsed < EXIT_CONFIRM_SECONDS:
-                        signal_logger.info(
-                            f"⏳ EXIT TRADE - LTP BREAKOUT DETECTED @ {option_ltp:.2f}, waiting for time breakout confirmation..."
-                        )   
-                        return False
-                    if elapsed >= EXIT_CONFIRM_SECONDS:
-                        signal_logger.info(
-                            f"⏳ EXIT TRADE - TIME BREAKOUT DETECTED @ {option_ltp:.2f}, confirming..."
-                        )
-                        if option_ltp < low:
-                            signal_logger.info(
-                                f"🔴 EXIT TRADE - LTP BREAKOUT CONFIRMED AFTER {elapsed:.1f}s @ {option_ltp:.2f}"
-                                )
-                            # Check trigger type for appropriate exit reason
-                            trigger = self.pending_exit_breakout.get("trigger", "REVERSAL")
-                            exit_reason = "CPR_SL_LTP_CONFIRM" if trigger == "CPR_SL" else "REVERSAL_LTP_CONFIRM"
-                            self._trigger_exit(exit_reason)
-                            self.reset_timer()
-                            return True
-                        else:
-                            self.reset_timer()
-                            return False
+
+            # Extract thresholds from pending payload (support both old and new keys)
+            spot_high = self.pending_exit_breakout.get("high")
+            spot_low = self.pending_exit_breakout.get("low")
+            opt_high = self.pending_exit_breakout.get("option_high") if "option_high" in self.pending_exit_breakout else self.pending_exit_breakout.get("high")
+            opt_low = self.pending_exit_breakout.get("option_low") if "option_low" in self.pending_exit_breakout else self.pending_exit_breakout.get("low")
+
+            # Helper to evaluate condition depending on side
+            def eval_spot_condition():
+                if spot_ltp is None:
+                    return False
+                if side == "EXIT_BUY":
+                    return spot_ltp < (spot_low or 0)
+                else:  # EXIT_SELL
+                    return spot_ltp > (spot_high or 0)
+
+            def eval_option_condition():
+                if option_ltp is None:
+                    return False
+                if side == "EXIT_BUY":
+                    # EXIT_BUY -> option must break below option_low
+                    return option_ltp < (opt_low or 0)
+                else:  # EXIT_SELL -> per new rule validate low side for options
+                    return option_ltp < (opt_low or 0)
+
+            # Determine which conditions to check based on mode
+            if mode == "SPOT":
+                cond = eval_spot_condition()
+            elif mode == "OPTIONS":
+                cond = eval_option_condition()
+            else:  # SPOT_OPTIONS (both)
+                cond = eval_spot_condition() and eval_option_condition()
+
+            # Backtesting: require N-candle confirmation (configurable via EXIT_BREAKOUT_CONFIRM_CANDLES)
+            if cond:
+                signal_logger.info(f"🔔 Exit breakout condition met for side={side} mode={mode}")
+                if BACKTESTING_MANAGER.active:
+                    # Use instance override if present else global constant
+                    req = getattr(self, 'exit_breakout_required_candles', EXIT_BREAKOUT_CONFIRM_CANDLES)
+                    # If only 1 candle required, confirm immediately
+                    if req <= 1:
+                        trigger = self.pending_exit_breakout.get("trigger", "REVERSAL")
+                        exit_reason = self.pending_exit_breakout.get("reason") or ("CPR_SL_LTP_CONFIRM" if trigger == "CPR_SL" else "REVERSAL_CANDLE_BREAKOUT")
+                        signal_logger.info(f"🔴 EXIT TRADE - {req}-CANDLE CONFIRMATION | mode={mode} side={side}")
+                        self._trigger_exit(exit_reason)
+                        self.reset_timer()
+                        self.exit_breakout_candle_count = 0
+                        self.reset_pending_breakout()
+                        return True
+                    # Increment counter and confirm when reached
+                    self.exit_breakout_candle_count += 1
+                    signal_logger.info(f"🕯️ CANDLE {self.exit_breakout_candle_count} DETECTED for exit breakout (need {req})")
+                    if self.exit_breakout_candle_count >= req:
+                        trigger = self.pending_exit_breakout.get("trigger", "REVERSAL")
+                        exit_reason = self.pending_exit_breakout.get("reason") or ("CPR_SL_LTP_CONFIRM" if trigger == "CPR_SL" else "REVERSAL_CANDLE_BREAKOUT")
+                        signal_logger.info(f"🔴 EXIT TRADE - {req}-CANDLE CONFIRMATION | mode={mode} side={side}")
+                        self._trigger_exit(exit_reason)
+                        self.reset_timer()
+                        self.exit_breakout_candle_count = 0
+                        return True
+                # Live/time-based confirmation
+                if not self.entry_timer_started:
+                    self.start_timer(now_ts)
+                    return False
+                elapsed = (now_ts - self.entry_timer_start_ts).total_seconds()
+                if elapsed < EXIT_CONFIRM_SECONDS:
+                    signal_logger.info(f"⏳ EXIT TRADE - breakout detected, waiting {EXIT_CONFIRM_SECONDS - elapsed:.1f}s")
+                    return False
+                # final check at timeout
+                if cond:
+                    trigger = self.pending_exit_breakout.get("trigger", "REVERSAL")
+                    # Prefer explicit reason from pending payload; fallback to legacy mapping
+                    exit_reason = self.pending_exit_breakout.get("reason")
+                    if not exit_reason:
+                        exit_reason = "CPR_SL_LTP_CONFIRM" if trigger == "CPR_SL" else "REVERSAL_CANDLE_BREAKOUT"
+                    signal_logger.info(f"🔴 EXIT TRADE - TIME CONFIRMED | mode={mode} side={side} | reason={exit_reason}")
+                    self._trigger_exit(exit_reason)
+                    self.reset_timer()
+                    return True
                 else:
                     self.reset_timer()
                     return False
-
-            # ==============================
-            # EXIT SELL → Option must stay ABOVE high
-            # ==============================
-            elif side == "EXIT_SELL":
-
-                if option_ltp > high:
-                    if not self.entry_timer_started:
-                        self.start_timer(now_ts)
-                        return False
-
-                    elapsed = (now_ts - self.entry_timer_start_ts).total_seconds()
-
-                    if elapsed >= EXIT_CONFIRM_SECONDS:
-                        if option_ltp > high:
-                            signal_logger.info(
-                                f"🔴 EXIT TRADE - PUT SIDE LTP BREAKOUT CONFIRMED AFTER {elapsed:.1f}s @ {option_ltp:.2f}"
-                            )
-                            # Check trigger type for appropriate exit reason
-                            trigger = self.pending_exit_breakout.get("trigger", "REVERSAL")
-                            exit_reason = "CPR_SL_LTP_CONFIRM" if trigger == "CPR_SL" else "REVERSAL_LTP_CONFIRM"
-                            self._trigger_exit(exit_reason)
-                            self.reset_timer()
-                            return True
-                        else:
-                            self.reset_timer()
-                            return False
-                else:
-                    self.reset_timer()
-                    return False
-
-            return False
+            else:
+                # Condition not met -> reset counters/timers
+                if BACKTESTING_MANAGER.active and self.exit_breakout_candle_count > 0:
+                    self.exit_breakout_candle_count = 0
+                    signal_logger.info(f"❌ Exit breakout failed - resetting {getattr(self,'exit_breakout_required_candles', EXIT_BREAKOUT_CONFIRM_CANDLES)}-candle counter")
+                self.reset_timer()
+                return False
 
     def _trigger_exit(self, reason: str):
             with self._state_lock:
@@ -1115,11 +1311,14 @@ class MYALGO_TRADING_BOT:
                     return
                 self.exit_in_progress = True
 
-            threading.Thread(
-                target=self.place_exit_order,
-                args=(reason,),
-                daemon=True
-            ).start()
+            if BACKTESTING_MANAGER.active:
+                self.place_exit_order(reason)
+            else:
+                threading.Thread(
+                    target=self.place_exit_order,
+                    args=(reason,),
+                    daemon=True
+                ).start()
 
             # Clear exit breakout state
             self.pending_exit_breakout = None
@@ -1150,6 +1349,13 @@ class MYALGO_TRADING_BOT:
             if self.gk_resistance_pivot is None and self.gk_support_pivot is None:
                 pivots_dict = {}
                 daily_pivot = float(self.static_indicators.get("DAILY", {}).get("pivot",0.0))
+                tc_og = float(self.static_indicators.get("DAILY", {}).get("tc",0.0))
+                bc_og = float(self.static_indicators.get("DAILY", {}).get("bc",0.0))
+                tc, bc = max(tc_og, bc_og), min(tc_og, bc_og)
+                if tc <= bc:
+                        position_logger.warning(
+                        f"Invalid CPR values detected → TC: {tc_og}, BC: {bc_og} | Adjusting to TC: {tc}, BC: {bc}"
+                        )
                 for tf in ["DAILY", "WEEKLY", "MONTHLY"]:
                     if tf in self.static_indicators:
                         pivots_dict[tf.lower()] = self.static_indicators[tf]
@@ -1163,8 +1369,8 @@ class MYALGO_TRADING_BOT:
 
                 pivots = [float(p) for p in level_mapping.keys()]
                 # Dynamic resistance/support detection (only once)
-                resistance = [p for p in pivots if p > daily_pivot]
-                support    = [p for p in pivots if p < daily_pivot]
+                resistance = [p for p in pivots if p > tc]
+                support    = [p for p in pivots if p < bc]
 
                 if resistance:
                     self.gk_resistance_pivot = min(resistance)
@@ -1172,8 +1378,8 @@ class MYALGO_TRADING_BOT:
                     self.gk_support_pivot = max(support)
 
                 signal_logger.info(
-                    f"[GATEKEEPER INIT] Stored Pivots → "
-                    f"Resistance={self.gk_resistance_pivot}, Support={self.gk_support_pivot}"
+                    f"✅ [GATEKEEPER INIT] Stored Pivots → "
+                    f"Resistance={self.gk_resistance_pivot:.2f}, Support={self.gk_support_pivot:.2f}"
                 )
 
             # --------------------------------------------
@@ -1225,7 +1431,7 @@ class MYALGO_TRADING_BOT:
         # --------------------------
         # 1️⃣ Breakout expiry time next 5 mins
         # --------------------------
-        if now_ts > self.pending_breakout_expiry:
+        if now_ts >= self.pending_breakout_expiry:
             signal_logger.info("❌ Breakout window expired | clearing pending signal.")
             self.reset_timer()
             self.reset_pending_breakout()
@@ -1242,10 +1448,44 @@ class MYALGO_TRADING_BOT:
                 # signal_logger.info("⚠️ OPTION LTP not available yet for breakout check")
                 return
             break_level = high
-            logger.debug(f"🔔 OPTION MODE BREAKOUT CHECK | Side: {side} | Current Option LTP: {current_opt_ltp:.2f} | Break Level: {break_level:.2f}")
+            logger.debug(f"🔔 OPTION MODE BREAKOUT CHECK | Side: {side} | Current Option LTP: {current_opt_ltp:.2f} | Break Level: {break_level:.2f} | Time {now_ts}")
             # For Options, BOTH Calls (BUY) and Puts (SELL) must break HIGH to enter
             if current_opt_ltp > break_level:
                  logger.info(f"🔔 OPTION LTP above break level for {side} side")
+                 if BACKTESTING_MANAGER.active:
+                    # Configurable N-candle confirmation for backtesting
+                    req = getattr(self, 'entry_breakout_required_candles', ENTRY_BREAKOUT_CONFIRM_CANDLES)
+                    if req <= 1:
+                        signal_logger.info(f"🚀 OPTION ENTRY BREAKOUT CONFIRMED! ({side}) | {req}-Candle Confirmation | LTP {current_opt_ltp:.2f} > {break_level:.2f}")
+                        intraday = self.get_intraday()
+                        self.place_entry_order(side, intraday)
+                        self.reset_timer()
+                        self.reset_pending_breakout()
+                        self.entry_breakout_candle_count = 0
+                        return
+                    # First candle detection
+                    if self.entry_breakout_candle_count == 0:
+                        self.entry_breakout_candle_count = 1
+                        signal_logger.info(f"🕯️ CANDLE 1 DETECTED | OPTION LTP breaks {break_level:.2f} @ {current_opt_ltp:.2f}")
+                        return
+                    # Subsequent candles: increment and confirm when reached
+                    if current_opt_ltp > break_level:
+                        self.entry_breakout_candle_count += 1
+                        signal_logger.info(f"🕯️ CANDLE {self.entry_breakout_candle_count} CONFIRMED | OPTION LTP remains beyond {break_level:.2f} @ {current_opt_ltp:.2f}")
+                        if self.entry_breakout_candle_count >= req:
+                            signal_logger.info(f"🚀 OPTION ENTRY BREAKOUT CONFIRMED! ({side}) | {req}-Candle Confirmation | LTP {current_opt_ltp:.2f} > {break_level:.2f}")
+                            intraday = self.get_intraday()
+                            self.place_entry_order(side, intraday)
+                            self.entry_breakout_candle_count = 0
+                            self.reset_timer()
+                            self.reset_pending_breakout()
+                            return
+                        return
+                    else:
+                        # Reversal: fell back → reset
+                        self.entry_breakout_candle_count = 0
+                        signal_logger.info(f"❌ Candle failed | OPTION LTP reverted below {break_level:.2f} @ {current_opt_ltp:.2f} - resetting counter")
+                        return
                  if not self.entry_timer_started:
                     self.start_timer(now_ts)
                     return
@@ -1254,9 +1494,9 @@ class MYALGO_TRADING_BOT:
                     signal_logger.info(f"⏳Waiting for entry seconds breakout. current second {elapsed:.1f}s @ current_opt_ltp: {current_opt_ltp:.2f}")
                     return
                  if elapsed >= ENTRY_CONFIRM_SECONDS:
-                     signal_logger.info(f"⏳ Verifying OPTION {side} breakout after {elapsed:.1f}s @ current_opt_ltp: {current_opt_ltp:.2f}")
+                     signal_logger.info(f"⏳ Verifying OPTION {side} entry breakout after {elapsed:.1f}s @ current_opt_ltp: {current_opt_ltp:.2f}")
                      if current_opt_ltp > break_level:
-                         signal_logger.info(f"🚀 OPTION BREAKOUT CONFIRMED! ({side}) | LTP {current_opt_ltp:.2f} > {break_level:.2f} | Elapsed: {elapsed:.1f}s")
+                         signal_logger.info(f"🚀 OPTION ENTRY BREAKOUT CONFIRMED! ({side}) | LTP {current_opt_ltp:.2f} > {break_level:.2f} | Elapsed: {elapsed:.1f}s")
                          intraday = self.get_intraday()
                          # Side remains "BUY" or "SELL" to indicate CE or PE
                          self.place_entry_order(side, intraday)
@@ -1268,29 +1508,70 @@ class MYALGO_TRADING_BOT:
                          self.reset_timer() # Wick failed
                          return
             else:
+                # LTP fell back below breakout level → reset 2-candle counter
+                if BACKTESTING_MANAGER.active and self.entry_breakout_candle_count > 0:
+                    self.entry_breakout_candle_count = 0
+                    signal_logger.info(f"❌ LTP below {break_level:.2f} @ {current_opt_ltp:.2f} - resetting 2-candle counter")
                 self.reset_timer() # Fell back
                 return
             # Force return to skip Spot logic if in Option mode
             return
         # --------------------------
-        # 2️⃣ BUY breakout logic (Call option breakout) for Spot
+        # 2️⃣ BUY breakout logic (Spot)
         # --------------------------
+        # Thread-safe check for spot LTP availability (distinguish unset vs real 0.0)
+        with self._state_lock:
+            current_spot_ltp = getattr(self, "ltp", None)
+        if current_spot_ltp in (None, 0.0):
+            # signal_logger.info("⚠️ SPOT LTP not available yet for breakout check")
+            return
         if side == "BUY":
-            if self.ltp > high:  # Price above breakout?
-                # Start timer if first cross
+            if current_spot_ltp > high:  # Price above breakout?
+                # Backtesting: configurable N-candle confirmation
+                if BACKTESTING_MANAGER.active:
+                    req = getattr(self, 'entry_breakout_required_candles', ENTRY_BREAKOUT_CONFIRM_CANDLES)
+                    if req <= 1:
+                        signal_logger.info(f"🚀 ENTRY BREAKOUT CONFIRMED AT (CALL SIDE) IMMEDIATE | SPOT LTP {current_spot_ltp:.2f} > {high:.2f}")
+                        intraday = self.get_intraday()
+                        self.place_entry_order("BUY", intraday)
+                        self.reset_timer()
+                        self.reset_pending_breakout()
+                        self.entry_breakout_candle_count = 0
+                        return
+                    if self.entry_breakout_candle_count == 0:
+                        self.entry_breakout_candle_count = 1
+                        signal_logger.info(f"🕯️ CANDLE 1 DETECTED | SPOT LTP breaks {high:.2f} @ {current_spot_ltp:.2f}")
+                        return
+                    # Candle >=2
+                    if current_spot_ltp > high:
+                        self.entry_breakout_candle_count += 1
+                        signal_logger.info(f"🕯️ CANDLE {self.entry_breakout_candle_count} CONFIRMED | SPOT LTP remains beyond {high:.2f} @ {current_spot_ltp:.2f}")
+                        if self.entry_breakout_candle_count >= req:
+                            intraday = self.get_intraday()
+                            self.place_entry_order("BUY", intraday)
+                            self.entry_breakout_candle_count = 0
+                            self.reset_timer()
+                            self.reset_pending_breakout()
+                            return
+                        return
+                    else:
+                        self.entry_breakout_candle_count = 0
+                        signal_logger.info(f"❌ Candle failed | SPOT LTP reverted below {high:.2f} @ {current_spot_ltp:.2f} - resetting counter")
+                        return
+
+                # Live mode: timer-based confirmation
                 if not self.entry_timer_started:
                     self.start_timer(now_ts)
                     return 
                 elapsed = (now_ts - self.entry_timer_start_ts).total_seconds()
                 if elapsed < ENTRY_CONFIRM_SECONDS:
-                    signal_logger.info(f"⏳ Verifying BUY breakout after {elapsed:.1f}s @ {self.ltp:.2f}")
+                    signal_logger.info(f"⏳ Verifying BUY breakout after {elapsed:.1f}s @ {current_spot_ltp:.2f}")
                     return
                 # Has it held long enough?
                 if elapsed >= ENTRY_CONFIRM_SECONDS:
-                    signal_logger.info(f"⏳ Verifying BUY breakout after {elapsed:.1f}s @ {self.ltp:.2f}")
-                    if self.ltp > high:
-                        self.ltp = high
-                        signal_logger.info(f"🚀 ENTRY BREAKOUT CONFIRMED AT (CALL SIDE) AFTER {elapsed:.1f}s @ {self.ltp:.2f}")
+                    signal_logger.info(f"⏳ Verifying BUY breakout after {elapsed:.1f}s @ {current_spot_ltp:.2f}")
+                    if current_spot_ltp > high:
+                        signal_logger.info(f"🚀 ENTRY BREAKOUT CONFIRMED AT (CALL SIDE) AFTER {elapsed:.1f}s @ {current_spot_ltp:.2f}")
                         intraday = self.get_intraday()
                         self.place_entry_order("BUY", intraday)
                         self.reset_timer()
@@ -1310,6 +1591,42 @@ class MYALGO_TRADING_BOT:
         # --------------------------
         if side == "SELL":
             if self.ltp < low:
+                # Backtesting: require 2-candle confirmation
+                if BACKTESTING_MANAGER.active:
+                    req = getattr(self, 'entry_breakout_required_candles', ENTRY_BREAKOUT_CONFIRM_CANDLES)
+                    if req <= 1:
+                        signal_logger.info(f"🚀 ENTRY BREAKOUT CONFIRMED AT (PUT SIDE) IMMEDIATE | SPOT LTP {self.ltp:.2f} < {low:.2f}")
+                        intraday = self.get_intraday()
+                        self.place_entry_order("SELL", intraday)
+                        self.reset_timer()
+                        self.reset_pending_breakout()
+                        self.entry_breakout_candle_count = 0
+                        return
+
+                    # First candle detection
+                    if self.entry_breakout_candle_count == 0:
+                        self.entry_breakout_candle_count = 1
+                        signal_logger.info(f"🕯️ CANDLE 1 DETECTED | SPOT LTP breaks below {low:.2f} @ {self.ltp:.2f}")
+                        return
+
+                    # Subsequent candles: increment and confirm when reached
+                    if self.ltp < low:
+                        self.entry_breakout_candle_count += 1
+                        signal_logger.info(f"🕯️ CANDLE {self.entry_breakout_candle_count} CONFIRMED | SPOT LTP remains below {low:.2f} @ {self.ltp:.2f}")
+                        if self.entry_breakout_candle_count >= req:
+                            intraday = self.get_intraday()
+                            self.place_entry_order("SELL", intraday)
+                            self.entry_breakout_candle_count = 0
+                            self.reset_timer()
+                            self.reset_pending_breakout()
+                            return
+                        return
+                    else:
+                        # Reversal: fell back → reset
+                        self.entry_breakout_candle_count = 0
+                        signal_logger.info(f"❌ Candle failed | SPOT LTP reverted above {low:.2f} @ {self.ltp:.2f} - resetting counter")
+                        return
+
                 if not self.entry_timer_started:
                     self.start_timer(now_ts)
                     return
@@ -1320,7 +1637,6 @@ class MYALGO_TRADING_BOT:
                     return
                 if elapsed >= ENTRY_CONFIRM_SECONDS:
                     if self.ltp < low:
-                        self.ltp = low
                         signal_logger.info(f"🚀 ENTRY BREAKOUT CONFIRMED AT (PUT SIDE) AFTER {elapsed:.1f}s @ {self.ltp:.2f}")
                         intraday = self.get_intraday()
                         self.place_entry_order("SELL", intraday)
@@ -1351,6 +1667,8 @@ class MYALGO_TRADING_BOT:
             signal_logger.info("🔄 Entry timer reset (breakout rejected)")
         self.entry_timer_started = False
         self.entry_timer_start_ts = None
+        self.exit_breakout_candle_count = 0
+        self.entry_breakout_candle_count = 0
 
     def _update_option_ltp_from_df(self, current_ts):
         """
@@ -1389,8 +1707,9 @@ class MYALGO_TRADING_BOT:
             self._option_intrabar_stage += 1
             return float(ltp)
 
-        except KeyError:
+        except Exception as e:
             # candle not available yet → keep last known LTP
+            logger.error(f"Option LTP not found in DataFrame for {self.option_symbol} at {ts}: {e}")
             return self.option_ltp
     # -------------------------
     # WebSocket - Real time data LTP 
@@ -1402,15 +1721,19 @@ class MYALGO_TRADING_BOT:
             symbol = data.get("symbol") or (data.get("data") or {}).get("symbol")
             ltp = data.get("ltp") or (data.get("data") or {}).get("ltp")
             timestamp = data.get("timestamp")
-            self.option_ltp = None
-            if symbol == self.option_symbol:
-                self.option_ltp = float(ltp)
-                # logger.info(f"Option LTP: {self.option_ltp} {timestamp}")
-            elif symbol == SYMBOL:
-                self.ltp = float(ltp)
+            
             if symbol is None or ltp is None:
                 position_logger.warning("No LTP data in tick data")
                 return
+
+            # Track last tick time for health monitoring
+            self.last_ltp_time[symbol] = time.time()
+
+            if symbol == self.option_symbol:
+                self.option_ltp = float(ltp)
+            elif symbol == SYMBOL:
+                self.ltp = float(ltp)
+
             # 🎯 Get proper timestamp (simulated or real)
             current_time = get_now()
             now_str = current_time.strftime("%H:%M:%S")
@@ -1422,7 +1745,7 @@ class MYALGO_TRADING_BOT:
                 self.last_ws_tick_time = time.time()
             # ----------------------------------------
             # Update Option LTP from DataFrame in SIMULATION mode
-            if BACKTESTING_MANAGER.active and (self.position or self.pending_breakout) and USE_OPTION_FOR_SLTP:
+            if BACKTESTING_MANAGER.active and (self.position or self.pending_breakout):
                 opt_ltp = self._update_option_ltp_from_df(current_time)
                 if opt_ltp is not None:
                     self.option_ltp = opt_ltp
@@ -1483,7 +1806,8 @@ class MYALGO_TRADING_BOT:
             if not position or exit_in_progress or stoploss_price in (None, 0.0) or target_price in (None, 0.0):
                 current_time = time.time()
                 if not hasattr(self, '_last_detailed_log') or current_time - self._last_detailed_log > 30:
-                    print(f"\r[{now_str}] {symbol} LTP={self.ltp:.2f} | No Active Position |", end="")
+                    signal_logger.info(f"[{now_str}] {symbol} LTP={self.ltp:.2f} | No Active Position")
+                    # logger.info(f"[{now_str}] {symbol} LTP={self.ltp:.2f} | No Active Position")
                     self._last_detailed_log = current_time
                 return
                 
@@ -1507,7 +1831,7 @@ class MYALGO_TRADING_BOT:
                 self.option_ltp = track_ltp
 
             if track_ltp is None:
-                print(f"\r[{now_str}] Waiting for {tracking_mode} LTP updates...", end="")
+                logger.info(f"[{now_str}] Waiting for {tracking_mode} LTP updates...")
                 return
 
             # Compute P&L
@@ -1520,8 +1844,8 @@ class MYALGO_TRADING_BOT:
                 distance_to_sl = track_ltp - stoploss_price
                 distance_to_tp = target_price - track_ltp
 
-            # Print brief status line
-            # print(f"\r[{now}] {symbol} LTP={track_ltp:.2f} | {position} @ {entry_price:.2f} | P&L {unreal:.2f} | SL {stoploss_price:.2f} TG {target_price:.2f}", end="")
+            # logger.info brief status line
+            # logger.info(f"\r[{now}] {symbol} LTP={track_ltp:.2f} | {position} @ {entry_price:.2f} | P&L {unreal:.2f} | SL {stoploss_price:.2f} TG {target_price:.2f}", end="")
 
             # Detailed position logging occasionally
             current_time = time.time()
@@ -1545,7 +1869,7 @@ class MYALGO_TRADING_BOT:
                 cpr_result = self.check_cpr_sl_tp_conditions(track_ltp)
                 if cpr_result == "SL_HIT":
                     position_logger.warning(f"🔴 CPR STOP LOSS TRIGGERED at {track_ltp:.2f}")
-                    print(f"\n[{now_str}] CPR Stoploss hit at {track_ltp:.2f}")
+                    logger.info(f"\n[{now_str}] CPR Stoploss hit at {track_ltp:.2f}")
                     with self._state_lock:
                         self.exit_in_progress = True
                     threading.Thread(target=self.place_exit_order, args=("CPR_STOPLOSS",), daemon=True).start()
@@ -1553,28 +1877,36 @@ class MYALGO_TRADING_BOT:
                 elif cpr_result == "SL_PENDING_BREAKOUT":
                     # Waiting for LTP breakout confirmation
                     position_logger.debug(f"⏳ CPR SL detected, waiting for LTP breakout confirmation")
-                    return  # Continue monitoring, handle_exit_ltp_breakout will confirm
+                    current_time = get_now()
+                    if self.handle_exit_ltp_breakout(current_time):
+                        return  # Continue handle_exit_ltp_breakoutonitoring, handle_exit_ltp_breakout will confirm
                 elif cpr_result == "FINAL_EXIT":
                     position_logger.info(f"🎯 CPR FINAL TARGET ACHIEVED at {track_ltp:.2f}")
-                    print(f"\n[{now_str}] CPR Final target reached at {track_ltp:.2f}")
+                    logger.info(f"\n[{now_str}] CPR Final target reached at {track_ltp:.2f}")
                     with self._state_lock:
                         self.exit_in_progress = True
-                    threading.Thread(target=self.place_exit_order, args=("CPR_FINAL_TARGET",), daemon=True).start()
+                    if BACKTESTING_MANAGER.active:
+                        self.place_exit_order("CPR_FINAL_TARGET")
+                    else:
+                        threading.Thread(target=self.place_exit_order, args=("CPR_FINAL_TARGET",), daemon=True).start()
                     return
                 elif cpr_result == "TP_HIT":
                     # TP hit handled in check_cpr_sl_tp_conditions, continue monitoring
                     return
             # If TSL is enabled and the SL_TP_METHOD is Signal_candle_range_SL_TP, handle TP hits by trailing instead of exiting immediately.
-            elif TSL_ENABLED and SL_TP_METHOD == "Signal_candle_range_SL_TP":
+            elif getattr(self, 'tsl_enabled', False) and SL_TP_METHOD == "Signal_candle_range_SL_TP":
                 # TP hit -> advance TSL; SL hit -> exit
                 if position == "BUY":
                     # Stoploss check (exit)
                     if track_ltp <= stoploss_price:
                         position_logger.warning(f"🔴 STOP LOSS TRIGGERED: {track_ltp:.2f} <= {stoploss_price:.2f}")
-                        print(f"\n[{now_str}] Stoploss hit at {track_ltp:.2f}")
+                        logger.info(f"\n[{now_str}] Stoploss hit at {track_ltp:.2f}")
                         with self._state_lock:
                             self.exit_in_progress = True
-                        threading.Thread(target=self.place_exit_order, args=("STOPLOSS",), daemon=True).start()
+                        if BACKTESTING_MANAGER.active:
+                            self.place_exit_order("STOPLOSS")
+                        else:
+                            threading.Thread(target=self.place_exit_order, args=("STOPLOSS",), daemon=True).start()
                         return
 
                     # TP hit -> update trailing (do not exit)
@@ -1586,10 +1918,13 @@ class MYALGO_TRADING_BOT:
                 else:  # SELL
                     if track_ltp >= stoploss_price:
                         position_logger.warning(f"🔴 STOP LOSS TRIGGERED: {track_ltp:.2f} >= {stoploss_price:.2f}")
-                        print(f"\n[{now_str}] Stoploss hit at {track_ltp:.2f}")
+                        logger.info(f"\n[{now_str}] Stoploss hit at {track_ltp:.2f}")
                         with self._state_lock:
                             self.exit_in_progress = True
-                        threading.Thread(target=self.place_exit_order, args=("STOPLOSS",), daemon=True).start()
+                        if BACKTESTING_MANAGER.active:
+                            self.place_exit_order("STOPLOSS")
+                        else:
+                            threading.Thread(target=self.place_exit_order, args=("STOPLOSS",), daemon=True).start()
                         return
 
                     if track_ltp <= target_price:
@@ -1604,26 +1939,38 @@ class MYALGO_TRADING_BOT:
                         position_logger.warning(f"🔴 STOP LOSS TRIGGERED: {track_ltp:.2f} <= {stoploss_price:.2f}")
                         with self._state_lock:
                             self.exit_in_progress = True
-                        threading.Thread(target=self.place_exit_order, args=("STOPLOSS",), daemon=True).start()
+                        if BACKTESTING_MANAGER.active:
+                            self.place_exit_order("STOPLOSS")
+                        else:
+                            threading.Thread(target=self.place_exit_order, args=("STOPLOSS",), daemon=True).start()
                         return
                     if track_ltp >= target_price:
                         position_logger.info(f"🟢 TARGET ACHIEVED: {track_ltp:.2f} >= {target_price:.2f}")
                         with self._state_lock:
                             self.exit_in_progress = True
-                        threading.Thread(target=self.place_exit_order, args=("TARGET",), daemon=True).start()
+                        if BACKTESTING_MANAGER.active:
+                            self.place_exit_order("TARGET")
+                        else:
+                            threading.Thread(target=self.place_exit_order, args=("TARGET",), daemon=True).start()
                         return
                 else:
                     if track_ltp >= stoploss_price:
                         position_logger.warning(f"🔴 STOP LOSS TRIGGERED: {track_ltp:.2f} >= {stoploss_price:.2f}")
                         with self._state_lock:
                             self.exit_in_progress = True
-                        threading.Thread(target=self.place_exit_order, args=("STOPLOSS",), daemon=True).start()
+                        if BACKTESTING_MANAGER.active:
+                            self.place_exit_order("STOPLOSS")
+                        else:
+                            threading.Thread(target=self.place_exit_order, args=("STOPLOSS",), daemon=True).start()
                         return
                     if track_ltp <= target_price:
                         position_logger.info(f"🟢 TARGET ACHIEVED: {track_ltp:.2f} <= {target_price:.2f}")
                         with self._state_lock:
                             self.exit_in_progress = True
-                        threading.Thread(target=self.place_exit_order, args=("TARGET",), daemon=True).start()
+                        if BACKTESTING_MANAGER.active:
+                            self.place_exit_order("TARGET")
+                        else:
+                            threading.Thread(target=self.place_exit_order, args=("TARGET",), daemon=True).start()
                         return
         except Exception:
             logger.exception("on_ltp_update error")
@@ -1631,16 +1978,75 @@ class MYALGO_TRADING_BOT:
 
     def subscribe_all_symbols(self):
         """
-        subscribe all required symbols after websocket reconnect.
+        Subscribe all required symbols after websocket reconnect with verification.
+        Enhanced with immediate retry on subscribe call failures.
         """
-        base_client = client
-        for sym in list(self.ws_subscriptions):
-            try:
+        symbols_to_subscribe = list(self.ws_subscriptions)
+        if not symbols_to_subscribe:
+            return
+
+        successfully_attempted = []  # Track which symbols to verify
+        
+        for sym in symbols_to_subscribe:
+            max_retries = 3
+            subscribed = False
+            
+            for attempt in range(max_retries):
+                try:
+                    exchange = EXCHANGE if sym == SYMBOL else OPTION_EXCHANGE
+                    self.client.subscribe_ltp(
+                        [{"exchange": exchange, "symbol": sym}], 
+                        on_data_received=self.on_ltp_update
+                    )
+                    logger.info(f"📡 Subscribed {sym} (attempt {attempt+1})")
+                    subscribed = True
+                    successfully_attempted.append(sym)
+                    break
+                    
+                except Exception as e:
+                    logger.error(f"❌ Subscribe call failed for {sym} (attempt {attempt+1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(1)
+            
+            if not subscribed:
+                logger.error(f"🚨 Failed to subscribe {sym} after {max_retries} attempts")
+                with self.ws_subscription_lock:
+                    self.ws_subscriptions.discard(sym)
+        
+        # ✅ Only verify symbols that were successfully subscribed
+        if successfully_attempted:
+            threading.Thread(
+                target=self._verify_subscriptions_async, 
+                args=(successfully_attempted,),
+                daemon=True
+            ).start()
+
+    def _verify_subscriptions_async(self, symbols, timeout=10, retries=5):
+        """Verify that ticks are actually arriving for the given symbols."""
+        time.sleep(2) # Initial wait for first ticks
+        for attempt in range(retries):
+            missing = []
+            now = time.time()
+            for sym in symbols:
+                last_time = self.last_ltp_time.get(sym, 0)
+                if now - last_time > timeout:
+                    missing.append(sym)
+            
+            if not missing:
+                logger.info(f"✅ All symbols verified and receiving ticks: {symbols}")
+                return True
+            
+            logger.warning(f"⚠️ Missing ticks for {missing} (attempt {attempt+1}/{retries}). Retrying subscription...")
+            for sym in missing:
                 exchange = EXCHANGE if sym == SYMBOL else OPTION_EXCHANGE
-                self.client.subscribe_ltp([{"exchange": exchange, "symbol": sym}], on_data_received=self.on_ltp_update)
-                logger.info(f"🔁 Subscribed {sym}")
-            except Exception as e:
-                logger.error(f"❌ 🚨 Failed to subscribe {sym}: {e}")
+                try:
+                    self.client.subscribe_ltp([{"exchange": exchange, "symbol": sym}], on_data_received=self.on_ltp_update)
+                except Exception as e:
+                    logger.error(f"❌ Retry subscription failed for {sym}: {e}")
+            time.sleep(timeout)
+        
+        logger.error(f"❌ FAILED to receive ticks for {missing} after {retries} retries")
+        return False
 
     def websocket_thread(self):
         """
@@ -1698,7 +2104,21 @@ class MYALGO_TRADING_BOT:
                         # 🔌 Connect WebSocket
                         # -------------------------------
                         logger.info("🔌 Connecting LIVE WebSocket...")
-                        self.client.connect()
+                        max_initial_retries = 3
+                        for attempt in range(max_initial_retries):
+                            try:
+                                logger.info(f"🔌 Connecting LIVE WebSocket (attempt {attempt+1}/{max_initial_retries})...")
+                                self.client.connect()
+                                self.ws_connected = True
+                                break
+                            except Exception as e:
+                                logger.error(f"❌ Initial connection failed (attempt {attempt+1}): {e}")
+                                if attempt < max_initial_retries - 1:
+                                    time.sleep(2 ** attempt)  # Exponential backoff
+                                else:
+                                    logger.error("🚨 Failed to establish initial WebSocket connection after retries")
+                                    return
+                                
                         self.ws_connected = True
                         self.ws_retry_count = 0 # reset on success
                         
@@ -1708,12 +2128,32 @@ class MYALGO_TRADING_BOT:
                         # Keep alive until disconnect
                         # -------------------------------
                         while self.ws_connected and not self.stop_event.is_set():
-                            time.sleep(0.5)
-                            # Heartbeat check
-                            if self.last_ws_tick_time and time.time() - self.last_ws_tick_time > HEARTBEAT_INTERVAL * 2:
+                            time.sleep(0.1)
+                            now = time.time()
+                            # Heartbeat check (global WebSocket health)
+                            if self.last_ws_tick_time and now - self.last_ws_tick_time > HEARTBEAT_INTERVAL * 2:
                                 logger.warning("⚠️ WebSocket heartbeat lost")
                                 self.ws_connected = False
                                 break
+                            
+                            # Individual subscription health check (Stall Detection)
+                            if round(now) % 30 == 0: # Check every ~30 seconds
+                                missing = []
+                                active_symbols = list(self.ws_subscriptions)
+                                for sym in active_symbols:
+                                    last_time = self.last_ltp_time.get(sym, 0)
+                                    if now - last_time > 60: # No tick for 60 seconds
+                                        missing.append(sym)
+                                
+                                if missing:
+                                    logger.warning(f"⚠️ Subscription stall detected for {missing}. Re-subscribing...")
+                                    for sym in missing:
+                                        exchange = EXCHANGE if sym == SYMBOL else OPTION_EXCHANGE
+                                        try:
+                                            self.client.subscribe_ltp([{"exchange": exchange, "symbol": sym}], on_data_received=self.on_ltp_update)
+                                        except Exception as e:
+                                            logger.error(f"❌ Re-subscription failed for {sym}: {e}")
+
                             # Market close during session
                             if not market_is_open():
                                 logger.info("🛑 Market closed during session")
@@ -1742,7 +2182,7 @@ class MYALGO_TRADING_BOT:
             # -------------------------------
             # 🔌 CLEAN SHUTDOWN
             # -------------------------------
-            if not BACKTESTING_MANAGER.active:
+            if MODE == "LIVE":
                 try:
                     self.ws_should_run = False
                     self.ws_connected = False
@@ -1799,6 +2239,7 @@ class MYALGO_TRADING_BOT:
                     return result
 
                 logger.warning(f"⚠️ {description} returned empty on attempt {attempt}")
+                time.sleep(delay)
             except Exception as e:
                 logger.warning(f"⚠️ {description} failed on attempt {attempt}: {e}")
                 if attempt < max_retries:
@@ -1838,6 +2279,40 @@ class MYALGO_TRADING_BOT:
             # ==========================================================
             if BACKTESTING_MANAGER.active:
                 try:
+                    # 🚀 OPTIMIZATION (Phase 1): Serve SPOT data from RAM
+                    if instrument_type == "SPOT":
+                        df_slice = BACKTESTING_MANAGER.get_data_slice(end_date)
+                        
+                        if not df_slice.empty:
+                            # ✅ Compute current-day levels using helper
+                            try:
+                                day_open, day_high, day_low = self.get_current_day_highlow(df_slice)
+                                if day_open and day_high and day_low:
+                                    self.current_day_open = day_open
+                                    self.current_day_high = day_high
+                                    self.current_day_low = day_low
+                                    data_logger.info(f"📊 [SIM-RAM] Current Day Levels | O={day_open:.2f} H={day_high:.2f} L={day_low:.2f}")
+                            except Exception as e:
+                                data_logger.error(f"Error computing day high/low in SIM-RAM mode: {e}", exc_info=True)
+                                
+                            # data_logger.debug(f"⚡ Served {len(df_slice)} rows from RAM slice")
+                            return df_slice
+                        else:
+                            data_logger.warning("RAM slice empty, falling back to DB...")
+
+                    # 🚀 OPTIMIZATION (Phase 3): Serve OPTION data from JIT Cache
+                    if instrument_type == "OPTIONS":
+                        sim_date = get_now()
+                        # Checks BacktestingManager.option_cache (supports JIT)
+                        cached_opt = BACKTESTING_MANAGER.get_option_data_slice(symbol, CANDLE_TIMEFRAME, sim_date)
+                        
+                        if cached_opt is not None and not cached_opt.empty:
+                            # data_logger.info(f"⚡ [SIM-RAM] Served Option {symbol} from cache")
+                            return cached_opt
+                        else:
+                            # Fallback: Process will continue to typical fetch, but we MUST cache the result
+                            pass 
+
                     backtesting_day_key = end_date.date().isoformat()
                     order_logger.info(f"[SIM MODE] Fetching intraday for {backtesting_day_key}")
                     
@@ -1903,6 +2378,10 @@ class MYALGO_TRADING_BOT:
                         hour=9, minute=15, second=0,
                         tz=IST
                     )
+                    # 🚀 OPTIMIZATION (Phase 3): Cache the fetched Result for Options
+                    if instrument_type == "OPTIONS":
+                         BACKTESTING_MANAGER.cache_option_data(symbol, CANDLE_TIMEFRAME, df_full)
+
                     df = df_full[(df_full.index >= start_915) & (df_full.index <= current_sim_time)].copy()
                     df_intraday = df_full[(df_full.index <= current_sim_time)].copy()
                     
@@ -2025,18 +2504,18 @@ class MYALGO_TRADING_BOT:
                 self.static_indicators['MONTHLY'] = self.compute_cpr(dfmonthly, "MONTHLY")
 
             # Combined summary
-            indicators_logger.info("╔═══════════════════════════")
-            indicators_logger.info("📘 CPR SUMMARY OVERVIEW (All Active Timeframes)")
+            logger.info("╔═══════════════════════════")
+            logger.info("📘 CPR SUMMARY OVERVIEW (All Active Timeframes)")
             for key, val in self.static_indicators.items():
                 if val:
-                    indicators_logger.info(
+                    logger.info(
                         f"{key:<8} | Pivot:{val['pivot']:.2f} | BC:{val['bc']:.2f} | TC:{val['tc']:.2f} | Width:{val['cpr_range']:.2f}"
                     )
-            indicators_logger.info("╚═══════════════════════════")
+            logger.info("╚═══════════════════════════")
             return True
 
         except Exception as e:
-            indicators_logger.error(f"❌ Error computing static indicators: {e}", exc_info=True)
+            logger.error(f"❌ Error computing static indicators: {e}", exc_info=True)
             return False         
     # -------------------------
     # Get Historical OHLCV 
@@ -2356,41 +2835,41 @@ class MYALGO_TRADING_BOT:
         self.current_day_low = float(dyn.get("current_day_low", 0.0))
         self.current_day_open = float(dyn.get("current_day_open", 0.0))
 
-        indicators_logger.debug(
+        logger.debug(
             f"📊 Current Day Levels | O={day_open} H={day_high} L={day_low}"
             )
 
         # Comprehensive logging of computed indicators
-        indicators_logger.debug("=== Dynamic Indicators Computed ===")
+        logger.debug("=== Dynamic Indicators Computed ===")
         
         # Log EMA values
         ema_values = []
         for p in EMA_PERIODS:
             if f"EMA_{p}" in dyn:
                 ema_values.append(f"EMA_{p}={dyn[f'EMA_{p}']:.2f}")
-        indicators_logger.debug(f"EMA Values: {', '.join(ema_values)}")
+                # logger.debug(f"EMA Values: {', '.join(ema_values)}")
         
         # Log SMA values  
         sma_values = []
         for p in SMA_PERIODS:
             if f"SMA_{p}" in dyn:
                 sma_values.append(f"SMA_{p}={dyn[f'SMA_{p}']:.2f}")
-        indicators_logger.debug(f"SMA Values: {', '.join(sma_values)}")
+                # logger.debug(f"SMA Values: {', '.join(sma_values)}")
         
         # Log RSI values
         rsi_values = []
         for p in RSI_PERIODS:
             if f"RSI_{p}" in dyn:
                 rsi_values.append(f"RSI_{p}={dyn[f'RSI_{p}']:.2f}")
-        indicators_logger.debug(f"RSI Values: {', '.join(rsi_values)}")
+                # logger.debug(f"RSI Values: {', '.join(rsi_values)}")
 
         # Log Dynamic data
         lc = dyn.get("last_candle", {})
         pc = dyn.get("prev_candle", {})
         if lc:
-            indicators_logger.debug(f"Last Candle: O={lc.get('open',0):.2f}, H={lc.get('high',0):.2f}, L={lc.get('low',0):.2f}, C={lc.get('close',0):.2f}")
+            logger.debug(f"Last Candle: O={lc.get('open',0):.2f}, H={lc.get('high',0):.2f}, L={lc.get('low',0):.2f}, C={lc.get('close',0):.2f}")
         if pc:
-            indicators_logger.debug(f"Prev Candle: O={pc.get('open',0):.2f}, H={pc.get('high',0):.2f}, L={pc.get('low',0):.2f}, C={pc.get('close',0):.2f}")
+            logger.debug(f"Prev Candle: O={pc.get('open',0):.2f}, H={pc.get('high',0):.2f}, L={pc.get('low',0):.2f}, C={pc.get('close',0):.2f}")
 
         return dyn
     # -------------------------
@@ -2418,8 +2897,19 @@ class MYALGO_TRADING_BOT:
             signal_logger.info(f"Current LTP: {current_ltp:.2f}")
             signal_logger.info(f"SL Level: {self.stoploss_price:.2f}, TP Level: {self.target_price:.2f}")
             
-            dyn = self.compute_dynamic_indicators(intraday_df)
+            
             dyn_option = self.compute_dynamic_indicators(intraday_df_opt)
+            dyn = self.compute_dynamic_indicators(intraday_df)
+            # Cache dynamic indicators and last close for reuse by CPR/TSL checks
+            try:
+                self.cached_dyn_spot = dyn
+                self.cached_dyn_option = dyn_option
+                spot_candle = dyn.get("last_candle", {})
+                self.cached_last_close = float(spot_candle.get("close", 0.0))
+            except Exception:
+                self.cached_dyn_spot = None
+                self.cached_dyn_option = None
+                self.cached_last_close = None
             
             if not dyn:
                 signal_logger.warning("Failed to compute dynamic indicators for exit evaluation")
@@ -2481,14 +2971,31 @@ class MYALGO_TRADING_BOT:
                 is_opt_reversal = opt_prev_close < opt_prev_open and opt_close < opt_prev_low and opt_close < opt_open
                 signal_logger.info(f"CALL Exit Check Spot: spot_prev_close < spot_prev_open and spot_close < spot_prev_low and spot_close < spot_open  -> {spot_prev_close:.2f} < {spot_prev_open:.2f} and {spot_close:.2f} < {spot_prev_low:.2f} and {spot_close:.2f} < {spot_open:.2f} = {is_spot_reversal}")
                 signal_logger.info(f"CALL Exit Check Option: opt_prev_close < opt_prev_open and opt_close < opt_prev_low and opt_close < opt_open -> {opt_prev_close:.2f} < {opt_prev_open:.2f} and {opt_close:.2f} < {opt_prev_low:.2f} and {opt_close:.2f} < {opt_open:.2f} = {is_opt_reversal}")
-                if is_spot_reversal or is_opt_reversal:
+                if is_spot_reversal:
                     if LTP_BREAKOUT_ENABLED:
                         now = get_now()
-                        self.pending_exit_breakout = {
+                        mode = EXIT_LTP_BREAKOUT_MODE.upper()
+                        payload = {
                             "type": "EXIT_BUY",
-                            "low": float(opt_low - SL_BUFFER_POINT),
-                            "high": float(opt_high + SL_BUFFER_POINT)
+                            "trigger": "REVERSAL",
+                            "mode": mode,
+                            "reason": "REVERSAL_CANDLE_SPOT_CALL_SIDE"
                         }
+                        # Include spot thresholds when mode allows SPOT
+                        if mode in ("SPOT", "SPOT_OPTIONS"):
+                            payload.update({
+                                "low": float(spot_low - SL_BUFFER_POINT),
+                                "high": float(spot_high + SL_BUFFER_POINT),
+                                "reason": "REVERSAL_CANDLE_SPOT_CALL_SIDE"
+                            })
+                        # Include option thresholds when mode allows OPTIONS
+                        if mode in ("OPTIONS", "SPOT_OPTIONS"):
+                            payload.update({
+                                "option_low": float(opt_low - SL_BUFFER_POINT),
+                                "option_high": float(opt_high + SL_BUFFER_POINT),
+                                "reason": "REVERSAL_CANDLE_OPTIONS_CALL_SIDE"
+                            })
+                        self.pending_exit_breakout = payload
                         minute = now.minute
                         next_multiple = ((minute // LTP_BREAKOUT_INTERVAL_MIN) + 1) * LTP_BREAKOUT_INTERVAL_MIN
                         self.pending_exit_breakout_expiry = (
@@ -2497,7 +3004,7 @@ class MYALGO_TRADING_BOT:
                         )
                         self.exit_breakout_side = "EXIT_BUY"
                         signal_logger.info(
-                            f"⏳ EXIT BUY waiting for OPTION LTP breakdown < {opt_low:.2f} "
+                            f"⏳ EXIT BUY waiting for {self.pending_exit_breakout['reason']} LTP breakout < {self.pending_exit_breakout.get('low', 0):.2f} "
                             f"until {self.pending_exit_breakout_expiry.strftime('%H:%M:%S')}"
                         )
                         return None
@@ -2506,32 +3013,52 @@ class MYALGO_TRADING_BOT:
                 is_spot_ema_exit = spot_close < spot_ema20
                 is_opt_ema_exit = opt_close < opt_ema20    
                 signal_logger.info(f"CALL Exit Check Spot: Close < EMA20 -> {spot_close:.2f} < {spot_ema20:.2f} = {is_spot_ema_exit}; CALL Exit Check Option: Close < EMA20 -> {opt_close:.2f} < {opt_ema20:.2f} = {is_opt_ema_exit}") 
-                if is_spot_ema_exit or is_opt_ema_exit:
-                    signal_logger.info("🔴 EXIT SIGNAL TRIGGERED: CLOSE BELOW EMA20 (CALL Position)")
-                    return f"CLOSE_BELOW_EMA20 (close={spot_close:.2f}, EMA20={spot_ema20:.2f}, option_close={opt_close:.2f}, EMA20_option={opt_ema20:.2f})"
+                if is_spot_ema_exit:
+                    signal_logger.info("🔴 EXIT SIGNAL TRIGGERED: EMA20 CROSSOVER (CALL Position)")
+                    if is_spot_ema_exit:
+                        return f"SPOT_CLOSE_BELOW_EMA20"
+                    if is_opt_ema_exit:
+                        return f"OPTION_CLOSE_BELOW_EMA20" 
             elif self.position == "SELL":
                 signal_logger.info(f"Reversal Candle Check for PUT Position")
                 is_spot_reversal = spot_prev_close > spot_prev_open and spot_close > spot_prev_high and spot_close > spot_open
                 is_opt_reversal = opt_prev_close < opt_prev_open and opt_close < opt_prev_low and opt_close < opt_open
                 signal_logger.info(f"PUT Exit Check Spot: spot_prev_close > spot_prev_open and spot_close > spot_prev_high and spot_close > spot_open  -> {spot_prev_close:.2f} > {spot_prev_open:.2f} and {spot_close:.2f} > {spot_prev_high:.2f} and {spot_close:.2f} > {spot_open:.2f} = {is_spot_reversal}")
                 signal_logger.info(f"PUT Exit Check Option: opt_prev_close < opt_prev_open and opt_close < opt_prev_low and opt_close < opt_open -> {opt_prev_close:.2f} < {opt_prev_open:.2f} and {opt_close:.2f} < {opt_prev_low:.2f} and {opt_close:.2f} < {opt_open:.2f} = {is_opt_reversal}") 
-                if is_spot_reversal or is_opt_reversal:
+                if is_spot_reversal:
                     if LTP_BREAKOUT_ENABLED:
                         now = get_now()
-                        self.pending_exit_breakout = {
-                            "type": "EXIT_BUY",
-                            "high": float(opt_high + SL_BUFFER_POINT),
-                            "low": float(opt_low - SL_BUFFER_POINT)
+                        mode = EXIT_LTP_BREAKOUT_MODE.upper()
+                        payload = {
+                            "type": "EXIT_SELL",
+                            "trigger": "REVERSAL",
+                            "mode": mode,
+                            "reason": "REVERSAL_CANDLE_SPOT_PUT_SIDE"
                         }
+                        # Include spot thresholds when mode allows SPOT
+                        if mode in ("SPOT", "SPOT_OPTIONS"):
+                            payload.update({
+                                "high": float(spot_high + SL_BUFFER_POINT),
+                                "low": float(spot_low - SL_BUFFER_POINT),
+                                "reason": "REVERSAL_CANDLE_SPOT_PUT_SIDE"
+                            })
+                        # Include option thresholds when mode allows OPTIONS
+                        if mode in ("OPTIONS", "SPOT_OPTIONS"):
+                            payload.update({
+                                "option_low": float(opt_low - SL_BUFFER_POINT),
+                                "option_high": float(opt_high + SL_BUFFER_POINT),
+                                "reason": "REVERSAL_CANDLE_OPTIONS_PUT_SIDE"
+                            })
+                        self.pending_exit_breakout = payload
                         minute = now.minute
                         next_multiple = ((minute // LTP_BREAKOUT_INTERVAL_MIN) + 1) * LTP_BREAKOUT_INTERVAL_MIN
                         self.pending_exit_breakout_expiry = (
                             now.replace(minute=0, second=0, microsecond=0)
                             + timedelta(minutes=next_multiple)
                         )
-                        self.exit_breakout_side = "EXIT_BUY"
+                        self.exit_breakout_side = "EXIT_SELL"
                         signal_logger.info(
-                            f"⏳ EXIT SELL waiting for OPTION LTP breakout < {opt_low:.2f} "
+                            f"⏳ EXIT SELL waiting for {self.pending_exit_breakout['reason']} LTP breakout > {self.pending_exit_breakout.get('high', 0):.2f} "
                             f"until {self.pending_exit_breakout_expiry.strftime('%H:%M:%S')}"
                         )
                         return None
@@ -2540,9 +3067,12 @@ class MYALGO_TRADING_BOT:
                 is_spot_ema_exit = spot_close > spot_ema20
                 is_opt_ema_exit = opt_close < opt_ema20
                 signal_logger.info(f"PUT Exit Check Spot: Close > EMA20 -> {spot_close:.2f} > {spot_ema20:.2f} = {is_spot_ema_exit} ; PUT Exit Check Option: Close < EMA20 -> {opt_close:.2f} < {opt_ema20:.2f} = {is_opt_ema_exit}")
-                if is_spot_ema_exit or is_opt_ema_exit:
-                    signal_logger.info("🔴 EXIT SIGNAL TRIGGERED: CLOSE ABOVE EMA20 (PUT Position)")
-                    return f"CLOSE_ABOVE_EMA20 (close={spot_close:.2f}, EMA20={spot_ema20:.2f}, option_close={opt_close:.2f}, EMA20_option={opt_ema20:.2f})"
+                if is_spot_ema_exit:
+                    signal_logger.info("🔴 EXIT SIGNAL TRIGGERED: EMA20 CROSSOVER (PUT Position)")
+                    if is_spot_ema_exit:
+                        return f"SPOT_CLOSE_ABOVE_EMA20"
+                    if is_opt_ema_exit:
+                        return f"OPTION_CLOSE_BELOW_EMA20" 
 
             signal_logger.info("⚪ NO EXIT SIGNAL - Position maintained")
             return None
@@ -2615,7 +3145,29 @@ class MYALGO_TRADING_BOT:
             # Get current LTP for logging context
             current_ltp = self.ltp if self.ltp else 0.0
             signal_logger.info(f"🔍 Current LTP: {current_ltp:.2f}")
-             # ---------------------------
+            # ---------------------------
+            # 🎯 Log current subscription status for debugging
+            now = time.time()
+
+            for sym in list(self.ws_subscriptions):
+                last_time = self.last_ltp_time.get(sym)
+
+                if not last_time:
+                    signal_logger.warning(f"⚠️ NO TICK RECEIVED YET: {sym}")
+                    continue
+
+                # 🛡️ Auto-fix milliseconds
+                if last_time > 1e12:   # clearly ms
+                    last_time = last_time / 1000
+                    self.last_ltp_time[sym] = last_time
+
+                delta = now - last_time
+
+                if delta > 10:
+                    signal_logger.warning(f"⚠️ STALE DATA: {sym} last tick {delta:.1f}s ago")
+                else:
+                    signal_logger.debug(f"✅ FRESH DATA: {sym} last tick {delta:.1f}s ago")
+
             if LTP_BREAKOUT_ENABLED and self.pending_breakout:
                 signal_logger.info(f"⏳ LTP breakout enabled for entry.")
                 return None
@@ -2699,14 +3251,22 @@ class MYALGO_TRADING_BOT:
             prev_day_low = float(self.static_indicators.get("DAILY", {}).get("low",0.0))
             daiily_pivot = float(self.static_indicators.get("DAILY", {}).get("pivot",0.0))
             weekly_pivot = float(self.static_indicators.get("WEEKLY", {}).get("pivot",0.0))
-            
             # Log all key values for signal evaluation
-            signal_logger.info(f"📊 Signal Evaluation Data:")
-            signal_logger.info(f"  📈 Current Candle: Open={open_:.2f}, Close={close:.2f}")
-            signal_logger.info(f"  📉 Previous Candle: Open={prev_open:.2f}, High={prev_high:.2f}, Low={prev_low:.2f}, Close={prev_close:.2f}")
-            signal_logger.info(f"  📊 EMA Values: EMA9={ema9:.2f}, EMA20={ema20:.2f}, EMA50={ema50:.2f}")
-            signal_logger.info(f"  📐 CPR Levels: R1={cpr_r1:.2f}, S1={cpr_s1:.2f}")
-            signal_logger.info(f"  📊 Previous Day: High={prev_day_high:.2f}, Low={prev_day_low:.2f}")
+            # 🚀 OPTIMIZATION (Phase 2): Reduce log verbosity in Backtesting
+            if BACKTESTING_MANAGER.active:
+                signal_logger.debug(f"📊 Signal Evaluation Data:")
+                signal_logger.debug(f"  📈 Current Candle: Open={open_:.2f}, Close={close:.2f}")
+                signal_logger.debug(f"  📉 Previous Candle: Open={prev_open:.2f}, High={prev_high:.2f}, Low={prev_low:.2f}, Close={prev_close:.2f}")
+                signal_logger.debug(f"  📊 EMA Values: EMA9={ema9:.2f}, EMA20={ema20:.2f}, EMA50={ema50:.2f}")
+                signal_logger.debug(f"  📐 CPR Levels: R1={cpr_r1:.2f}, S1={cpr_s1:.2f}")
+                signal_logger.debug(f"  📊 Previous Day: High={prev_day_high:.2f}, Low={prev_day_low:.2f}")
+            else:
+                signal_logger.info(f"📊 Signal Evaluation Data:")
+                signal_logger.info(f"  📈 Current Candle: Open={open_:.2f}, Close={close:.2f}")
+                signal_logger.info(f"  📉 Previous Candle: Open={prev_open:.2f}, High={prev_high:.2f}, Low={prev_low:.2f}, Close={prev_close:.2f}")
+                signal_logger.info(f"  📊 EMA Values: EMA9={ema9:.2f}, EMA20={ema20:.2f}, EMA50={ema50:.2f}")
+                signal_logger.info(f"  📐 CPR Levels: R1={cpr_r1:.2f}, S1={cpr_s1:.2f}")
+                signal_logger.info(f"  📊 Previous Day: High={prev_day_high:.2f}, Low={prev_day_low:.2f}")
 
             # require current_day_high/low as additional gate (if not available, treat it as false to avoid false entries)
             current_high_ok = (self.current_day_high is not None and close > self.current_day_high)
@@ -2788,7 +3348,7 @@ class MYALGO_TRADING_BOT:
             long_cond1 = (close > weekly_pivot)
             long_cond2 = (close > daiily_pivot)
             long_cond3 = (close > ema9)
-            long_cond4 = (ema9 > ema20)
+            long_cond4 = (close > ema20)
             long_cond5 = (prev_close > prev_open)
             long_cond6 = (close > open_)
             long_cond7 = (close > ema50)
@@ -2796,12 +3356,20 @@ class MYALGO_TRADING_BOT:
             long_cond9 = (current_ltp > high)
             long_cond10 = current_high_ok
             long_cond11 = (close > prev_high)
+            long_cond12 = (close > cpr_r1)
+            # Guard against None pivots introduced by check_ltp_pivot_break
+            gk_res = getattr(self, "gk_resistance_pivot", None)
+            try:
+                long_cond13 = (gk_res is not None) and (close > float(gk_res))
+            except Exception:
+                long_cond13 = False
+            # long_cond12 = (close > self.gk_resistance_pivot)
 
             # Evaluate Short conditions step by step
             short_cond1 = (close < weekly_pivot)
             short_cond2 = (close < daiily_pivot)
             short_cond3 = (close < ema9)
-            short_cond4 = (ema9 < ema20)
+            short_cond4 = (close < ema20)
             short_cond5 = (prev_close < prev_open)
             short_cond6 = (close < open_)
             short_cond7 = (close < ema50)
@@ -2809,45 +3377,95 @@ class MYALGO_TRADING_BOT:
             short_cond9 = (current_ltp < low)
             short_cond10 = current_low_ok
             short_cond11 = (close < prev_low)
+            short_cond12 = (close < cpr_s1)
+            # Guard for support pivot comparisons if used later
+            gk_sup = getattr(self, "gk_support_pivot", None)
+            try:
+                short_cond13 = (gk_sup is not None) and (close < float(gk_sup))
+            except Exception:
+                short_cond13 = False
+            # short_cond12 = (close < self.gk_support_pivot) 
+
             # Final Long/Short condition aggregation
 
-            long_cond = long_cond2 and long_cond3 and long_cond4 and long_cond5 and long_cond6 and long_cond7 and long_cond8 and long_cond11 and expiry_allowed
+            long_cond =  long_cond2 and long_cond3 and long_cond4 and long_cond5 and long_cond6 and long_cond7 and  long_cond8 and long_cond11 and expiry_allowed 
 
-            short_cond = short_cond2 and short_cond3 and short_cond4 and short_cond5 and short_cond6 and short_cond7 and short_cond8 and short_cond11 and expiry_allowed  
+            short_cond =  short_cond2 and short_cond3 and short_cond4 and short_cond5 and short_cond6 and short_cond7 and short_cond8 and short_cond11 and expiry_allowed   
 
-            # long_cond = long_cond5 and long_cond6  and expiry_allowed
-
-            # short_cond = short_cond5 and short_cond6 and expiry_allowed          
+            # long_cond = long_cond5 and long_cond6 
+            # short_cond = short_cond5 and short_cond6
+            # Trend detection left here only for logging. TSL enabling
+            # is handled at runtime in `check_cpr_sl_tp_conditions`.
+            if long_cond and close > daiily_pivot and close > cpr_r1 and close > self.current_day_high:
+                signal_logger.info("🔵 Overall Trend: BULLISH (Close > Daily Pivot and CPR R1 and Current Day High)")
+            elif short_cond and close < daiily_pivot and close < cpr_s1 and close < self.current_day_low: 
+                signal_logger.info("🔴 Overall Trend: BEARISH (Close < Daily Pivot and CPR S1 and Current Day Low)")
+            # short_cond = short_cond6          
             # Log detailed condition evaluation (matching your reference)
-            signal_logger.info(f"=== 🟢 LONG Signal Conditions === {long_cond}")
-            signal_logger.info(f"  1. Close > Weekly Pivot: {close:.2f} > {weekly_pivot:.2f} = {long_cond1}")
-            signal_logger.info(f"  2. Close > Daily Pivot: {close:.2f} > {daiily_pivot:.2f} = {long_cond2}")
-            signal_logger.info(f"  3. Close > EMA9: {close:.2f} > {ema9:.2f} = {long_cond3}")
-            signal_logger.info(f"  4. EMA9 > EMA20: {ema9:.2f} > {ema20:.2f} = {long_cond4}")
-            signal_logger.info(f"  5. Prev Close > Prev Open: {prev_close:.2f} > {prev_open:.2f} = {long_cond5}")
-            signal_logger.info(f"  6. Close > Prev High: {close:.2f} > {prev_high:.2f} = {long_cond11}")
-            signal_logger.info(f"  7. Close > Open: {close:.2f} > {open_:.2f} = {long_cond6}")
-            signal_logger.info(f"  8. Close > EMA50: {close:.2f} > {ema50:.2f} = {long_cond7}")
-            signal_logger.info(f"  9. Close > EMA200: {close:.2f} > {ema200:.2f} = {long_cond8}")
-            signal_logger.info(f"  10. LTP > last candle high: {current_ltp:.2f} > {high:.2f} = {long_cond9}")
-            signal_logger.info(f"  11. Close > current day high: {close:.2f} > {self.current_day_high :.2f} = {long_cond10}")
-            signal_logger.info(f"  12. Expiry Day Rule: {expiry_allowed}")
-            signal_logger.info(f"  🟢 🎯 LONG Signal Valid: {long_cond} {get_now()}")
+            if BACKTESTING_MANAGER.active:
+                logger.debug(f"=== 🟢 LONG Signal Conditions === {long_cond}")
+                logger.debug(f"  1. Close > Weekly Pivot: {close:.2f} > {weekly_pivot:.2f} = {long_cond1}")
+                logger.debug(f"  2. Close > Daily Pivot: {close:.2f} > {daiily_pivot:.2f} = {long_cond2}")
+                logger.debug(f"  3. Close > EMA9: {close:.2f} > {ema9:.2f} = {long_cond3}")
+                logger.debug(f"  4. EMA9 > EMA20: {ema9:.2f} > {ema20:.2f} = {long_cond4}")
+                logger.debug(f"  5. Prev Close > Prev Open: {prev_close:.2f} > {prev_open:.2f} = {long_cond5}")
+                logger.debug(f"  6. Close > Prev High: {close:.2f} > {prev_high:.2f} = {long_cond11}")
+                logger.debug(f"  7. Close > Open: {close:.2f} > {open_:.2f} = {long_cond6}")
+                logger.debug(f"  8. Close > EMA50: {close:.2f} > {ema50:.2f} = {long_cond7}")
+                logger.debug(f"  9. Close > EMA200: {close:.2f} > {ema200:.2f} = {long_cond8}")
+                logger.debug(f"  10. LTP > last candle high: {current_ltp:.2f} > {high:.2f} = {long_cond9}")
+                logger.debug(f"  11. Close > current day high: {close:.2f} > {self.current_day_high :.2f} = {long_cond10}")
+                logger.debug(f"  12. Expiry Day Rule: {expiry_allowed}")
+                logger.debug(f"  13. Close > Gk Support Pivot: {close:.2f} > {self.gk_support_pivot} = {long_cond13}")
+                logger.info(f"  🟢 🎯 LONG Signal Valid: {long_cond} {get_now()}")
 
-            signal_logger.info("=== 🔴 SHORT Signal Conditions ===")
-            signal_logger.info(f"  1. Close < Weekly Pivot: {close:.2f} < {weekly_pivot:.2f} = {short_cond1}")
-            signal_logger.info(f"  2. Close < Daily Pivot: {close:.2f} < {daiily_pivot:.2f} = {short_cond2}")
-            signal_logger.info(f"  3. Close < EMA9: {close:.2f} < {ema9:.2f} = {short_cond3}")
-            signal_logger.info(f"  4. EMA9 < EMA20: {ema9:.2f} < {ema20:.2f} = {short_cond4}")
-            signal_logger.info(f"  5. Prev Close < Prev Open: {prev_close:.2f} < {prev_open:.2f} = {short_cond5}")
-            signal_logger.info(f"  6. Close < Prev Low: {close:.2f} < {prev_low:.2f} = {short_cond11}")
-            signal_logger.info(f"  7. Close < Open: {close:.2f} < {open_:.2f} = {short_cond6}")
-            signal_logger.info(f"  8. Close < EMA50: {close:.2f} < {ema50:.2f} = {short_cond7}")
-            signal_logger.info(f"  9. Close < EMA200: {close:.2f} < {ema200:.2f} = {short_cond8}")
-            signal_logger.info(f"  10. LTP < last candle low: {current_ltp:.2f} < {low:.2f} = {short_cond9}")
-            signal_logger.info(f"  11. Close < current day low: {close:.2f} < {self.current_day_low :.2f} = {short_cond10}")
-            signal_logger.info(f"  12. Expiry Day Rule: {expiry_allowed}")
-            signal_logger.info(f"  🔴 🎯 SHORT Signal Valid: {short_cond} {get_now()}")
+                logger.debug("=== 🔴 SHORT Signal Conditions ===")
+                logger.debug(f"  1. Close < Weekly Pivot: {close:.2f} < {weekly_pivot:.2f} = {short_cond1}")
+                logger.debug(f"  2. Close < Daily Pivot: {close:.2f} < {daiily_pivot:.2f} = {short_cond2}")
+                logger.debug(f"  3. Close < EMA9: {close:.2f} < {ema9:.2f} = {short_cond3}")
+                logger.debug(f"  4. EMA9 < EMA20: {ema9:.2f} < {ema20:.2f} = {short_cond4}")
+                logger.debug(f"  5. Prev Close < Prev Open: {prev_close:.2f} < {prev_open:.2f} = {short_cond5}")
+                logger.debug(f"  6. Close < Prev Low: {close:.2f} < {prev_low:.2f} = {short_cond11}")
+                logger.debug(f"  7. Close < Open: {close:.2f} < {open_:.2f} = {short_cond6}")
+                logger.debug(f"  8. Close < EMA50: {close:.2f} < {ema50:.2f} = {short_cond7}")
+                logger.debug(f"  9. Close < EMA200: {close:.2f} < {ema200:.2f} = {short_cond8}")
+                logger.debug(f"  10. LTP < last candle low: {current_ltp:.2f} < {low:.2f} = {short_cond9}")
+                logger.debug(f"  11. Close < current day low: {close:.2f} < {self.current_day_low :.2f} = {short_cond10}")
+                logger.debug(f"  12. Expiry Day Rule: {expiry_allowed}")
+                logger.debug(f"  13. Close < Gk Resistance Pivot: {close:.2f} < {self.gk_resistance_pivot} = {short_cond13}")
+                logger.info(f"  🔴 🎯 SHORT Signal Valid: {short_cond} {get_now()}")
+            else:
+                logger.info(f"=== 🟢 LONG Signal Conditions === {long_cond}")
+                signal_logger.info(f"  1. Close > Weekly Pivot: {close:.2f} > {weekly_pivot:.2f} = {long_cond1}")
+                signal_logger.info(f"  2. Close > Daily Pivot: {close:.2f} > {daiily_pivot:.2f} = {long_cond2}")
+                signal_logger.info(f"  3. Close > EMA9: {close:.2f} > {ema9:.2f} = {long_cond3}")
+                signal_logger.info(f"  4. EMA9 > EMA20: {ema9:.2f} > {ema20:.2f} = {long_cond4}")
+                signal_logger.info(f"  5. Prev Close > Prev Open: {prev_close:.2f} > {prev_open:.2f} = {long_cond5}")
+                signal_logger.info(f"  6. Close > Prev High: {close:.2f} > {prev_high:.2f} = {long_cond11}")
+                signal_logger.info(f"  7. Close > Open: {close:.2f} > {open_:.2f} = {long_cond6}")
+                signal_logger.info(f"  8. Close > EMA50: {close:.2f} > {ema50:.2f} = {long_cond7}")
+                signal_logger.info(f"  9. Close > EMA200: {close:.2f} > {ema200:.2f} = {long_cond8}")
+                signal_logger.info(f"  10. LTP > last candle high: {current_ltp:.2f} > {high:.2f} = {long_cond9}")
+                signal_logger.info(f"  11. Close > current day high: {close:.2f} > {self.current_day_high :.2f} = {long_cond10}")
+                signal_logger.info(f"  12. Expiry Day Rule: {expiry_allowed}")
+                signal_logger.info(f"  13. Close > Gk Resistance Pivot: {close:.2f} > {self.gk_resistance_pivot} = {long_cond13}")
+                signal_logger.info(f"  🟢 🎯 LONG Signal Valid: {long_cond} {get_now()}")
+
+                signal_logger.info("=== 🔴 SHORT Signal Conditions ===")
+                signal_logger.info(f"  1. Close < Weekly Pivot: {close:.2f} < {weekly_pivot:.2f} = {short_cond1}")
+                signal_logger.info(f"  2. Close < Daily Pivot: {close:.2f} < {daiily_pivot:.2f} = {short_cond2}")
+                signal_logger.info(f"  3. Close < EMA9: {close:.2f} < {ema9:.2f} = {short_cond3}")
+                signal_logger.info(f"  4. EMA9 < EMA20: {ema9:.2f} < {ema20:.2f} = {short_cond4}")
+                signal_logger.info(f"  5. Prev Close < Prev Open: {prev_close:.2f} < {prev_open:.2f} = {short_cond5}")
+                signal_logger.info(f"  6. Close < Prev Low: {close:.2f} < {prev_low:.2f} = {short_cond11}")
+                signal_logger.info(f"  7. Close < Open: {close:.2f} < {open_:.2f} = {short_cond6}")
+                signal_logger.info(f"  8. Close < EMA50: {close:.2f} < {ema50:.2f} = {short_cond7}")
+                signal_logger.info(f"  9. Close < EMA200: {close:.2f} < {ema200:.2f} = {short_cond8}")
+                signal_logger.info(f"  10. LTP < last candle low: {current_ltp:.2f} < {low:.2f} = {short_cond9}")
+                signal_logger.info(f"  11. Close < current day low: {close:.2f} < {self.current_day_low :.2f} = {short_cond10}")
+                signal_logger.info(f"  12. Expiry Day Rule: {expiry_allowed}")
+                signal_logger.info(f"  13. Close < Gk Support Pivot: {close:.2f} < {self.gk_support_pivot} = {short_cond13}")
+                signal_logger.info(f"  🔴 🎯 SHORT Signal Valid: {short_cond} {get_now()}")
 
             # === Breakout Filter Check ===
             if long_cond:
@@ -2866,6 +3484,60 @@ class MYALGO_TRADING_BOT:
                             signal_logger.warning("❌ Could not resolve option for breakout setup. Aborting signal.")
                             return None
                         
+                        # 🆕 OPTION SIGNAL VALIDATION (Before LTP Subscription)
+                        signal_logger.info(f"🔍 Validating option signal for {tradable_symbol}")
+                        
+                        # Fetch option 5m intraday data (temporary, for validation only)
+                        temp_opt_data = self.get_intraday(
+                            days=LOOKBACK_DAYS,
+                            symbol=tradable_symbol,
+                            exchange=tradable_exchange,
+                            instrument_type="OPTIONS"
+                        )
+                        
+                        if temp_opt_data is None or temp_opt_data.empty or len(temp_opt_data) < 2:
+                            signal_logger.warning(f"⚠️ No option data available for {tradable_symbol} - rejecting entry")
+                            return None
+                        
+                        # Compute option indicators
+                        dyn_option = self.compute_dynamic_indicators(temp_opt_data)
+                        
+                        if not dyn_option:
+                            signal_logger.warning("Failed to compute option indicators - rejecting entry")
+                            return None
+                        
+                        # Extract option candle data
+                        option_candle = dyn_option.get("last_candle", {})
+                        option_prev_candle = dyn_option.get("prev_candle", {})
+                        opt_close = float(option_candle.get("close", 0.0))
+                        opt_prev_close = float(option_prev_candle.get("close", 0.0))
+                        opt_prev_open = float(option_prev_candle.get("open", 0.0))
+                        opt_prev_high = float(option_prev_candle.get("high", 0.0))
+                        opt_ema20 = float(dyn_option.get("EMA_20", 0.0))
+                        opt_vwap = float(dyn_option.get("VWAP", 0.0))
+                        
+                        # Validate LONG option signal
+
+                        if self.trade_count > 1:
+                            opt_signal_valid = (
+                                opt_close > opt_prev_high 
+                            )
+                        else:
+                            opt_signal_valid = (
+                                opt_close > opt_prev_high 
+    
+                            )
+                        
+                        signal_logger.info(f"Option LONG validation: prev_close > prev_open: {opt_prev_close:.2f} > {opt_prev_open:.2f} = {opt_prev_close > opt_prev_open}")
+                        signal_logger.info(f"Option LONG validation: close > prev_high: {opt_close:.2f} > {opt_prev_high:.2f} = {opt_close > opt_prev_high}")
+                        signal_logger.info(f"Option LONG validation: close > EMA20: {opt_close:.2f} > {opt_ema20:.2f} = {opt_close > opt_ema20}")
+                        
+                        if not opt_signal_valid:
+                            signal_logger.info(f"❌ Option signal NOT valid for {tradable_symbol} - rejecting LONG entry")
+                            return None
+                        
+                        signal_logger.info(f"✅ Option signal VALID for {tradable_symbol}")
+                        
                         # 2. Subscribe Mechanism
                         if not BACKTESTING_MANAGER.active:
                              order_logger.info("🛒 Subscribing to Live option LTP for Breakout Tracking...")
@@ -2874,17 +3546,9 @@ class MYALGO_TRADING_BOT:
                              logger.info("Backtesting mode detected - skipping live subscription for option LTP.")
                              self._fetch_simulation_option_data()
                         
-                        # 3. Get Option Data
-                        # time.sleep(1) # small buffer for subscription
-                        intraday_df_opt = self.get_intraday(days=LOOKBACK_DAYS, symbol=self.option_symbol, exchange=OPTION_EXCHANGE, instrument_type="OPTIONS")
-                        
-                        if intraday_df_opt is None or intraday_df_opt.empty or len(intraday_df_opt) < 2:
-                             signal_logger.warning("❌ No option data available for breakout level. Aborting.")
-                             return None
-                        
-                        opt_last = intraday_df_opt.iloc[-2] # Last completed candle
-                        breakout_high = float(opt_last.get("high", 0))
-                        breakout_low = float(opt_last.get("low", 0)) # Not used for logic, but logged
+                        # 3. Get Option Data (Uses cached validation data)
+                        breakout_high = float(option_candle.get("high", 0))
+                        breakout_low = float(option_candle.get("low", 0)) # Not used for logic, but logged
                         
                         self.pending_breakout = {
                             "type": "BUY",
@@ -2937,6 +3601,61 @@ class MYALGO_TRADING_BOT:
                         if not res:
                             signal_logger.warning("❌ Could not resolve option for breakout setup. Aborting signal.")
                             return None
+                        
+                        # 🆕 OPTION SIGNAL VALIDATION (Before LTP Subscription)
+                        signal_logger.info(f"🔍 Validating option signal for {tradable_symbol}")
+                        
+                        # Fetch option 5m intraday data (temporary, for validation only)
+                        temp_opt_data = self.get_intraday(
+                            days=LOOKBACK_DAYS,
+                            symbol=tradable_symbol,
+                            exchange=tradable_exchange,
+                            instrument_type="OPTIONS"
+                        )
+                        
+                        if temp_opt_data is None or temp_opt_data.empty or len(temp_opt_data) < 2:
+                            signal_logger.warning(f"⚠️ No option data available for {tradable_symbol} - rejecting entry")
+                            return None
+                        
+                        # Compute option indicators
+                        dyn_option = self.compute_dynamic_indicators(temp_opt_data)
+                        
+                        if not dyn_option:
+                            signal_logger.warning("Failed to compute option indicators - rejecting entry")
+                            return None
+                        
+                        # Extract option candle data
+                        option_candle = dyn_option.get("last_candle", {})
+                        option_prev_candle = dyn_option.get("prev_candle", {})
+                        opt_close = float(option_candle.get("close", 0.0))
+                        opt_prev_close = float(option_prev_candle.get("close", 0.0))
+                        opt_prev_open = float(option_prev_candle.get("open", 0.0))
+                        opt_prev_low = float(option_prev_candle.get("low", 0.0))
+                        opt_prev_high = float(option_prev_candle.get("high", 0.0))
+                        opt_ema20 = float(dyn_option.get("EMA_20", 0.0))
+                        opt_vwap = float(dyn_option.get("VWAP", 0.0))
+                        # Validate SHORT option signal (same as LONG - option buying strategy)
+                        # Both CE and PE options profit when premium goes UP
+                        if self.trade_count > 1:
+                            opt_signal_valid = (
+                                opt_close > opt_prev_high 
+                            )
+                        else:
+                            opt_signal_valid = (
+                                opt_close > opt_prev_high 
+    
+                            )
+                        
+                        signal_logger.info(f"Option SHORT validation: prev_close > prev_open: {opt_prev_close:.2f} > {opt_prev_open:.2f} = {opt_prev_close > opt_prev_open}")
+                        signal_logger.info(f"Option SHORT validation: close > prev_high: {opt_close:.2f} > {opt_prev_high:.2f} = {opt_close > opt_prev_high}")
+                        signal_logger.info(f"Option SHORT validation: close > EMA20: {opt_close:.2f} > {opt_ema20:.2f} = {opt_close > opt_ema20}")
+                        
+                        if not opt_signal_valid:
+                            signal_logger.info(f"❌ Option signal NOT valid for {tradable_symbol} - rejecting SHORT entry")
+                            return None
+                        
+                        signal_logger.info(f"✅ Option signal VALID for {tradable_symbol}")
+                        
                         # 2. Subscribe Mechanism
                         if not BACKTESTING_MANAGER.active:
                              order_logger.info("Subscribing to Live option LTP for Breakout Tracking...")
@@ -2944,16 +3663,8 @@ class MYALGO_TRADING_BOT:
                         else:
                              self._fetch_simulation_option_data()
                         
-                        # 3. Get Option Data
-                        # time.sleep(1) # small buffer
-                        intraday_df_opt = self.get_intraday(days=LOOKBACK_DAYS, symbol=self.option_symbol, exchange=OPTION_EXCHANGE, instrument_type="OPTIONS")
-                        
-                        if intraday_df_opt is None or intraday_df_opt.empty or len(intraday_df_opt) < 2:
-                             signal_logger.warning("❌ No option data available for breakout level. Aborting.")
-                             return None
-                        
-                        opt_last = intraday_df_opt.iloc[-2]
-                        breakout_high = float(opt_last.get("high", 0))
+                        # 3. Get Option Data (Uses cached validation data)
+                        breakout_high = float(option_candle.get("high", 0))
                         
                         # NOTE: For Option-Mode, "SELL" Spot signal still means BUYING a PE Option.
                         # So we watch for Breakout > High.
@@ -3165,8 +3876,13 @@ class MYALGO_TRADING_BOT:
             if excluded_ids:
                 position_logger.info(f"Excluded {len(excluded_ids)} unreliable pivot levels")
                 
-            expanded_levels = expand_with_midpoints(filtered_levels)
-            self.cpr_levels_sorted = sorted(expanded_levels)
+            if CPR_MIDPOINTS_ENABLED:
+                position_logger.info("CPR Midpoint expansion enabled - generating midpoints for filtered levels")   
+                expanded_levels = expand_with_midpoints(filtered_levels)
+                self.cpr_levels_sorted = sorted(expanded_levels)
+            else:
+                position_logger.info("CPR Midpoint expansion disabled - using filtered levels only")
+                self.cpr_levels_sorted = sorted(filtered_levels)
             
             if not self.cpr_levels_sorted:
                 position_logger.warning("No CPR levels available after filtering")
@@ -3176,7 +3892,17 @@ class MYALGO_TRADING_BOT:
             if base_price is None:
                 base_price = float(self.option_entry_price or 0.0)
             self.entry_price = float(base_price)
-            self.cpr_side = signal.upper()
+
+            # ✅ FIX: Determine effective side based on mode
+            if USE_OPTION_FOR_SLTP:
+                # For options, always use BUY logic (both CE/PE premiums increase similarly)
+                effective_side = "BUY"
+                position_logger.info(f"OPTION MODE: Using BUY logic for {signal} position (Option: {getattr(self, 'option_symbol', 'N/A')})")
+            else:
+                # For spot, use the actual signal side
+                effective_side = signal.upper()
+                position_logger.info(f"SPOT MODE: Using {effective_side} logic for {signal} position")
+            self.cpr_side = effective_side
             
             # Calculate initial SL from signal candle
             position_logger.info(f"Calculating initial SL using Option signal candle range: Low={signal_candle_low:.2f}, High={signal_candle_high:.2f}, Range={signal_candle_range:.2f}")
@@ -3201,7 +3927,11 @@ class MYALGO_TRADING_BOT:
             if USE_DYNAMIC_TARGET:
                 # Use dynamic calculation with filtered CPR levels
                 dynamic_target, risk_dist, reward_dist, target_key, rationale = self.calculate_dynamic_cpr_target(
-                    signal, base_price, initial_sl, self.cpr_levels_sorted, level_mapping
+                    effective_side,  # ✅ Use effective_side instead of signal
+                    base_price, 
+                    initial_sl, 
+                    self.cpr_levels_sorted, 
+                    level_mapping
                 )
                 
                 # Set the dynamic target as initial target
@@ -3256,6 +3986,8 @@ class MYALGO_TRADING_BOT:
             # Comprehensive initialization summary
             position_logger.info(f"Enhanced CPR Range SL/TP Initialized Successfully:")
             position_logger.info(f"  Side: {self.cpr_side}")
+            position_logger.info(f"  Original Signal: {signal}")
+            position_logger.info(f"  Effective Side (for SL/TP): {self.cpr_side}")
             position_logger.info(f"  Entry Price: {self.entry_price:.2f}")
             position_logger.info(f"  Initial SL: {self.cpr_sl:.2f}")
             position_logger.info(f"  Signal Candle: Low={signal_candle_low:.2f}, High={signal_candle_high:.2f}")
@@ -3354,9 +4086,8 @@ class MYALGO_TRADING_BOT:
                 if self.cpr_tp_hit_count == 1:
                     # First CPR hit → Move SL to breakeven
                     self.cpr_sl = round(float(self.entry_price), 2)
-                    position_logger.info(
-                        f"First CPR hit → SL moved to Breakeven {self.cpr_sl:.2f}"
-                    )
+                    position_logger.info(f"First CPR hit → SL moved to Breakeven {self.cpr_sl:.2f}")
+                    
                 elif self.cpr_tp_hit_count > 1:
                     # Subsequent meaningful hits → SL to previous TP
                     previous_hit = self.cpr_tp_hits[-2]
@@ -3365,8 +4096,16 @@ class MYALGO_TRADING_BOT:
                         f"CPR hit #{self.cpr_tp_hit_count} → SL moved to prev TP {self.cpr_sl:.2f}"
                     )
 
-                # Update SL
-                self.stoploss_price = self.cpr_sl - SL_BUFFER_POINT
+                # Update SL: adjust sign based on side (BUY -> SL below, SELL -> SL above)
+                try:
+                    if getattr(self, 'cpr_side', 'BUY') == 'BUY':
+                        self.stoploss_price = self.cpr_sl - SL_BUFFER_POINT
+                    else:
+                        self.stoploss_price = self.cpr_sl + SL_BUFFER_POINT
+                    position_logger.info(f"Updated stoploss_price based on CPR SL: {self.stoploss_price:.2f}")
+                except Exception:
+                    # fallback to previous behavior on any issue
+                    self.stoploss_price = self.cpr_sl - SL_BUFFER_POINT
 
                 # Advance target index ONLY on meaningful move
                 self.current_tp_index = prev_idx + 1
@@ -3399,8 +4138,22 @@ class MYALGO_TRADING_BOT:
             return None
             
         try:
+            # NOTE: Dynamic TSL enabling is evaluated only when a TP is hit
+            # to avoid repeated intraday fetches / indicator recomputations.
+
             side = self.cpr_side
             current_tp = self.get_current_cpr_tp()
+
+            # ✅ FIX: Use correct LTP based on tracking mode
+            if USE_OPTION_FOR_SLTP:
+                tracking_ltp = getattr(self, "option_ltp", None) or current_ltp
+                position_logger.debug(f"Using OPTION LTP for SL/TP check: {tracking_ltp:.2f}")
+            else:
+                tracking_ltp = self.ltp or current_ltp
+                position_logger.debug(f"Using SPOT LTP for SL/TP check: {tracking_ltp:.2f}")
+
+            # Use tracking_ltp for subsequent comparisons
+            current_ltp = tracking_ltp
             
             # Check SL conditions with LTP breakout confirmation
             if side == "BUY" and current_ltp <= self.cpr_sl:
@@ -3416,7 +4169,8 @@ class MYALGO_TRADING_BOT:
                         "type": "CPR_SL_BUY",
                         "low": float(self.cpr_sl - SL_BUFFER_POINT),
                         "high": float(self.cpr_sl + SL_BUFFER_POINT),
-                        "trigger": "CPR_SL"
+                        "trigger": "CPR_SL",
+                        "reason": "CPR_SL_HIT_CALL_SIDE"
                     }
                     
                     minute = now.minute
@@ -3438,14 +4192,65 @@ class MYALGO_TRADING_BOT:
                     
             elif side == "SELL" and current_ltp >= self.cpr_sl:
                 position_logger.warning(f"CPR SELL | SL Hit: {current_ltp:.2f} >= {self.cpr_sl:.2f}")
-                return "SL_HIT"
+
+                # Setup LTP breakout confirmation for SELL
+                if LTP_BREAKOUT_ENABLED:
+                    now = get_now()
+
+                    self.pending_exit_breakout = {
+                        "type": "CPR_SL_SELL",
+                        "low": float(self.cpr_sl - SL_BUFFER_POINT),
+                        "high": float(self.cpr_sl + SL_BUFFER_POINT),
+                        "trigger": "CPR_SL",
+                        "reason": "CPR_SL_HIT_PUT_SIDE"
+                    }
+
+                    minute = now.minute
+                    next_multiple = ((minute // LTP_BREAKOUT_INTERVAL_MIN) + 1) * LTP_BREAKOUT_INTERVAL_MIN
+                    self.pending_exit_breakout_expiry = (
+                        now.replace(minute=0, second=0, microsecond=0)
+                        + timedelta(minutes=next_multiple)
+                    )
+                    self.exit_breakout_side = "EXIT_SELL"
+
+                    ltp_type = "OPTION" if USE_OPTION_FOR_SLTP else "SPOT"
+                    position_logger.info(
+                        f"⏳ CPR SL waiting for {ltp_type} LTP breakup > {self.cpr_sl + SL_BUFFER_POINT:.2f} "
+                        f"until {self.pending_exit_breakout_expiry.strftime('%H:%M:%S')}"
+                    )
+                    return "SL_PENDING_BREAKOUT"
+                else:
+                    return "SL_HIT"
                 
             # Check TP conditions
             if current_tp is not None:
                 if side == "BUY" and current_ltp >= current_tp:
-                    position_logger.info(f"🟢 CPR BUY TP Hit: {current_ltp:.2f} >= {current_tp:.2f}")     
-                    # Check TSL_ENABLED to determine behavior
-                    if not TSL_ENABLED:
+                    position_logger.info(f"🟢 CPR BUY TP Hit: {current_ltp:.2f} >= {current_tp:.2f}")
+                    # Evaluate dynamic TSL enable only when TP is hit (uses cached close if available)
+                    if not getattr(self, 'tsl_enabled', False):
+                        try:
+                            last_close = None
+                            if getattr(self, 'cached_last_close', None) is not None:
+                                last_close = float(self.cached_last_close)
+                            else:
+                                intraday_df = self.get_intraday(days=LOOKBACK_DAYS, symbol=self.spot_symbol, exchange=self.spot_exchange, instrument_type="SPOT")
+                                dyn_for_trend = self.compute_dynamic_indicators(intraday_df) if intraday_df is not None and not intraday_df.empty else None
+                                if dyn_for_trend:
+                                    last_close = float(dyn_for_trend.get("last_candle", {}).get("close", 0.0))
+
+                            if last_close is not None:
+                                cpr_r1_local = float(self.static_indicators.get("DAILY", {}).get("r1", 0.0)) if self.static_indicators else 0.0
+                                daily_pivot_local = float(self.static_indicators.get("DAILY", {}).get("pivot", 0.0)) if self.static_indicators else 0.0
+                                if last_close > daily_pivot_local and last_close > cpr_r1_local:
+                                    position_logger.info("Enabling TSL dynamically (bullish CPR + above daily pivot + r1)")
+                                    self.tsl_enabled = True
+                                else:
+                                    position_logger.info("TSL remains disabled (conditions for dynamic enable not met) - last close: {:.2f}, daily pivot: {:.2f}, cpr r1: {:.2f}".format(last_close, daily_pivot_local, cpr_r1_local))
+                        except Exception:
+                            pass
+
+                    # Check TSL flag to determine behavior
+                    if not getattr(self, 'tsl_enabled', False):
                         position_logger.info("TSL disabled - sending FINAL_EXIT signal on TP hit")
                         return "FINAL_EXIT"
                     else:
@@ -3457,13 +4262,35 @@ class MYALGO_TRADING_BOT:
                             return "TP_HIT"
                         elif tp_result == "IGNORED":
                             position_logger.info("Weak CPR hit ignored - continuing trade")
-                            return None     
+                            return None
                         
                 elif side == "SELL" and current_ltp <= current_tp:
-                    position_logger.info(f"CPR SELL TP Hit: {current_ltp:.2f} <= {current_tp:.2f}")
-                    
-                    # Check TSL_ENABLED to determine behavior
-                    if not TSL_ENABLED:
+                    position_logger.info(f"🟢 CPR SELL TP Hit: {current_ltp:.2f} <= {current_tp:.2f}")
+                    # Evaluate dynamic TSL enable only when TP is hit (uses cached close if available)
+                    if not getattr(self, 'tsl_enabled', False):
+                        try:
+                            last_close = None
+                            if getattr(self, 'cached_last_close', None) is not None:
+                                last_close = float(self.cached_last_close)
+                            else:
+                                intraday_df = self.get_intraday(days=LOOKBACK_DAYS, symbol=self.spot_symbol, exchange=self.spot_exchange, instrument_type="SPOT")
+                                dyn_for_trend = self.compute_dynamic_indicators(intraday_df) if intraday_df is not None and not intraday_df.empty else None
+                                if dyn_for_trend:
+                                    last_close = float(dyn_for_trend.get("last_candle", {}).get("close", 0.0))
+
+                            if last_close is not None:
+                                cpr_s1_local = float(self.static_indicators.get("DAILY", {}).get("s1", 0.0)) if self.static_indicators else 0.0
+                                daily_pivot_local = float(self.static_indicators.get("DAILY", {}).get("pivot", 0.0)) if self.static_indicators else 0.0
+                                if last_close < daily_pivot_local and last_close < cpr_s1_local:
+                                    position_logger.info("Enabling TSL dynamically (bearish CPR + daily pivot + s1)")
+                                    self.tsl_enabled = True
+                                else:
+                                    position_logger.info("TSL remains disabled (conditions for dynamic enable not met) - last close: {:.2f}, daily pivot: {:.2f}, cpr s1: {:.2f}".format(last_close, daily_pivot_local, cpr_s1_local))
+                        except Exception:
+                            pass
+
+                    # Check TSL flag to determine behavior
+                    if not getattr(self, 'tsl_enabled', False):
                         position_logger.info("TSL disabled - sending FINAL_EXIT signal on TP hit")
                         return "FINAL_EXIT"
                     else:
@@ -3475,7 +4302,7 @@ class MYALGO_TRADING_BOT:
                             return "TP_HIT"
                         elif tp_result == "IGNORED":
                             position_logger.info("Weak CPR hit ignored - continuing trade")
-                            return None  
+                            return None
                     
             return None
             
@@ -3501,13 +4328,13 @@ class MYALGO_TRADING_BOT:
                 "spot_price": self.ltp if self.ltp else 0.0,
                 "action": f"CPR_TP_{self.cpr_tp_hit_count}",
                 "quantity": QUANTITY,
-                "price": float(self.option_ltp),
+                "price": float(f"{self.option_ltp:.2f}"),
                 "order_id": "",
                 "strategy": STRATEGY,
                 "leg_type": "CPR_TP_HIT",
                 "reason": f"CPR TP {target_level:.2f} hit",
-                "pnl": unrealized_pnl,
-                "leg_status": "partial"
+                "pnl": f"{unrealized_pnl:.2f}",
+                "leg_status": "TSL_TP_HIT"
             }
             log_trade_db(data)
             position_logger.info(f"CPR TP hit logged: Level={target_level:.2f}, P&L={unrealized_pnl:.2f}")
@@ -3530,7 +4357,10 @@ class MYALGO_TRADING_BOT:
             if risk <= 0:
                 position_logger.warning("Invalid risk distance; using fallback target calculation")
                 fallback_target = entry_price + TARGET if signal == "BUY" else entry_price - TARGET
-                risk = abs(entry_price - MIN_SL_POINTS)
+                # Use absolute minimum SL points as fallback risk (points),
+                # not a subtraction from entry price which produced incorrect large values.
+                risk = float(MIN_SL_POINTS)
+                position_logger.warning(f"Fallback risk applied: {risk:.2f} points (MIN_SL_POINTS)")
             
             # Compute required reward distance
             reward_distance = risk 
@@ -3561,9 +4391,9 @@ class MYALGO_TRADING_BOT:
                     if reward >= max(risk * MIN_REWARD_PCT_OF_RISK, MIN_ABSOLUTE_REWARD):
                         valid_candidates.append((level_value, level_id, reward))
                 elif signal == "SELL" and level_value < entry_price:  # SELL
-                    # For SELL: level must be below entry AND meet minimum reward requirement  
-                    # if level_value < entry_price and level_value <= required_target:
+                    # For SELL: level must be below entry AND meet minimum reward requirement
                     reward = entry_price - level_value
+                    # Ensure reward meets minimum (same direction logic as BUY)
                     if reward >= max(risk * MIN_REWARD_PCT_OF_RISK, MIN_ABSOLUTE_REWARD):
                         valid_candidates.append((level_value, level_id, reward))
 
@@ -3595,11 +4425,25 @@ class MYALGO_TRADING_BOT:
                 rationale = f"Default nearest CPR level ({distance:.2f} from entry)"
             
             # Log selection details
-            position_logger.info(f"  Available target levels: {len(valid_candidates)}")
-            for level_val, level_key, dist in valid_candidates[:10]:  # Log first 10
-                position_logger.info(f"    {level_key}: {level_val:.2f} (dist: {dist:.2f})")
-            if len(valid_candidates) > 10:
-                position_logger.info(f"    ... and {len(valid_candidates) - 10} more")
+            position_logger.info(f"  Available valid target count for {signal}: {len(valid_candidates)}")
+            # Show only the top few valid candidates in the trade direction (BUY -> ascending, SELL -> descending)
+            try:
+                if signal == 'BUY':
+                    sorted_by_price = sorted(valid_candidates, key=lambda x: x[0])
+                else:
+                    sorted_by_price = sorted(valid_candidates, key=lambda x: x[0], reverse=True)
+
+                show_n = min(5, len(sorted_by_price))
+                for level_val, level_key, dist in sorted_by_price[:show_n]:
+                    position_logger.info(f"    {level_key}: {level_val:.2f} (dist: {dist:.2f})")
+                if len(sorted_by_price) > show_n:
+                    position_logger.info(f"    ... and {len(sorted_by_price) - show_n} more candidates (showing {show_n} in {signal} direction)")
+            except Exception:
+                # Fallback to previous verbose listing if sorting fails for any reason
+                for level_val, level_key, dist in valid_candidates[:10]:
+                    position_logger.info(f"    {level_key}: {level_val:.2f} (dist: {dist:.2f})")
+                if len(valid_candidates) > 10:
+                    position_logger.info(f"    ... and {len(valid_candidates) - 10} more")
                 
             position_logger.info(f"  🎯 SELECTED TARGET: {target_key} @ {target_price:.2f}")
             position_logger.info(f"   Risk Reward Ratio: 1:{(target_price - entry_price if signal == 'BUY' else entry_price - target_price) / risk:.2f}")
@@ -3658,22 +4502,32 @@ class MYALGO_TRADING_BOT:
     def get_nearest_weekly_expiry(self):
         """Pick nearest expiry date (YYYY-MM-DD). In Backtesting, calculates Next Tuesday."""
         try:
-            # 🟢 BACKTESTING MODE: Calculate "Next Tuesday"
+            # 🟢 BACKTESTING MODE: Lookup from EXPIRY_LIST_DDMMYYYY
             if BACKTESTING_MANAGER.active:
                 current_date_val = get_now().date()
-                # Find upcoming Tuesday (including today)
-                # Weekday: Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
-                today_weekday = current_date_val.weekday()
-                target_weekday = 1 # Tuesday
                 
-                if today_weekday <= target_weekday:
-                    days_ahead = target_weekday - today_weekday
+                # Sort and find the first expiry date >= current_date_val
+                # Parse list into date objects
+                try:
+                     sorted_expiries = sorted(
+                         [datetime.strptime(d, "%d-%m-%Y").date() for d in EXPIRY_LIST_DDMMYYYY]
+                     )
+                     
+                     # Find nearest expiry
+                     resolved_expiry_date = next(
+                         (expiry for expiry in sorted_expiries if expiry >= current_date_val), 
+                         None
+                     )
+                except Exception as e:
+                     order_logger.error(f"Error parsing expiry list: {e}")
+                     return None
+                
+                if resolved_expiry_date:
+                     order_logger.info(f"🗓️ [SIMULATION] Resolved Expiry from List: {resolved_expiry_date}")
+                     return resolved_expiry_date
                 else:
-                    days_ahead = 7 - (today_weekday - target_weekday)
-                    
-                resolved_expiry_date = current_date_val + timedelta(days=days_ahead)
-                # order_logger.info(f"🗓️ [SIMULATION] Calculated Next Tuesday Expiry: {resolved_expiry_date}")
-                return resolved_expiry_date
+                     logger.error(f"❌ No future expiry found in EXPIRY_LIST_DDMMYYYY for {current_date_val}")
+                     return None
 
             # 🟢 LIVE MODE: API Call
             base_client = client
@@ -3812,13 +4666,18 @@ class MYALGO_TRADING_BOT:
         if BACKTESTING_MANAGER.active:
             order_logger.info(f"📋 [SIMULATION] Placing {action} order: {symbol} x {quantity}")
             # Generate mock_order_id with timestamp
-            mock_order_id = f"SIGNAL_{get_now().strftime('%H%M%S')}_{action[:1]}"
+            action = "BUY"
+            current_time = get_now()
+            mock_order_id = f"{action}_Order_{current_time.strftime('%H:%M:%S')}"
             
-            if not self._fetch_simulation_option_data():
+            if self._fetch_simulation_option_data():
+                self.option_ltp = self._update_option_ltp_from_df(current_time)
+                exec_price = self.option_ltp
+            else:
                 return False
                 
             # Use current LTP as execution price
-            exec_price = self._update_option_ltp_from_df(get_now())
+            exec_price = self.option_ltp
             order_logger.info(f"✅ 🎯 [SIMULATION] Order executed: ID={mock_order_id} | Price={exec_price:.2f}")
             return mock_order_id, exec_price
         # 🎯 LIVE MODE: Real order placement
@@ -4022,6 +4881,11 @@ class MYALGO_TRADING_BOT:
         """
         try:
             order_logger.info("=== 🛒 PLACING ENTRY ORDER ===")
+            # Reset per-trade TSL flag at the start of a new order
+            try:
+                self.tsl_enabled = False
+            except Exception:
+                pass
             signal_side = "CALL" if signal == "BUY" else "PUT"
             order_logger.info(f"Buy Signal: {signal_side}")
             
@@ -4078,8 +4942,15 @@ class MYALGO_TRADING_BOT:
                     exit_symbol = tradable_symbol
                     exit_exchange = tradable_exchange
                     if USE_OPTION_FOR_SLTP:
+                        # For options, always use BUY side for SL calculation (premium goes up)
                         entry_side = "BUY"
+                        risk_logger.info("Using BUY side for option SL calculation (premium-based)")
+                    elif USE_SPOT_FOR_SLTP:
+                        # For spot, use actual signal direction
+                        entry_side = signal.upper()
+                        risk_logger.info(f"Using {entry_side} side for spot SL calculation (direction-based)")
                     else:
+                        # Default fallback
                         entry_side = signal.upper()
 
                     # Use existing computed 10% stoploss_price for SL order
@@ -4129,7 +5000,8 @@ class MYALGO_TRADING_BOT:
                     base_price = exec_price
                     # option entry price will be set after execution retrieval; temporarily keep base_price
                     risk_logger.info("SL/TP tracking via OPTION; option exec price to be recorded after execution")
-
+                
+                self.entry_price = round(base_price, 2)
                 # Initialize SL/TP using configured method
                 if SL_TP_METHOD == "Signal_candle_range_SL_TP":
                     self.initialize_signal_candle_sl_tp(signal, intraday_df, base_price=base_price)
@@ -4141,7 +5013,8 @@ class MYALGO_TRADING_BOT:
                         risk_logger.info("Calculating CPR for SL/TP")
                         self.compute_static_indicators(
                         symbol = self.option_symbol,
-                        exchange = OPTION_EXCHANGE
+                        exchange = OPTION_EXCHANGE,
+                        instrument_type="OPTIONS"
                         )
                         self.static_indicators_option = self.static_indicators.copy()
                         self.static_indicators = spot_cpr
@@ -4160,7 +5033,8 @@ class MYALGO_TRADING_BOT:
                             )
                             if intraday_df_opt is not None and not intraday_df_opt.empty:
                                 cpr_source = self.static_indicators_option
-                                cpr_success = self.initialize_cpr_range_sl_tp_enhanced("BUY", intraday_df_opt, base_price=exec_price, pivots=cpr_source)
+                                # ✅ FIX: Pass original signal, function will determine effective_side internally
+                                cpr_success = self.initialize_cpr_range_sl_tp_enhanced(signal, intraday_df_opt, base_price=exec_price, pivots=cpr_source)
                                 # self.dynamic_indicators_option = self.compute_dynamic_indicators(intraday_df_opt)
                             else:
                                 self.dynamic_indicators_option = None 
@@ -4178,11 +5052,20 @@ class MYALGO_TRADING_BOT:
                         self.initialize_signal_candle_sl_tp(signal, intraday_df, base_price=base_price)
                 else:
                     # fallback: fixed TP/SL
-                    base_price = self.spot_entry_price
-                    if signal == "BUY":
+                    # ✅ FIX: Determine effective side for fallback logic
+                    if USE_OPTION_FOR_SLTP:
+                        effective_side = "BUY"
+                        base_price = exec_price
+                        risk_logger.info(f"Fallback: Using BUY logic for option (premium-based)")
+                    else:
+                        effective_side = signal.upper()
+                        base_price = self.spot_entry_price
+                        risk_logger.info(f"Fallback: Using {effective_side} logic for spot")
+                    
+                    if effective_side == "BUY":
                         self.stoploss_price = round(base_price - STOPLOSS, 2)
                         self.target_price = round(base_price + TARGET, 2)
-                    else:
+                    else:  # SELL
                         self.stoploss_price = round(base_price + STOPLOSS, 2)
                         self.target_price = round(base_price - TARGET, 2)
 
@@ -4193,6 +5076,11 @@ class MYALGO_TRADING_BOT:
             with self._state_lock:
                 self.exit_in_progress = False
 
+            # Start verification for the option symbol if just establishment
+            if not BACKTESTING_MANAGER.active:
+                order_logger.info("Verifying option LTP subscription post-entry...")
+                threading.Thread(target=self._verify_subscriptions_async, args=([self.option_symbol],), daemon=True).start()
+        
             order_logger.info(f"Order ID: {entry_order_id}")
 
             # final logging and DB record
@@ -4203,19 +5091,20 @@ class MYALGO_TRADING_BOT:
             order_logger.info(f"Target: {self.target_price:.2f}")
             order_logger.info(f"Quantity: {QUANTITY}")
             order_logger.info(f"Trade Count: {self.trade_count}/{MAX_TRADES_PER_DAY}")
-
-            # log trade to DB (existing helper)
+            reason = f"Breakout"
+            # log trade to DB (existing helper)     
             trade_data = {
                 "timestamp": self.trade_start_time,
                 "symbol": tradable_symbol,
                 "spot_price": getattr(self, 'spot_entry_price', 0.0),
                 "action": "CALL" if signal.upper() == "BUY" else "PUT",
                 "quantity": QUANTITY,
-                "price": getattr(self, 'option_entry_price', self.entry_price),
+                "price": getattr(self, 'option_entry_price', self.option_entry_price),
                 "order_id": entry_order_id,
                 "strategy": STRATEGY,
                 "leg_type": "ENTRY",
-                "leg_status": "open"
+                "leg_status": "Open",
+                "reason": reason,
             }
             log_trade_db(trade_data)
 
@@ -4232,26 +5121,51 @@ class MYALGO_TRADING_BOT:
             return False
 
     def subscribe_option_ltp(self):
-        """Subscribe dynamically to option LTP once order is placed."""
+        """
+        Subscribe dynamically to option LTP once order is placed.
+        Enhanced with retry logic and verification.
+        """
         if not getattr(self, "option_symbol", None):
+            order_logger.warning("❌ Option symbol not set yet")
             return
         
         # Avoid duplicate subscription
         if self.option_symbol in self.ws_subscriptions:
-            logger.info(f"Option LTP already subscribed: {self.option_symbol}")     
+            order_logger.info(f"ℹ️ Option {self.option_symbol} already subscribed")
             return
-        try:
-            base_client = client
-            base_client.subscribe_ltp(
-                [
-                    {"exchange": OPTION_EXCHANGE, "symbol": self.option_symbol}
-                ],
-                on_data_received=self.on_ltp_update
-            )
-            signal_logger.info(f"🧩 Subscribed to Option LTP: {self.option_symbol}")
-            self.ws_subscriptions.add(self.option_symbol)
-        except Exception as e:
-            signal_logger.warning(f"⚠️ Failed to subscribe option symbol: {e}")
+        
+        max_retries = 3
+        subscribed = False
+        
+        for attempt in range(max_retries):
+            try:
+                with self.ws_subscription_lock:
+                    self.ws_subscriptions.add(self.option_symbol)
+                
+                self.client.subscribe_ltp(
+                    [{"exchange": OPTION_EXCHANGE, "symbol": self.option_symbol}],
+                    on_data_received=self.on_ltp_update
+                )
+                order_logger.info(f"📡 Subscribed to Option {self.option_symbol} (attempt {attempt+1})")
+                subscribed = True
+                
+                # Start verification for this option symbol
+                threading.Thread(
+                    target=self._verify_subscriptions_async,
+                    args=([self.option_symbol],),
+                    daemon=True
+                ).start()
+                break
+                
+            except Exception as e:
+                order_logger.error(f"❌ Option subscribe failed for {self.option_symbol} (attempt {attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+        
+        if not subscribed:
+            order_logger.error(f"🚨 Failed to subscribe to option {self.option_symbol} after {max_retries} attempts")
+            with self.ws_subscription_lock:
+                self.ws_subscriptions.discard(self.option_symbol)
     
     def _fetch_simulation_option_data(self):
         """
@@ -4269,13 +5183,14 @@ class MYALGO_TRADING_BOT:
             return True
         
         try:
-            # Fetch 1-minute option data from database
+            # 🚀 OPTIMIZATION: Check BacktestingManager Cache First (1m timeframe)
+            sim_date = get_now() # Use full timestamp for slicing if needed, but here we just need the dataframe valid for today
             logger.info(f"Fetching 1-minute option data for backtesting: {self.option_symbol}")
             
-            # Get simulation date range
-            sim_date = get_now().date()
-            start_date = sim_date.strftime("%Y-%m-%d")
-            end_date = sim_date.strftime("%Y-%m-%d")
+            # Get simulation date range works for single day
+            sim_date_only = sim_date.date()
+            start_date = sim_date_only.strftime("%Y-%m-%d")
+            end_date = sim_date_only.strftime("%Y-%m-%d")
             
             # Fetch from database
             df = DB_MANAGER.get_ohlcv_data(
@@ -4300,6 +5215,9 @@ class MYALGO_TRADING_BOT:
                 df_indexed = df.set_index("timestamp")
                 self.option_1m_df = df_indexed
             
+            # 🚀 OPTIMIZATION: Cache the result for future use
+            BACKTESTING_MANAGER.cache_option_data(self.option_symbol, "1m", df)
+
             # ✅ Mark as subscribed to prevent redundant fetches
             self.ws_subscriptions.add(self.option_symbol)
             logger.info(f"✅ Option data loaded and tracked for backtesting: {self.option_symbol} ({len(df)} candles)")
@@ -4443,35 +5361,32 @@ class MYALGO_TRADING_BOT:
             order_logger.info(f"Exit Exchange: {exit_exchange}")
             order_logger.info(f"Exit Action: {action}")
             order_logger.info(f"Exit Quantity: {exit_qty}")
+
+            try:
+                self.unsubscribe_option_ltp(exit_symbol)
+            except Exception as e:
+                order_logger.error(f"Unable to unsubscribe option ltp")
+                pass
                      
             if BACKTESTING_MANAGER.active:
                 order_logger.info("📋 [SIMULATION] Exit order simulated in backtesting mode.")
-                exit_order_id = f"SIM_EXIT_{get_now().strftime('%H%M%S')}"
+                current_time = get_now().time()
+                exit_order_id = f"{action}_Order_{current_time.strftime('%H:%M:%S')}"
                 exit_price = self._update_option_ltp_from_df(get_now())
 
             if (exit_order_id is not None or exit_price is not None):
                 order_logger.info(f"Exit Order Success: {exit_order_id}")
-                try:
-                    if not BACKTESTING_MANAGER.active:
-                        self.unsubscribe_option_ltp(exit_symbol)
-                    else:
-                        order_logger.warning(f"Option LTP not required to unsubscribe in SIM mode")
-                except Exception as e:
-                    order_logger.error(f"Unable to unsubscribe option ltp")
-                    pass
-                
                 if self.option_ltp is None:
                     self.option_ltp = self.option_entry_price
-
                 if exit_price:
                     # Calculate actual P&L
                     if self.position == "BUY":
-                        realized_pnl = (exit_price - self.option_entry_price) * QUANTITY
+                        unrealized_pnl = unrealized_pnl
                     else:
-                        realized_pnl = (exit_price - self.option_entry_price) * QUANTITY
+                        unrealized_pnl = unrealized_pnl
                     
                     order_logger.info(f"EXIT EXECUTED: Price = {exit_price:.2f}")
-                    order_logger.info(f"Realized P&L: {realized_pnl:.2f}")
+                    order_logger.info(f"Unrealized P&L: {unrealized_pnl:.2f}")
                     
                     # Comprehensive trade summary
                     order_logger.info(f"=== TRADE {self.trade_count} COMPLETED ===") 
@@ -4482,7 +5397,7 @@ class MYALGO_TRADING_BOT:
                     order_logger.info(f"Option Entry: {self.position} @ {self.option_entry_price:.2f}")
                     order_logger.info(f"Option Exit: {action} @ {self.option_ltp:.2f}")
                     order_logger.info(f"Trade End Time: {trade_end_time}")
-                    order_logger.info(f"P&L: {realized_pnl:.2f}")
+                    order_logger.info(f"Unrealized P&L: {unrealized_pnl:.2f}")
                     order_logger.info(f"Reason: {reason}")
                     order_logger.info(f"Duration: {trade_duration}")
 
@@ -4497,7 +5412,7 @@ class MYALGO_TRADING_BOT:
                     "strategy": STRATEGY,
                     "leg_type": "EXIT",
                     "reason": reason,
-                    "leg_status": "closed"
+                    "leg_status": "Closed"
                     })
 
                     self.reconcile_trade_pnl({
@@ -4505,6 +5420,7 @@ class MYALGO_TRADING_BOT:
                     "strategy": STRATEGY,
                     "price": self.option_ltp,
                     "quantity": QUANTITY
+
                     })
                    
                 else:
@@ -4548,8 +5464,13 @@ class MYALGO_TRADING_BOT:
             #  Reset dynamic pivot attributes
             self.dynamic_target_info = None
             self.excluded_pivots_info = None
-            self.gk_resistance_pivot = None
-            self.gk_support_pivot = None
+            try:
+                self.tsl_enabled = False
+            except Exception:
+                pass
+            # Keep stored gatekeeper pivots across position exits so
+            # `check_entry_signal` can still reference them. Do NOT clear
+            # `gk_resistance_pivot` / `gk_support_pivot` here.
             # Reset LTP pivot breakout state
             with self._pivot_gate_lock:
                 self.ltp_pivot_breakout = False
@@ -4760,11 +5681,11 @@ class MYALGO_TRADING_BOT:
                     )
                 )
             # Attempt to cancel all orders and close position via API (best-effort)
-            if BACKTESTING_MANAGER.active:
+            if MODE in ["BACKTESTING", "BACKTESTING_RANGE"]:
                 logger.info("📋 [SIMULATION] Skipping final order cancellation and position close API calls")
             else:
                 logger.info("Attempting final order cancellations and position close via API")
-                client.cancelallorders(strategy=STRATEGY)
+                client.cancelallorder(strategy=STRATEGY)
                 client.closeposition(strategy=STRATEGY)
         except Exception:
             logger.exception("Error while logging final status")
@@ -5014,6 +5935,7 @@ class MYALGO_TRADING_BOT:
             ws_thread = threading.Thread(target=self.websocket_thread, daemon=True)
             ws_thread.start()
             time.sleep(1)
+            # allow websocket to connect
             
             # strategy thread (contains scheduler)
             main_logger.info("Starting strategy thread with signal processing")
@@ -5025,7 +5947,7 @@ class MYALGO_TRADING_BOT:
             
             try:
                 while not self.stop_event.is_set() and self.running:
-                    time.sleep(1)
+                    time.sleep(0.1)
             except KeyboardInterrupt:
                 main_logger.info("Manual interruption detected (Ctrl+C)")
                 logger.info("KeyboardInterrupt -> shutting down")
@@ -5054,24 +5976,89 @@ class MYALGO_TRADING_BOT:
             main_logger.info(f"Max Trades Allowed: {MAX_TRADES_PER_DAY}")
             main_logger.info(f"Final Status: {'Max trades reached' if self.trade_count >= MAX_TRADES_PER_DAY else 'Session ended normally'}")
             
+            if MODE == "BACKTESTING":
+                main_logger.info("📋 [SIMULATION] Backtesting session ended")
+                from backtesting_analysis import main
+                main()
+            
             logger.info("Bot stopped")
-            sys.exit()
+            
+            # Only exit system in single-run modes. 
+            # In BACKTESTING_RANGE, return control to orchestrator.
+            if MODE != "BACKTESTING_RANGE":
+                sys.exit()
+            else:
+                main_logger.info("🔄 Returning control to orchestrator...")
 # -------------------------
 # main
 # -------------------------
 if __name__ == "__main__":
-    # Auto start simulation if configured
-    if MODE == "BACKTESTING" and SIMULATION_DATE:
+    
+    # ═════════════════════════════════════════════════════════════
+    # MODE DETECTION & INITIALIZATION
+    # ═════════════════════════════════════════════════════════════
+    
+    # ─────────────────────────────────────────────────────────────
+    # MODE 1: BACKTESTING - DATE RANGE (NEW)
+    # ─────────────────────────────────────────────────────────────
+    if MODE == "BACKTESTING_RANGE":
+        try:
+            # Validate configuration
+            if not START_DATE or not END_DATE:
+                main_logger.error("❌ BACKTESTING_RANGE mode requires START_DATE and END_DATE")
+                sys.exit(1)
+            
+            main_logger.info("🎯 BACKTESTING MODE: DATE RANGE")
+            main_logger.info(f"📅 Range: {START_DATE} → {END_DATE}")
+            
+            # Import orchestrator
+            from backtesting_engine import BacktestOrchestrator
+            
+            # Create and run orchestrator
+            orchestrator = BacktestOrchestrator(
+                start_date_str=START_DATE,
+                end_date_str=END_DATE
+            )
+            
+            orchestrator.run_backtest_range()
+            
+            # Run analysis after completion
+            main_logger.info("🔍 Starting post-backtest analysis...")
+            from backtesting_analysis import main as run_analysis
+            run_analysis()
+            
+            main_logger.info("✅ Multi-day backtesting completed successfully")
+            sys.exit(0)
+            
+        except Exception as e:
+            main_logger.exception(f"❌ Multi-day backtesting failed: {e}")
+            sys.exit(1)
+    
+    # ─────────────────────────────────────────────────────────────
+    # MODE 2: BACKTESTING - SINGLE DAY (EXISTING)
+    # ─────────────────────────────────────────────────────────────
+    elif MODE == "BACKTESTING" and SIMULATION_DATE:
         try:
             BACKTESTING_MANAGER.start(SIMULATION_DATE, symbol=SYMBOL, exchange=EXCHANGE, timeframe="1m")
             main_logger.info(f"🎬 Simulation Mode Activated for {SIMULATION_DATE}")
         except Exception:
             main_logger.exception("❌ 🚨 Simulation startup failed; exiting")
             sys.exit(1)
+    
+    # ─────────────────────────────────────────────────────────────
+    # MODE 3: LIVE TRADING (EXISTING)
+    # ─────────────────────────────────────────────────────────────
     else:
         main_logger.info("🚀 Live Mode Activated")
         if not market_is_open():
             logger.info("🛑 Market closed right now. Please schedule the bot to run during market hours.")
             sys.exit(1)
-    bot = MYALGO_TRADING_BOT()
-    bot.run()
+    
+    # ═════════════════════════════════════════════════════════════
+    # RUN BOT (ONLY FOR SINGLE-DAY MODES)
+    # ═════════════════════════════════════════════════════════════
+    
+    # Skip bot creation for BACKTESTING_RANGE (orchestrator handles it)
+    if MODE != "BACKTESTING_RANGE":
+        bot = MYALGO_TRADING_BOT()
+        bot.run()

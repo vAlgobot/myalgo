@@ -31,7 +31,7 @@ try:
 except ImportError:
     raise ImportError("DuckDB library not installed. Run: pip install duckdb")
 
-from core.logger import get_logger
+from logger import get_logger
 
 
 class DatabaseManager:
@@ -48,21 +48,33 @@ class DatabaseManager:
     _lock = threading.Lock()
     _initialized = False
     
-    def __new__(cls, db_path: Optional[str] = None, config_path: Optional[str] = None):
-        """Ensure singleton pattern with thread safety."""
+    def __new__(cls, db_path: Optional[str] = None, config_path: Optional[str] = None, 
+                read_only: bool = True):
+        """
+        Ensure singleton pattern with thread safety PER PROCESS.
+        
+        Args:
+            db_path: Path to DuckDB database file
+            config_path: Path to Excel configuration file
+            read_only: If True, opens database in read-only mode (allows parallel access)
+        """
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
                     cls._instance = super(DatabaseManager, cls).__new__(cls)
         return cls._instance
+
     
-    def __init__(self, db_path: Optional[str] = None, config_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, config_path: Optional[str] = None,
+                 read_only: bool = False):
         """
-        Initialize Database Manager (singleton pattern).
+        Initialize Database Manager (singleton pattern per process).
         
         Args:
             db_path: Path to DuckDB database file
             config_path: Path to Excel configuration file
+            read_only: If True, opens in read-only mode for parallel backtesting
+                      If False, opens in read-write mode for data loading
         """
         # Only initialize once due to singleton pattern
         if self._initialized:
@@ -70,6 +82,7 @@ class DatabaseManager:
             
         self.logger = get_logger(__name__)
         self.config_path = config_path or "config/config.xlsx"
+        self.read_only = False  # Store read-only mode
         
         # Set up database path
         if db_path is None:
@@ -81,123 +94,44 @@ class DatabaseManager:
         self.db_path = db_path
         self.connection = None
 
-        # Add thread lock for DB operations (for v2 method)
-        import threading
+        # Add thread lock for DB operations
         self._db_lock = threading.Lock()
         
         # Database configuration
         self.spot_table = "spot_data"
         self.options_table = "options_data"
         self.metadata_table = "data_metadata"
+        self.table = None
         
         # Initialize database
         self._initialize_database()
         
-        self.logger.info(f"DatabaseManager singleton initialized with database: {self.db_path}")
+        # Mark as initialized
         DatabaseManager._initialized = True
         
-    def get_ohlcv_data_v2(
-            self,
-            symbol: str,
-            exchange: str,
-            timeframe: str,
-            start_date: str,
-            end_date: str,
-            instrument_type: str = "SPOT",
-            expiry: Optional[str] = None,
-            underlying: Optional[str] = None
-        ) -> 'pd.DataFrame':
-            """
-            Alternative OHLCV data retrieval method using explicit SQL and thread lock.
-            Args:
-                symbol: Trading symbol
-                exchange: Exchange name
-                timeframe: Time interval
-                start_date: Start date (YYYY-MM-DD)
-                end_date: End date (YYYY-MM-DD)
-                instrument_type: "SPOT" or "OPTIONS"
-                expiry: Expiry date (dd-mm-YYYY) for options
-                strike: Strike price for options
-                underlying: Underlying symbol for options
-            Returns:
-                pd.DataFrame: OHLCV data indexed by timestamp
-            """
-            instrument_type = instrument_type.upper()
-            timeframe = timeframe.lower()
-
-            start_ts = f"{start_date} 00:00:00"
-            end_ts = f"{end_date} 23:59:59"
-
-            if instrument_type == "SPOT":
-                query = f"""
-                    SELECT timestamp, open, high, low, close, volume
-                    FROM {self.spot_table}
-                    WHERE symbol = ?
-                      AND exchange = ?
-                      AND timeframe = ?
-                      AND timestamp BETWEEN ? AND ?
-                    ORDER BY timestamp
-                """
-                params = [
-                    symbol.upper(),
-                    exchange.upper(),
-                    timeframe,
-                    start_ts,
-                    end_ts,
-                ]
-
-            else:
-                strike = extract_strike_from_symbol(symbol)
-                if not all([expiry, strike, underlying]):
-                    raise ValueError("OPTIONS require expiry, strike, underlying")
-                query = f"""
-                    SELECT timestamp, open, high, low, close, volume, oi
-                    FROM {self.options_table}
-                    WHERE symbol = ?
-                      AND expiry = ?
-                      AND strike = ?
-                      AND timeframe = ?
-                      AND exchange = ?
-                      AND underlying = ?
-                      AND timestamp BETWEEN ? AND ?
-                    ORDER BY timestamp
-                """
-
-                params = [
-                    symbol.upper(),
-                    datetime.strptime(expiry, "%d-%m-%Y").date(),
-                    strike,
-                    timeframe,
-                    exchange.upper(),
-                    underlying.upper(),
-                    start_ts,
-                    end_ts,
-                ]
-
-            with self._db_lock:
-                df = self.connection.execute(query, params).fetchdf()
-
-            if df.empty:
-                return pd.DataFrame()
-
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-            return df.set_index("timestamp")
     
     def _initialize_database(self) -> None:
         """Initialize database connection and create tables if they don't exist."""
         try:
             # Establish DuckDB connection
+            if self.read_only:
+            # READ-ONLY mode - allows multiple processes
+                self.connection = duckdb.connect(self.db_path, read_only=True)
+                self.logger.info(f"✅ Database opened in READ-ONLY mode (PID: {os.getpid()})")
+            else:
+            # READ-WRITE mode - exclusive access
+                self.connection = duckdb.connect(self.db_path, read_only=False)
+                self.logger.info(f"✅ Database opened in READ-WRITE mode (PID: {os.getpid()})")
+                self.connection = duckdb.connect(self.db_path)  
 
-            self.connection = duckdb.connect(self.db_path)  
-
-            # Create OHLCV data table
-            self._create_ohlcv_table()
+                # Create OHLCV data table
+                self._create_ohlcv_table()
             
-            # Create metadata table
-            self._create_metadata_table()
+                # Create metadata table
+                self._create_metadata_table()
             
-            # Create indexes for better performance
-            self._create_indexes()
+                # Create indexes for better performance
+                self._create_indexes()
             
             self.logger.info("Database initialized successfully")
             
@@ -731,97 +665,319 @@ class DatabaseManager:
         
         return results
     
+    # def get_ohlcv_data(self, symbol: str, exchange: str, timeframe: str,
+    #                   start_date: Optional[str] = None, end_date: Optional[str] = None, instrument_type: str = "SPOT", underlying_symbol: str = "NIFTY", expiry_date: Optional[str] = None) -> pd.DataFrame:
+    #     """
+    #     Retrieve OHLCV data for backtesting.
+        
+    #     Args:
+    #         symbol: Trading symbol
+    #         exchange: Exchange name
+    #         timeframe: Time interval
+    #         start_date: Start date in YYYY-MM-DD format (optional)
+    #         end_date: End date in YYYY-MM-DD format (optional)
+            
+    #     Returns:
+    #         pd.DataFrame: OHLCV data with timestamp index
+    #     """
+    #     try:
+    #         # TABLE ASSIGNMENT BASED ON INSTRUMENT TYPE
+
+    #         if instrument_type.upper() == "SPOT":
+    #             self.table = "spot_data"  # Main OHLCV table
+    #             # Build query
+    #             where_conditions = [
+    #             "symbol = ?",
+    #             "exchange = ?", 
+    #             "LOWER(timeframe) = ?"
+    #             ]
+    #             params = [symbol.upper(), exchange.upper(), timeframe.lower()]
+                
+    #         elif instrument_type.upper() == "OPTIONS":
+    #             self.table = "options_data_master"  # OPTION-specific table    
+    #             # Build query
+    #             where_conditions = [
+    #             "underlying = ?",
+    #             "exchange = ?",
+    #             "expiry = ?",
+    #             "strike = ?",
+    #             "symbol = ?",
+    #             "LOWER(timeframe) = ?"
+    #             ]
+                
+    #             # Auto-convert expiry format if needed (e.g. 02-12-2025 -> 02DEC25)
+    #             if expiry_date:
+    #                 try:
+    #                     if "-" in expiry_date and len(expiry_date) == 10:
+    #                         # Parse DD-MM-YYYY
+    #                         dt_temp = datetime.strptime(expiry_date, "%d-%m-%Y")
+    #                         expiry_date = dt_temp.strftime("%d%b%y").upper()
+    #                         self.logger.debug(f"Converted expiry parameter to DB format: {expiry_date}")
+    #                 except ValueError:
+    #                     pass # Pass original value if parsing fails
+
+    #             strike_price = extract_strike_from_symbol(symbol)
+                
+    #             params = [underlying_symbol.upper(), exchange.upper(), expiry_date, strike_price, symbol.upper(), timeframe.lower()]
+    #         else:
+    #             self.logger.error(f"Invalid instrument type: {instrument_type}")
+    #             return pd.DataFrame()
+    #         # Build query conditions
+    #         if start_date:
+    #             where_conditions.append("timestamp >= ?")
+    #             params.append(start_date)
+    #         if end_date:
+    #             where_conditions.append("timestamp <= ?")
+    #             # Fix: For same-day queries or single day backtesting, extend end_date to include full day
+    #             if end_date and len(end_date) == 10:  # YYYY-MM-DD format
+    #                 end_date_extended = end_date + ' 23:59:59'
+    #                 params.append(end_date_extended)
+    #                 self.logger.debug(f"Extended end_date for full day coverage: {end_date_extended}")
+    #             else:
+    #                 params.append(end_date)
+    #         # Execute query
+
+    #         if instrument_type.upper() == "OPTIONS":
+    #             query = f"""
+    #             SELECT timestamp, open, high, low, close, volume, oi, strike, expiry, underlying
+    #             FROM {self.table}
+    #             WHERE {' AND '.join(where_conditions)}
+    #             ORDER BY timestamp ASC
+    #             """
+    #         else:
+    #             query = f"""
+    #             SELECT timestamp, open, high, low, close, volume
+    #             FROM {self.table}
+    #             WHERE {' AND '.join(where_conditions)}
+    #             ORDER BY timestamp ASC
+    #             """
+
+    #         df = self.connection.execute(query, params).df()
+            
+    #         if df.empty:
+    #             self.logger.warning(f"No data found for {symbol} ({exchange}, {timeframe})")
+    #             return pd.DataFrame()
+    #         # Set timestamp as index
+    #         df['timestamp'] = pd.to_datetime(df['timestamp'])
+    #         df = df.set_index('timestamp')
+    #         if timeframe.lower() == "d":
+    #             df.index = df.index.normalize()
+            
+    #         self.logger.info(f"Retrieved {len(df)} records for {symbol} ({exchange}, {timeframe})")
+    #         return df
+            
+    #     except Exception as e:
+    #         self.logger.error(f"Failed to retrieve data for {symbol}: {e}")
+    #         return pd.DataFrame()
+
     def get_ohlcv_data(self, symbol: str, exchange: str, timeframe: str,
-                      start_date: Optional[str] = None, end_date: Optional[str] = None, instrument_type: str = "SPOT", underlying_symbol: str = "NIFTY", expiry_date: Optional[str] = None) -> pd.DataFrame:
+                      start_date: Optional[str] = None, end_date: Optional[str] = None, 
+                      instrument_type: str = "SPOT", underlying_symbol: str = "NIFTY", 
+                      expiry_date: Optional[str] = None) -> pd.DataFrame:
         """
         Retrieve OHLCV data for backtesting.
+        
+        ✅ ENHANCED: Auto-resamples 1m data to 5m for OPTIONS when 5m is requested
         
         Args:
             symbol: Trading symbol
             exchange: Exchange name
-            timeframe: Time interval
+            timeframe: Time interval (e.g., '1m', '5m', 'D')
             start_date: Start date in YYYY-MM-DD format (optional)
             end_date: End date in YYYY-MM-DD format (optional)
+            instrument_type: "SPOT" or "OPTIONS"
+            underlying_symbol: Underlying symbol for options
+            expiry_date: Expiry date for options
             
         Returns:
             pd.DataFrame: OHLCV data with timestamp index
         """
         try:
+            # ✅ FIX: Check if we need to resample OPTIONS data
+            original_timeframe = timeframe
+            fetch_timeframe = timeframe
+            needs_resampling = False
+            
+            if instrument_type.upper() == "OPTIONS":
+                if timeframe.lower() == '5m':
+                    # Only 5m is supported for resampling
+                    fetch_timeframe = '1m'
+                    needs_resampling = True
+                    self.logger.info(f"OPTIONS: Will fetch 1m data and resample to 5m")
+            
             # TABLE ASSIGNMENT BASED ON INSTRUMENT TYPE
-
             if instrument_type.upper() == "SPOT":
-                self.spot_table = self.spot_table  # Main OHLCV table
-                # Build query
+                self.table = "spot_data"
                 where_conditions = [
-                "symbol = ?",
-                "exchange = ?", 
-                "LOWER(timeframe) = ?"
+                    "symbol = ?",
+                    "exchange = ?", 
+                    "LOWER(timeframe) = ?"
                 ]
-                params = [symbol.upper(), exchange.upper(), timeframe.lower()]
+                params = [symbol.upper(), exchange.upper(), fetch_timeframe.lower()]
                 
             elif instrument_type.upper() == "OPTIONS":
-                self.spot_table = self.options_table  # Options-specific table    
-                # Build query
+                self.table = "options_data_master"
                 where_conditions = [
-                "underlying = ?",
-                "exchange = ?",
-                "expiry = ?",
-                "strike = ?",
-                "symbol = ?",
-                "LOWER(timeframe) = ?"
+                    "underlying = ?",
+                    "exchange = ?",
+                    "expiry = ?",
+                    "strike = ?",
+                    "symbol = ?",
+                    "LOWER(timeframe) = ?"
                 ]
+                
+                # Auto-convert expiry format if needed
+                if expiry_date:
+                    try:
+                        if "-" in expiry_date and len(expiry_date) == 10:
+                            dt_temp = datetime.strptime(expiry_date, "%d-%m-%Y")
+                            expiry_date = dt_temp.strftime("%d%b%y").upper()
+                            self.logger.debug(f"Converted expiry parameter to DB format: {expiry_date}")
+                    except ValueError:
+                        pass
+                
                 strike_price = extract_strike_from_symbol(symbol)
-                params = [underlying_symbol.upper(), exchange.upper(), expiry_date, strike_price, symbol.upper(), timeframe.lower()]
+                params = [underlying_symbol.upper(), exchange.upper(), expiry_date, strike_price, 
+                         symbol.upper(), fetch_timeframe.lower()]
             else:
                 self.logger.error(f"Invalid instrument type: {instrument_type}")
                 return pd.DataFrame()
+            
             # Build query conditions
             if start_date:
                 where_conditions.append("timestamp >= ?")
                 params.append(start_date)
             if end_date:
                 where_conditions.append("timestamp <= ?")
-                # Fix: For same-day queries or single day backtesting, extend end_date to include full day
-                if end_date and len(end_date) == 10:  # YYYY-MM-DD format
+                if end_date and len(end_date) == 10:
                     end_date_extended = end_date + ' 23:59:59'
                     params.append(end_date_extended)
                     self.logger.debug(f"Extended end_date for full day coverage: {end_date_extended}")
                 else:
                     params.append(end_date)
+            
             # Execute query
-
             if instrument_type.upper() == "OPTIONS":
                 query = f"""
                 SELECT timestamp, open, high, low, close, volume, oi, strike, expiry, underlying
-                FROM {self.spot_table}
+                FROM {self.table}
                 WHERE {' AND '.join(where_conditions)}
                 ORDER BY timestamp ASC
                 """
             else:
                 query = f"""
                 SELECT timestamp, open, high, low, close, volume
-                FROM {self.spot_table}
+                FROM {self.table}
                 WHERE {' AND '.join(where_conditions)}
                 ORDER BY timestamp ASC
                 """
-
+            
             df = self.connection.execute(query, params).df()
             
             if df.empty:
-                self.logger.warning(f"No data found for {symbol} ({exchange}, {timeframe})")
+                self.logger.warning(f"No data found for {symbol} ({exchange}, {fetch_timeframe})")
                 return pd.DataFrame()
             
             # Set timestamp as index
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df = df.set_index('timestamp')
-            if timeframe.lower() == "d":
+            
+            self.logger.info(f"Retrieved {len(df)} records for {symbol} ({exchange}, {fetch_timeframe})")
+            
+            # ✅ RESAMPLE if needed (OPTIONS only)
+            if needs_resampling:
+                df = self._resample_ohlcv(df, original_timeframe, instrument_type)
+                if df.empty:
+                    self.logger.warning(f"Resampling resulted in empty DataFrame for {symbol}")
+                    return pd.DataFrame()
+                self.logger.info(f"Resampled to {original_timeframe}: {len(df)} candles")
+            
+            # Normalize daily timestamps
+            if original_timeframe.lower() == "d":
                 df.index = df.index.normalize()
             
-            self.logger.info(f"Retrieved {len(df)} records for {symbol} ({exchange}, {timeframe})")
             return df
             
         except Exception as e:
-            self.logger.error(f"Failed to retrieve data for {symbol}: {e}")
+            self.logger.error(f"Failed to retrieve data for {symbol}: {e}", exc_info=True)
+            return pd.DataFrame()
+    
+    
+    def _resample_ohlcv(self, df: pd.DataFrame, target_timeframe: str, instrument_type: str) -> pd.DataFrame:
+        """
+        Resample 1-minute OHLCV data to 5-minute timeframe with 100% accuracy.
+        
+        ✅ STRICT: Only supports 1m → 5m conversion for OPTIONS
+        
+        Args:
+            df: DataFrame with 1m data (timestamp index)
+            target_timeframe: Target timeframe (must be '5m')
+            instrument_type: "SPOT" or "OPTIONS"
+            
+        Returns:
+            Resampled DataFrame
+        """
+        try:
+            if df.empty:
+                return df
+            
+            # ✅ VALIDATION: Only allow 5m resampling
+            if target_timeframe.lower() != '5m':
+                self.logger.error(f"Resampling only supports 5m timeframe, got: {target_timeframe}")
+                return pd.DataFrame()
+            
+            self.logger.debug(f"Resampling from 1m to 5m")
+            
+            # Define aggregation rules
+            if instrument_type.upper() == "OPTIONS":
+                agg_dict = {
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last',
+                    'volume': 'sum',
+                    'oi': 'last',  # Open Interest: take last value
+                    'strike': 'first',
+                    'expiry': 'first',
+                    'underlying': 'first'
+                }
+            else:
+                agg_dict = {
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last',
+                    'volume': 'sum'
+                }
+            
+            # Resample with proper alignment
+            # Use 'left' label and closed='left' for standard market convention
+            # This means 09:15-09:19 becomes 09:15 candle (not 09:20)
+            resampled = df.resample('5T', label='left', closed='left').agg(agg_dict)
+            
+            # Drop rows where all OHLC values are NaN (no data in that period)
+            resampled = resampled.dropna(subset=['open', 'high', 'low', 'close'], how='all')
+            
+            # Fill forward for metadata columns (strike, expiry, underlying) if they have NaN
+            if instrument_type.upper() == "OPTIONS":
+                for col in ['strike', 'expiry', 'underlying']:
+                    if col in resampled.columns:
+                        resampled[col] = resampled[col].ffill()
+            
+            # Convert dtypes to match original
+            if 'volume' in resampled.columns:
+                resampled['volume'] = resampled['volume'].fillna(0).astype('int64')
+            if 'oi' in resampled.columns:
+                resampled['oi'] = resampled['oi'].fillna(0).astype('int64')
+            if 'strike' in resampled.columns:
+                resampled['strike'] = resampled['strike'].fillna(0).astype('int64')
+            
+            self.logger.debug(f"Resampling complete: {len(df)} rows → {len(resampled)} rows")
+            
+            return resampled
+            
+        except Exception as e:
+            self.logger.error(f"Error during resampling: {e}", exc_info=True)
             return pd.DataFrame()
     
     def get_available_dates(self, symbol: Optional[str] = None, exchange: Optional[str] = None, 
@@ -1366,6 +1522,10 @@ class DatabaseManager:
         except Exception as e:
             self.logger.error(f"Error cleaning up invalid timestamps: {e}")
             return 0
+        
+    
+
+    print("✅ my_trade_logs table cleared for fresh backtest run")
     
     def cleanup_old_data(self, days_to_keep: int = 365) -> int:
         """
@@ -1483,9 +1643,10 @@ class DatabaseManager:
 
 
 # Convenience functions for easy access
-def get_database_manager(db_path: Optional[str] = None, config_path: Optional[str] = None) -> DatabaseManager:
-    """Get the singleton database manager instance."""
-    return DatabaseManager(db_path, config_path)
+def get_database_manager(db_path: Optional[str] = None, 
+                           config_path: Optional[str] = None,
+                           read_only: bool = True) -> DatabaseManager:
+       return DatabaseManager(db_path, config_path, read_only=read_only)
 
 
 def get_quick_data(symbol: str, timeframe: str = '5m', days: int = 30) -> pd.DataFrame:
@@ -1539,12 +1700,14 @@ def extract_strike_from_symbol(symbol: str) -> int:
 
 
 # Global instance for backward compatibility
-database_manager = get_database_manager()
+database_manager = get_database_manager(read_only=True)
 
 if __name__ == "__main__":
     # Simple test of DatabaseManager functionality
-    db_manager = get_database_manager()
+    print(f"Testing DatabaseManager (PID: {os.getpid()})")
+    db_manager = get_database_manager(read_only=True)
+    print("✅ Database opened in READ-ONLY mode")
 
-    df = db_manager.get_ohlcv_data('BANKNIFTY', 'NSE_INDEX', '1m', '2026-01-16', '2026-01-16', instrument_type="SPOT")
-    # df = db_manager.get_ohlcv_data(symbol='NIFTY20JAN2625650PE', exchange='NFO', timeframe='D', start_date='2025-12-01', end_date='2026-01-15', instrument_type="OPTIONS", underlying_symbol="NIFTY", expiry_date="20-01-2026")
+    # df = db_manager.get_ohlcv_data('BANKNIFTY', 'NSE_INDEX', '1m', '2026-01-16', '2026-01-16', instrument_type="SPOT")
+    df = db_manager.get_ohlcv_data(symbol='NIFTY27JAN2625450CE', exchange='NFO', timeframe='D', start_date='2026-01-17', end_date='2026-01-22', instrument_type="OPTIONS", underlying_symbol="NIFTY", expiry_date="27-01-2026")
     print(df.count())
