@@ -49,7 +49,7 @@ class DatabaseManager:
     _initialized = False
     
     def __new__(cls, db_path: Optional[str] = None, config_path: Optional[str] = None, 
-                read_only: bool = True):
+                read_only: bool = False):
         """
         Ensure singleton pattern with thread safety PER PROCESS.
         
@@ -76,13 +76,21 @@ class DatabaseManager:
             read_only: If True, opens in read-only mode for parallel backtesting
                       If False, opens in read-write mode for data loading
         """
-        # Only initialize once due to singleton pattern
+        # Only initialize once due to singleton pattern.
+        # If caller asks for a different access mode, reopen accordingly.
         if self._initialized:
+            if self.read_only != read_only:
+                self.logger.info(
+                    f"Reinitializing DatabaseManager with read_only={read_only} "
+                    f"(was read_only={self.read_only})"
+                )
+                self.read_only = read_only
+                self._initialize_database()
             return
             
         self.logger = get_logger(__name__)
         self.config_path = config_path or "config/config.xlsx"
-        self.read_only = False  # Store read-only mode
+        self.read_only = read_only  # Store read-only mode
         
         # Set up database path
         if db_path is None:
@@ -122,8 +130,6 @@ class DatabaseManager:
             # READ-WRITE mode - exclusive access
                 self.connection = duckdb.connect(self.db_path, read_only=False)
                 self.logger.info(f"✅ Database opened in READ-WRITE mode (PID: {os.getpid()})")
-                self.connection = duckdb.connect(self.db_path)  
-
                 # Create OHLCV data table
                 self._create_ohlcv_table()
             
@@ -797,13 +803,12 @@ class DatabaseManager:
             original_timeframe = timeframe
             fetch_timeframe = timeframe
             needs_resampling = False
-            
-            if instrument_type.upper() == "OPTIONS":
-                if timeframe.lower() == '5m':
-                    # Only 5m is supported for resampling
-                    fetch_timeframe = '1m'
-                    needs_resampling = True
-                    self.logger.info(f"OPTIONS: Will fetch 1m data and resample to 5m")
+
+            if timeframe.lower() == '5m':
+                # Only 5m is supported for resampling
+                fetch_timeframe = '1m'
+                needs_resampling = True
+                self.logger.info(f"fetch 1m data and resample to 5m")
             
             # TABLE ASSIGNMENT BASED ON INSTRUMENT TYPE
             if instrument_type.upper() == "SPOT":
@@ -953,7 +958,7 @@ class DatabaseManager:
             # Resample with proper alignment
             # Use 'left' label and closed='left' for standard market convention
             # This means 09:15-09:19 becomes 09:15 candle (not 09:20)
-            resampled = df.resample('5T', label='left', closed='left').agg(agg_dict)
+            resampled = df.resample('5min', label='left', closed='left').agg(agg_dict)
             
             # Drop rows where all OHLC values are NaN (no data in that period)
             resampled = resampled.dropna(subset=['open', 'high', 'low', 'close'], how='all')
@@ -1523,10 +1528,6 @@ class DatabaseManager:
             self.logger.error(f"Error cleaning up invalid timestamps: {e}")
             return 0
         
-    
-
-    print("✅ my_trade_logs table cleared for fresh backtest run")
-    
     def cleanup_old_data(self, days_to_keep: int = 365) -> int:
         """
         Clean up old data beyond specified days.
@@ -1699,8 +1700,8 @@ def extract_strike_from_symbol(symbol: str) -> int:
     return int(strike_part)
 
 
-# Global instance for backward compatibility
-database_manager = get_database_manager(read_only=True)
+# Global instance for backward compatibility (lazy to avoid forcing mode at import time)
+database_manager = None
 
 if __name__ == "__main__":
     # Simple test of DatabaseManager functionality

@@ -20,9 +20,9 @@ import time
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger import get_logger
-from db.database_main import get_database_manager
+from db.database_main import DatabaseManager
 
-DB_MANAGER = get_database_manager(read_only=False)
+DB_MANAGER = DatabaseManager(read_only=False)
 logger = get_logger("market_data_dispatcher")
 
 # =====================================================================
@@ -36,8 +36,8 @@ OPTION_EXCHANGE = "NFO"
 TIMEFRAMES = ["1m", "5m", "D"]  # List of timeframes to fetch
 
 #---Backtesting configuration-----#
-START_DATE = "2026-01-01"
-END_DATE = "2026-02-06"
+START_DATE = "2026-02-13"
+END_DATE = "2026-02-13"
 BATCH_DATES = []
 EXCHANGE = "NSE_INDEX"
 
@@ -47,7 +47,7 @@ API_HOST = "https://myalgo.vralgo.com/"
 WS_URL = "wss://myalgo.vralgo.com/ws"
 
 
-MARKET_DATE = None  # Optional: Specific market date for LIVE mode (YYYY-MM-DD) or None
+MARKET_DATE = "2026-02-12"  # Optional: Specific market date for LIVE mode (YYYY-MM-DD) or None
 DAY_CANDLE_LOOKBACK_DAYS = 70
 LOOKBACK_DAYS = 10          # Lookback days for LIVE mode
 client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL)  # Placeholder for your market data API client

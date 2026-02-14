@@ -24,9 +24,9 @@ from datetime import datetime, timedelta
 # =============================================================================
 
 # Hardcoded Paths
-CSV_FOLDER_PATH = r"C:\Users\Srivi\myalgo_openalgo\myalgo\expired_monthly"
+CSV_FOLDER_PATH = r"C:\Users\Srivi\myalgo_openalgo\myalgo\option_expired_data"
 DB_PATH = r"C:\Users\Srivi\myalgo_openalgo\myalgo\data\market_data.db"
-ARCHIVE_FOLDER_PATH = r"C:\Users\Srivi\myalgo_openalgo\myalgo\expired_monthly\Archive"
+ARCHIVE_FOLDER_PATH = r"C:\Users\Srivi\myalgo_openalgo\myalgo\option_expired_data\Archive"
 # 🔹 SYMBOL CONFIGURATION (CHANGE HERE)
 UNDERLYING_SYMBOL = "NIFTY"   # Options: NIFTY, BANKNIFTY, SENSEX
 EXCHANGE = "NFO"              # Options: NFO (For Nifty/BankNifty), BFO (For Sensex)

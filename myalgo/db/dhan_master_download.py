@@ -1,27 +1,30 @@
-"""
-FOR each trading day D:
-
-    Fetch SPOT daily candle
-    Build strike ladder using day range + buffer 5 strikes Call & Put
-    FOR each strike:
-        FOR CE & PE:
-            Fetch expired option OHLCV + iv + oi + spot (interval 1 or 5)
-            If interval=1 -> lookup only that day
-            If interval=5 -> lookup last 60 days
-            Store data in local DB / CSV for later analysis
-"""
-
 import logging
 import time
 import json
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pyotp
 import pandas as pd
 
 from dhanhq import DhanLogin, DhanContext, dhanhq
+from push_option_historical_data_csv_to_db import (
+    OptionsIngestionPipeline,
+    DB_PATH,
+    EXPIRY_LIST_RAW,
+    UNDERLYING_SYMBOL,
+    EXCHANGE,
+)
+from push_option_d_data_nse_to_db import NSEHistoricalIngestor
 
+MODE = "HISTORICAL"  # "LIVE" or "HISTORICAL"
+start_date = "2026-02-13"   #✅ Used when MODE = "HISTORICAL" (YYYY-MM-DD)
+end_date = "2026-02-13"     #✅ Used when MODE = "HISTORICAL" (YYYY-MM-DD)
+out_dir = str(Path(__file__).resolve().parents[1] / "option_expired_data") #✅ Output directory for CSV files
+expiry_type = "WEEK"  # or "MONTH" #✅ Choose expiry type (WEEK or MONTH)
+expiry_code = 1       #✅ 1 for nearest expiry, 2 for next
+interval = 1          #✅ 1 for 1-min candles, 5 for 5-min candles
 
 class DhanExpiredDataDownloader:
     """
@@ -36,7 +39,7 @@ class DhanExpiredDataDownloader:
         self.TOTP_SECRET = "NKAH37E23LXNVODCEYUJAPDEP3ZLUYMF"
 
         # ===== TOKEN SETTINGS =====
-        self.TOKEN_FILE = "dhan_token.json"
+        self.TOKEN_FILE = Path(__file__).resolve().parent / "dhan_token.json"
         self.TOKEN_VALIDITY = 6 * 60 * 60  # 6 hours (safe)
 
         # ===== INSTRUMENT SETTINGS =====
@@ -50,14 +53,14 @@ class DhanExpiredDataDownloader:
     # 🔐 TOKEN HANDLING
     # ==================================================
     def _load_token(self):
-        if not os.path.exists(self.TOKEN_FILE):
+        if not self.TOKEN_FILE.exists():
             return None, 0
-        with open(self.TOKEN_FILE, "r") as f:
+        with open(self.TOKEN_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data.get("access_token"), data.get("generated_at", 0)
 
     def _save_token(self, token):
-        with open(self.TOKEN_FILE, "w") as f:
+        with open(self.TOKEN_FILE, "w", encoding="utf-8") as f:
             json.dump(
                 {
                     "access_token": token,
@@ -507,6 +510,9 @@ class DhanExpiredDataDownloader:
         out_dir="expired_monthly",
         api_delay=1.0,
         chunk_days=31,  # ✅ 31 calendar days (Dhan API accepts this per their example)
+        run_nse_after_ingest=True,
+        nse_start_date_filter=None,
+        nse_end_date_filter=None,
         ):
         """
         Chunk-wise download with automatic 31-day batching.
@@ -525,6 +531,7 @@ class DhanExpiredDataDownloader:
         os.makedirs(out_dir, exist_ok=True)
 
         monthly_rows = {}  # key = YYYY-MM, value = list of rows
+        saved_files = []
         
         # ✅ Split date range into 31-day chunks
         chunks = self._chunk_date_range(start_date, end_date, chunk_days)
@@ -569,15 +576,97 @@ class DhanExpiredDataDownloader:
 
             df.to_csv(file_path, index=False)
             print(f"✅ Saved {len(df)} rows → {file_path}")
+            saved_files.append(file_path)
 
         if not monthly_rows:
             print("⚠️ No data fetched for given period")
+            return
+
+        self._ingest_saved_csvs_to_db(out_dir=out_dir, saved_files=saved_files)
+        if run_nse_after_ingest:
+            self._run_nse_d_data_ingestion(
+                start_date_filter=nse_start_date_filter or start_date,
+                end_date_filter=nse_end_date_filter or end_date,
+            )
+
+    def _ingest_saved_csvs_to_db(self, out_dir: str, saved_files):
+        """
+        Push only newly saved CSV files into DuckDB using existing ingestion pipeline.
+        """
+        if not saved_files:
+            print("⚠️ No CSV files available for DB ingestion")
+            return
+
+        pipeline = None
+        try:
+            csv_dir = str(Path(out_dir).resolve())
+            print(f"🗄️ Starting DB ingestion for {len(saved_files)} file(s) from: {csv_dir}")
+
+            pipeline = OptionsIngestionPipeline(
+                db_path=DB_PATH,
+                csv_folder=csv_dir,
+                expiry_list_raw=EXPIRY_LIST_RAW,
+                underlying=UNDERLYING_SYMBOL,
+                exchange=EXCHANGE,
+            )
+            pipeline.connect()
+            pipeline.setup_schema()
+
+            for file_path in sorted(saved_files):
+                pipeline.process_csv_file(file_path)
+            print("✅ DB ingestion completed")
+        except Exception as e:
+            print(f"❌ DB ingestion failed: {e}")
+        finally:
+            try:
+                if pipeline is not None:
+                    pipeline.close()
+            except Exception:
+                pass
+
+    def _run_nse_d_data_ingestion(self, start_date_filter: str, end_date_filter: str):
+        """
+        Run NSE daily (D timeframe) ingestion after Dhan download + CSV ingestion.
+        """
+        try:
+            print(
+                f"🌐 Starting NSE D timeframe ingestion for range {start_date_filter} to {end_date_filter}..."
+            )
+            ingestor = NSEHistoricalIngestor(
+                DB_PATH,
+                start_date=start_date_filter,
+                end_date=end_date_filter,
+            )
+            ingestor.run()
+            print("✅ NSE D timeframe ingestion completed")
+        except Exception as e:
+            print(f"❌ NSE D timeframe ingestion failed: {e}")
+
+
+def resolve_runtime_date_range(mode: str, historical_start: str, historical_end: str):
+    """
+    LIVE mode  -> use today's date for both start/end.
+    HISTORICAL -> use configured start/end dates as-is.
+    """
+    mode_upper = (mode or "").strip().upper()
+    if mode_upper == "LIVE":
+        today = datetime.now().strftime("%Y-%m-%d")
+        return today, today
+    if mode_upper == "HISTORICAL":
+        return historical_start, historical_end
+    raise ValueError("MODE must be either 'LIVE' or 'HISTORICAL'")
 
 # ==================================================
 # 🚀 RUN
 # ==================================================
 if __name__ == "__main__":
     downloader = DhanExpiredDataDownloader()
+    runtime_start_date, runtime_end_date = resolve_runtime_date_range(
+        MODE, start_date, end_date
+    )
+    print(
+        f"🚦 MODE={MODE.upper()} | Using date range {runtime_start_date} to {runtime_end_date}"
+    )
 
     # Example: Full year download with automatic 31-day chunking
     # The script will automatically split "2024-01-01" to "2024-12-31" into ~12 chunks
@@ -589,13 +678,16 @@ if __name__ == "__main__":
     # Rate limit recommendations:
     # - api_delay: 1-2 seconds between API calls (per strike per side) 
     downloader.download_ladder_and_save(
-        start_date="2026-01-01",  # ✅ User can specify any date range
-        end_date="2026-02-06",    # ✅ Script auto-splits into 31-day chunks
+        start_date=runtime_start_date,  # ✅ LIVE: today, HISTORICAL: configured date
+        end_date=runtime_end_date,    # ✅ LIVE: today, HISTORICAL: configured date
         offsets=range(-10, 11),   # 10 strikes on each side of ATM (21 total)
-        expiry_flag="WEEK",
-        expiry_code=1,           
-        interval=1,              # 1-min; use 5 for 5-min
-        out_dir="expired_monthly",
+        expiry_flag= expiry_type,     # "WEEK" or "MONTH"
+        expiry_code= expiry_code,     # 1 for nearest expiry, 2 for next
+        interval= interval,              # 1-min; use 5 for 5-min
+        out_dir=out_dir,
         api_delay=1.5,           # ⏰ 1.5 seconds between each API call 
         chunk_days=31,           # ✅ 31 CALENDAR days = ~23 trading days per chunk
+        run_nse_after_ingest=True,
+        nse_start_date_filter=runtime_start_date,
+        nse_end_date_filter=runtime_end_date,
     )

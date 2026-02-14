@@ -25,9 +25,11 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 import logging
 from openalgo import api
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta, date, time as dt_time
 import time
 import threading
+import sqlite3
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 # Directly call the helper from MarketDataDispatcher
@@ -38,24 +40,12 @@ import sys
 from dataclasses import dataclass
 import os
 from openalgo import ta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import io
 import time
 import platform
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from logger import get_logger, log_trade_execution, set_strategy_name
-from db.expiry_list import EXPIRY_LIST_DDMMYYYY
-# ----------------------------
-# Global Constants
-os_name = platform.system()
-MARKET_OPEN  = dt_time(9, 15)   # 09:15 AM Market open time
-MARKET_CLOSE = dt_time(15, 20)  # 03:20 PM Market close time
-ENTRY_CUTOFF_TIME = dt_time(15, 00) # 03:00 PM No new entry orders after this time
 
-# dispatcher = MarketDataDispatcher()
-
-SIMULATION_DATE: Optional[str] = None            # Example: "28-11-2025" or None
 # ==============================================================  
 # MODE CONFIGURATION
 # ==============================================================
@@ -65,12 +55,73 @@ SIMULATION_DATE: Optional[str] = None            # Example: "28-11-2025" or None
 # - "BACKTESTING_RANGE": Multi-day simulation (NEW)
 
 MODE = "BACKTESTING_RANGE"  # Change this to switch modes # Example: LIVE or BACKTESTING or BACKTESTING_RANGE
-
 # ─────────────────────────────────────────────────────────────
 # BACKTESTING_RANGE Configuration (NEW)
 # ─────────────────────────────────────────────────────────────
-START_DATE: Optional[str] = "01-01-2025"  # DD-MM-YYYY format
-END_DATE: Optional[str] = "31-12-2025"    # DD-MM-YYYY format
+START_DATE: Optional[str] = "13-02-2026"  # DD-MM-YYYY format
+END_DATE: Optional[str] = "13-02-2026"    # DD-MM-YYYY format
+
+SYMBOL = "NIFTY"
+STRATEGY = "Scalping_" + SYMBOL
+# ============================================================================
+# 🎛️ LOGGING MODE CONFIGURATION
+# ============================================================================
+# Change LOGGING_MODE to switch between modes:
+#   "fast"   → Only warnings/errors (fastest, production)
+#   "normal" → INFO + warnings (development, debugging)
+#   "debug"  → Everything (deep troubleshooting)
+# ============================================================================
+
+LOGGING_MODE = "fast"  # ← CHANGE THIS ONE VARIABLE
+
+# ============================================================================
+
+# Auto-configure logging based on LOGGING_MODE
+if MODE in ["BACKTESTING", "BACKTESTING_RANGE"]:
+    if LOGGING_MODE == "fast":
+        os.environ['BACKTEST_MODE'] = 'true'
+        os.environ['FAST_BACKTEST'] = 'true'
+        print("🚀 FAST MODE: Minimal logs | Speed: ⚡⚡⚡")
+        
+    elif LOGGING_MODE == "normal":
+        os.environ['BACKTEST_MODE'] = 'true'
+        os.environ['FAST_BACKTEST'] = 'false'
+        print("📊 NORMAL MODE: INFO logs | Speed: ⚡⚡")
+        
+    elif LOGGING_MODE == "debug":
+        os.environ['BACKTEST_MODE'] = 'false'
+        os.environ['FAST_BACKTEST'] = 'false'
+        print("🔍 DEBUG MODE: All logs | Speed: ⚡")
+    else:
+        print("⚠️  Unknown LOGGING_MODE. Using FAST mode.")
+        os.environ['BACKTEST_MODE'] = 'true'
+        os.environ['FAST_BACKTEST'] = 'true'
+        
+elif MODE == "LIVE":
+    os.environ['BACKTEST_MODE'] = 'false'
+    os.environ['FAST_BACKTEST'] = 'false'
+    print("🔴 LIVE MODE: Full logging enabled")
+
+print(f"🔧 Environment: BACKTEST_MODE={os.getenv('BACKTEST_MODE')}, FAST_BACKTEST={os.getenv('FAST_BACKTEST')}")
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Ensure strategy name is available to the logger before it initialises
+os.environ.setdefault('STRATEGY', STRATEGY)
+from logger import get_logger, log_trade_execution, set_strategy_name
+from db.expiry_list import EXPIRY_LIST_DDMMYYYY
+set_strategy_name(STRATEGY)
+# Try importing talib
+
+TALIB_AVAILABLE = False
+    
+# ----------------------------
+# Global Constants
+os_name = platform.system()
+MARKET_OPEN  = dt_time(9, 15)   # 09:15 AM Market open time
+MARKET_CLOSE = dt_time(15, 20)  # 03:20 PM Market close time
+ENTRY_CUTOFF_TIME = dt_time(15, 00) # 03:00 PM No new entry orders after this time
+
+# dispatcher = MarketDataDispatcher()
 
 # ─────────────────────────────────────────────────────────────
 # BACKTESTING (Single Day) Configuration (EXISTING)
@@ -82,7 +133,7 @@ SIMULATION_DATE: Optional[str] = "31-12-2025"  # DD-MM-YYYY or None
 logging.info(f"🔧 Setting up API client based on OS {os_name}")
 if os_name.upper == "OS LINUX" or os_name.upper() == "LINUX":
     logging.info("💻 Running on Linux - using production API settings")
-    API_KEY = "45428a0d1b460d2b7a29cfcc71df97d296e63f6155a3a8282a741b5879fa99d9"
+    API_KEY = "076b15b4998ba741e0f12a49ef2befbd9cb11483a1a66fba50163c87a8453dc0"
     API_HOST = "https://myalgo.vralgo.com/"
     WS_URL = "wss://myalgo.vralgo.com/ws"
 else:
@@ -123,7 +174,7 @@ MIN_TP_SEPARATION_R = 0.5                         #Minimum TP separation ratio i
 
 LTP_BREAKOUT_ENABLED = True                         # enable / disable breakout waiting
 LTP_BREAKOUT_INTERVAL_MIN = 5                       # minutes to wait for LTP breakout confirmation
-ENTRY_BREAKOUT_MODE = "SPOT"                     # "SPOT" or "OPTIONS" (For breakout validation)
+ENTRY_BREAKOUT_MODE = "SPOT"                        # "SPOT" or "OPTIONS" (For breakout validation)
 
 # Indicators to compute
 EMA_PERIODS = [9, 20, 50, 200]                      #EMA Periods
@@ -147,8 +198,8 @@ SL_PERCENT = 0.25                 #12% of option premium
 MIN_REWARD_PCT_OF_RISK = 0.7      #At least 50% reward of risk
 MIN_REWARD_FOR_SL_MOVE = 0.7      #TSL Move only if reward is at least 50% of initial target 
 MIN_ABSOLUTE_REWARD = 15           #Minimum absolute reward in points
-ENTRY_CONFIRM_SECONDS = 5         #Seconds to confirm entry
-EXIT_CONFIRM_SECONDS = 5          #Seconds to confirm exit    
+ENTRY_CONFIRM_SECONDS = 1         #Seconds to confirm entry
+EXIT_CONFIRM_SECONDS = 1          #Seconds to confirm exit    
 SL_BUFFER_PCT = 0.15              #15% buffer from premium automatic SL placement in broker
 SL_BUFFER_POINT = 0               #Buffer in points from premium in CPR SL placement
 CPR_MIDPOINTS_ENABLED = False      #Enable CPR Midpoints for SL/TP calculation
@@ -165,7 +216,7 @@ OPTION_ENABLED = True               #Enable option trading
 OPTION_EXCHANGE = "NFO"             #Option exchange
 STRIKE_INTERVAL = 50                #Strike interval
 OPTION_EXPIRY_TYPE = "WEEKLY"       #Option expiry type
-OPTION_STRIKE_SELECTION = "OTM1"    # "ATM", "ITM1", "OTM1", etc.
+OPTION_STRIKE_SELECTION = "ATM"    # "ATM", "ITM1", "OTM1", etc.
 EXPIRY_LOOKAHEAD_DAYS = 30          #Expiry look ahead days
 LOT_QUANTITY =65                    #Lot size
 LOT = 1                             #Lot size
@@ -187,7 +238,7 @@ USE_OPTION_FOR_SLTP = False          # If True → uses option position LTP for 
 SL_TP_METHOD = "CPR_range_SL_TP" # current active method #CPR_range_SL_TP #Signal_candle_range_SL_TP
 TSL_ENABLED = False # enable trailing stoploss behavior
 TSL_METHOD = "TSL_CPR_range_SL_TP" # trailing method for this enhancement
-STRATEGY = "Scalping_" + SYMBOL
+
 # ===============================================================
 # 🔒 STOP LOSS AUTOMATION & ENTRY RESTRICTIONS
 # ===============================================================
@@ -225,7 +276,7 @@ IST = pytz.timezone("Asia/Kolkata")
 
 # Enhanced Logging System
 # Include strategy name in logfile (if provided) so filenames include strategy
-set_strategy_name(STRATEGY)
+
 # Module-specific loggers for detailed tracking
 main_logger = get_logger("trading_engine")
 signal_logger = get_logger("signals") 
@@ -238,6 +289,28 @@ data_logger = get_logger("market_data")
 # Keep original logger for backward compatibility
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("FixedSignalBot")
+
+# ==============================================================  
+def clear_trade_logs():
+    """
+    Clears the `my_trade_logs` table in the local SQLite database.
+    This ensures a clean slate for backtesting.
+    """
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        db_path = os.path.join(base_dir, "myalgo.db")
+        
+        # Connect and clear
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM my_trade_logs;")
+        conn.commit()
+        conn.close()
+        
+        main_logger.info(f"🧹 Trade logs cleared from {db_path} for new backtest.")
+    except Exception as e:
+        main_logger.error(f"❌ Failed to clear trade logs: {e}")
+
 # =========================================================
 # 🎮 SIMULATION INFRASTRUCTURE
 # =========================================================
@@ -255,7 +328,10 @@ class BacktestingManager:
         self.sim_index: int = 0  # next row to be emitted
         self.simulate_date_str: Optional[str] = None
         self.lock = threading.RLock()
+        self.lock = threading.RLock()
         self.pause_ticks = False
+        self.day_indices: Dict[date, Tuple[int, int]] = {} # Map date -> (start_idx, end_idx)
+        self.sim_end_index: int = 0  # current day end index
 
     def start(self, simulate_date_str: str, symbol: str, exchange: str, timeframe: str):
         """
@@ -364,6 +440,134 @@ class BacktestingManager:
             self.active = True
             main_logger.info(f"✅ Simulation loaded: {len(df)} ticks (1m) | {len(self.df_strategy_5m)} candles (5m)")
 
+    def start_range(self, start_date_str: str, end_date_str: str, symbol: str, exchange: str, timeframe: str):
+        """
+        Load 1-minute OHLC for the ENTIRE range and precompute day indices.
+        Also loads strategy data for the full range + lookback.
+        """
+        with self.lock:
+            start_dt = self._parse_date(start_date_str)
+            end_dt = self._parse_date(end_date_str)
+            main_logger.info(f"🎬 Loading simulation data for RANGE: {start_date_str} to {end_date_str}")
+            
+            # ─────────────────────────────────────────────────────────────
+            # 1. LOAD REPLAY DATA (1-minute, Full Range)
+            # ─────────────────────────────────────────────────────────────
+            start_date_fmt = start_dt.strftime("%Y-%m-%d")
+            end_date_fmt = end_dt.strftime("%Y-%m-%d")
+            
+            logger.info(f"🛰️ [Replay] Fetching 1-minute OHLC for range {start_date_fmt} - {end_date_fmt}")
+            
+            # 2️⃣ DuckDB FIRST
+            df = DB_MANAGER.get_ohlcv_data(
+                symbol=symbol,
+                exchange=exchange,
+                timeframe=timeframe,
+                start_date=start_date_fmt,
+                end_date=end_date_fmt
+                )
+            
+            # 3️⃣ API FALLBACK REMOVED
+            # User is 100% sure data is in DB. If not, stop.
+            if df is None or df.empty:
+                 main_logger.error(f"❌ No 1-minute data found in DB for range {start_date_fmt} to {end_date_fmt}")
+                 raise RuntimeError(f"Data missing in DB for range {start_date_fmt} to {end_date_fmt} (API fallback disabled)")
+
+            # Normalize
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df.reset_index()
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            if df["timestamp"].dt.tz is None:
+                df["timestamp"] = df["timestamp"].dt.tz_localize(IST)
+            else:
+                df["timestamp"] = df["timestamp"].dt.tz_convert(IST)
+
+            # Filter market hours for safety
+            start_time = datetime.strptime("09:15", "%H:%M").time()
+            df = df[df["timestamp"].dt.time >= start_time].reset_index(drop=True)
+            
+            if df.empty:
+                raise RuntimeError("No usable 1-minute candles after filtering market hours")
+
+            self.df = df
+            
+            # ─────────────────────────────────────────────────────────────
+            # 2. PRECOMPUTE DAY INDICES
+            # ─────────────────────────────────────────────────────────────
+            self.day_indices.clear()
+            # Group by date to find start/end indices
+            # df is sorted by timestamp
+            df['date'] = df['timestamp'].dt.date
+            
+            # Find first and last index for each date
+            # This is much faster than filtering dataframe every day
+            day_groups = df.groupby('date').indices
+            
+            for d, indices in day_groups.items():
+                if len(indices) > 0:
+                    start_idx = int(indices[0])
+                    end_idx = int(indices[-1]) + 1 # Exclusive end for slicing/range
+                    self.day_indices[d] = (start_idx, end_idx)
+            
+            main_logger.info(f"✅ Indexed {len(self.day_indices)} trading days from {len(df)} candles")
+
+            # ─────────────────────────────────────────────────────────────
+            # 3. LOAD STRATEGY DATA (5-minute, Full Range + Lookback)
+            # ─────────────────────────────────────────────────────────────
+            # Lookback from START date
+            history_start_dt = start_dt - timedelta(days=LOOKBACK_DAYS)
+            history_start_str = history_start_dt.strftime("%Y-%m-%d")
+            
+            logger.info(f"🛰️ [Strategy] Caching {CANDLE_TIMEFRAME} data: {history_start_str} to {end_date_fmt}")
+            
+            df_5m = DB_MANAGER.get_ohlcv_data(
+                symbol=symbol,
+                exchange=exchange,
+                timeframe=CANDLE_TIMEFRAME,
+                start_date=history_start_str,
+                end_date=end_date_fmt
+            )
+            
+            # normalize 5m cache
+            if df_5m is not None and not df_5m.empty:
+                if isinstance(df_5m.index, pd.DatetimeIndex):
+                    df_5m = df_5m.reset_index()
+                df_5m["timestamp"] = pd.to_datetime(df_5m["timestamp"])
+                if df_5m["timestamp"].dt.tz is None:
+                    df_5m["timestamp"] = df_5m["timestamp"].dt.tz_localize(IST)
+                else:
+                    df_5m["timestamp"] = df_5m["timestamp"].dt.tz_convert(IST)
+                
+                df_5m = df_5m.sort_values("timestamp").reset_index(drop=True)
+                self.df_strategy_5m = df_5m
+                logger.info(f"💾 [Strategy] Cached {len(df_5m)} rows ({CANDLE_TIMEFRAME}) for fast slicing")
+            else:
+                 logger.warning("⚠️ [Strategy] Could not preload 5m history. get_intraday() may fail.")
+                 self.df_strategy_5m = pd.DataFrame()
+
+            self.active = True
+            
+    def set_day(self, trade_date: date) -> bool:
+        """
+        Prepare BacktestingManager for a specific day from the preloaded range.
+        Returns True if data exists for the day, False otherwise.
+        """
+        with self.lock:
+            if not self.active or self.df is None:
+                return False
+                
+            if trade_date not in self.day_indices:
+                main_logger.warning(f"⚠️ No data indexed for {trade_date}")
+                return False
+                
+            start_idx, end_idx = self.day_indices[trade_date]
+            self.sim_index = start_idx
+            self.sim_end_index = end_idx # Exclusive
+            self.simulate_date_str = trade_date.strftime("%d-%m-%Y")
+            
+            main_logger.info(f"🔄 Switched to day {trade_date} | Rows {start_idx} to {end_idx} ({end_idx - start_idx} ticks)")
+            return True
+
     def get_data_slice(self, current_time: datetime) -> pd.DataFrame:
         """
         Return cached 5m data up to current_time (inclusive).
@@ -437,6 +641,8 @@ class BacktestingManager:
             self.df_strategy_5m = None
             self.option_cache.clear()
             self.sim_index = 0
+            self.sim_end_index = 0
+            self.day_indices.clear()
             self.simulate_date_str = None
             main_logger.info("🛑 Simulation stopped")
 
@@ -522,7 +728,12 @@ class DateReplayClient:
             logger.info(f"DateReplayClient replay starting ({instrument_type}) at index {idx}")
             
             # MAIN REPLAY LOOP
-            while idx < len(df) and not self._stop_event.is_set() and self.BACKTESTING_MANAGER.active:
+            # Use sim_end_index if set (Range Mode), else end of df (Single Day Mode)
+            end_limit = getattr(self.BACKTESTING_MANAGER, 'sim_end_index', 0)
+            if end_limit == 0:
+                 end_limit = len(df)
+            
+            while idx < end_limit and not self._stop_event.is_set() and self.BACKTESTING_MANAGER.active:
                 
                 # SIMULATION PAUSE DURING EXIT
                 while self.BACKTESTING_MANAGER.pause_ticks:
@@ -615,17 +826,16 @@ class DateReplayClient:
                         run_strategy = True
 
                     if run_strategy and (ts.minute % SIGNAL_CHECK_INTERVAL == 0 and ts.second == 0):
-                        main_logger.info(f"⏰ Signal trigger at {ts.strftime('%H:%M:%S')}")
+                        # main_logger.debug(f"⏰ Signal trigger at {ts.strftime('%H:%M:%S')}")
                         
                         # 🔧 PRE-CHECK: Validate breakout expiry BEFORE strategy evaluation
-                        # This prevents "STALE DATA" warnings when breakout window expires at signal time
                         if strategy_fn and hasattr(strategy_fn, '__self__'):
                             bot = strategy_fn.__self__
                             
                             # Check ENTRY breakout expiry
                             if hasattr(bot, 'pending_breakout_expiry') and bot.pending_breakout_expiry:
                                 if ts >= bot.pending_breakout_expiry:
-                                    signal_logger.info("❌ Entry breakout window expired (pre-check) | clearing pending signal.")
+                                    # signal_logger.info("❌ Entry breakout window expired (pre-check) | clearing pending signal.")
                                     
                                     # Unsubscribe from option LTP if subscribed
                                     if hasattr(bot, 'option_symbol') and bot.option_symbol:
@@ -639,7 +849,7 @@ class DateReplayClient:
                             # Check EXIT breakout expiry
                             if hasattr(bot, 'pending_exit_breakout_expiry') and bot.pending_exit_breakout_expiry:
                                 if ts >= bot.pending_exit_breakout_expiry:
-                                    signal_logger.info("❌ Exit breakout window expired (pre-check) | clearing.")
+                                    # signal_logger.info("❌ Exit breakout window expired (pre-check) | clearing.")
                                     bot.pending_exit_breakout = None
                                     bot.exit_breakout_side = None
                                     bot.reset_timer()
@@ -666,8 +876,17 @@ class DateReplayClient:
         # -------------------------------------------------------------
         # LOOP END — only stop when ALL candles replayed
         # -------------------------------------------------------------
-            if idx >= len(df):
+            # LOOP END — only stop when ALL candles replayed for the current day
+        # -------------------------------------------------------------
+            if idx >= end_limit:
                 main_logger.info("🏁 Replay completed — all candles processed.")
+                
+                # [FIX] In Range Mode, do NOT kill the bot/manager here.
+                # Let replay_range handle the loop day-by-day.
+                if MODE == "BACKTESTING_RANGE":
+                     main_logger.info("🏁 Day completed (Range Mode). Thread exiting naturally.")
+                     return
+
                 with self.BACKTESTING_MANAGER.lock:
                     self.BACKTESTING_MANAGER.active = False
                 self._stop_event.set()
@@ -689,6 +908,70 @@ class DateReplayClient:
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
         logger.info("🚀 DateReplayClient started replay thread")
+
+    def replay_range(self, trading_days: List[date], bot):
+        """
+        Drive the multi-day backtest loop from within the same process/thread.
+        """
+        logger.info(f"🚀 DateReplayClient starting RANGE replay for {len(trading_days)} days")
+        
+        self._stop_event.clear()
+        
+        for idx, trade_date in enumerate(trading_days, 1):
+            if self._stop_event.is_set():
+                break
+                
+            day_str = trade_date.strftime("%d-%m-%Y")
+            main_logger.info("")
+            main_logger.warning(f"📆 DAY {idx}/{len(trading_days)}: {day_str}")
+            
+            # 1. Reset Bot State
+            bot.reset_daily_state()
+            
+            # 2. Set Data Range
+            has_data = self.BACKTESTING_MANAGER.set_day(trade_date)
+            if not has_data:
+                continue
+                
+            # 3. Simulate Day
+            self._run_day_sync(bot)
+            
+            # 4. EOD Cleanup (Force close positions if any remain)
+            # Strategy usually auto-exits at 15:15 or 15:20, but we ensure here
+            if bot.position:
+                main_logger.info(f"⚠️ EOD Forced Exit needed for {day_str}")
+                bot.exit_all_positions()
+                
+        main_logger.info("🏁 Range Replay Completed.")
+        # Do not shut down bot here, let run() method handle finalization or return
+        
+    def _run_day_sync(self, bot):
+        """
+        Run the replay loop synchronously for the current day setup in Manager.
+        This effectively replaces `_run` but runs in the main flow for range backtest.
+        """
+        # Re-use the existing _run logic but we need to call it or extract it.
+        # Since _run is a local function in subscribe_ltp, we need to adapt structure.
+        # Ideally, refactor _run to be a method. 
+        # For now, I will use subscribe_ltp which starts a thread, and join it.
+        # But wait, subscribe_ltp expects `on_data_received`.
+        
+        # In Range Mode, we call subscribe_ltp ONCE at the start?
+        # No, because subscribe_ltp starts a thread.
+        # Better approach: We need a synchronous version or we wait for the thread.
+        
+        # Let's rely on the existing subscribe_ltp structure but "Wait" for it to finish the day.
+        
+        # Start the thread for THIS day
+        self.subscribe_ltp(
+            instrument_type="SPOT",
+            on_data_received=bot.on_ltp_update,
+            strategy_fn=bot.strategy_job
+        )
+        
+        # Join the thread to wait for day completion
+        if self._thread and self._thread.is_alive():
+             self._thread.join()
         
     def unsubscribe_ltp(self, instruments):
         logger.info("🔌 DateReplayClient.unsubscribe_ltp() unsubscribing")
@@ -741,16 +1024,16 @@ def normalize_df(raw):
 # Simulation instances for Market Spot data OHLC
 if MODE in ["BACKTESTING", "BACKTESTING_RANGE"] and SIMULATION_DATE is not None:
     main_logger.info(f"🚀 Starting in BACKTESTING mode for date {SIMULATION_DATE}")
-    from db.database_main import get_database_manager
+    from db.database_main import DatabaseManager
     BACKTESTING_MANAGER = BacktestingManager()
     REPLAY_CLIENT = DateReplayClient(BACKTESTING_MANAGER)
-    DB_MANAGER = get_database_manager(read_only=True)
+    DB_MANAGER = DatabaseManager(read_only=True)
 else:
     main_logger.info("🚀 Starting in LIVE mode")
-    from db.database_main import get_database_manager
+    from db.database_main import DatabaseManager
     BACKTESTING_MANAGER = BacktestingManager()  # inactive in live mode
     REPLAY_CLIENT = None
-    DB_MANAGER = get_database_manager(read_only=True)
+    DB_MANAGER = DatabaseManager(read_only=True)
 # =========================================================
 # 📘 SQLAlchemy Dataclass Setup for Trade Logging
 # =========================================================
@@ -965,6 +1248,7 @@ class MYALGO_TRADING_BOT:
         self.tsl_enabled = False
         self.cached_dyn_spot = None
         self.cached_dyn_option = None
+        self.dynamic_indicators_cache = {}  # Cache for pre-calculated strategy indicators
         self.cached_last_close = None
 
         # 🎯 Log mode selection
@@ -1000,6 +1284,83 @@ class MYALGO_TRADING_BOT:
                 main_logger.debug(f"  Target Method: {DYNAMIC_TARGET_METHOD}")
                 main_logger.debug(f"  Valid Target Levels: {', '.join(VALID_TARGET_LEVELS)}")
             main_logger.debug("===============================")
+
+    def reset_daily_state(self):
+        """
+        Reset state for a new trading day in BACKTESTING_RANGE mode.
+        """
+        main_logger.info("🔄 [Daily Reset] Clearing bot state for new day")
+        with self._state_lock:
+            # 1. Trade State
+            self.trade_count = 0
+            self.position = None
+            self.entry_price = 0.0
+            self.spot_entry_price = 0.0
+            self.option_entry_price = 0.0
+            self.stoploss_price = 0.0
+            self.target_price = 0.0
+            self.option_stop_loss = 0.0
+            self.initial_stoploss_price = 0.0
+            self.exit_in_progress = False
+            self.option_symbol = None
+            self.ltp = None
+            self.option_ltp = None
+
+            # 2. Breakout State
+            self.pending_breakout = None
+            self.pending_breakout_expiry = None
+            self.breakout_side = None
+            self.entry_breakout_candle_count = 0
+            self.exit_breakout_candle_count = 0
+            self.pending_exit_breakout = None
+            self.pending_exit_breakout_expiry = None
+            self.exit_breakout_side = None
+            
+            # 3. Timers
+            self.reset_timer()
+
+            # 4. CPR / Strategy State
+            self.cpr_active = False
+            self.cpr_levels_sorted = []
+            self.cpr_targets = []
+            self.cpr_tp_hit_count = 0
+            self.cpr_sl = 0.0
+            self.cpr_side = None
+            self.current_tp_index = 0
+            self.cpr_tp_hits = []
+            self.dynamic_target_info = None
+            self.excluded_pivots_info = None
+            
+            # 5. Gatekeeper
+            self.ltp_pivot_breakout = False
+            self.ltp_pivot_info = None
+            self.gk_resistance_pivot = None
+            self.gk_support_pivot = None
+            
+            # 6. Trailing
+            self.trailing_levels = []
+            self.trailing_index = 0
+            
+            # 7. Data Cache
+            self.static_indicators = None
+            self.static_indicators_date = None
+            self.current_day_high = None
+            self.current_day_low = None
+            self.option_1m_df = None
+            self.expiry_cache = {"date": None, "is_expiry": False, "expiry_dt": None}
+            self.cached_dyn_spot = None
+            self.cached_dyn_option = None
+            self.cached_last_close = None
+            self.dynamic_indicators_option = None
+            
+            # 8. Intrabar
+            self._option_intrabar_stage = 0
+            self._last_option_candle_ts = None
+            self.last_ltp_time = {}
+            
+        # Reset threading events
+        self.stop_event.clear()
+        self.running = True
 
     # =========================================================
     # 💰 Auto PnL Reconciliation Helper
@@ -1081,11 +1442,17 @@ class MYALGO_TRADING_BOT:
             # 🎯 Use get_now() for proper timestamp (simulated or real)
             current_time = get_now()
             
-            if BACKTESTING_MANAGER.active:
-                signal_logger.info(f"⏰ Strategy check (SIMULATED): {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            # if BACKTESTING_MANAGER.active:
+                # signal_logger.debug(f"⏰ Strategy check (SIMULATED): {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
             
             # If reached daily trade limit, initiate graceful shutdown
             if not self.position and self.trade_count >= MAX_TRADES_PER_DAY:
+                
+                # FIX: In Range Mode, do not kill the bot/process. Just stop taking new trades.
+                if MODE == "BACKTESTING_RANGE":
+                    #  logger.debug(f"Max trades reached ({self.trade_count}). Idling for remainder of day (Range Mode).")
+                     return
+
                 logger.info("Max trades reached (%d). Initiating graceful shutdown.", MAX_TRADES_PER_DAY)
                 self.shutdown_gracefully()
                 return
@@ -1099,9 +1466,14 @@ class MYALGO_TRADING_BOT:
 
             # ENTRY: only attempt if no open position
             if not self.position and not self.exit_in_progress:
-                intraday = self.get_intraday()
+                intraday = self.get_intraday(
+                            days=LOOKBACK_DAYS, 
+                            symbol=self.spot_symbol, 
+                            exchange=self.spot_exchange,
+                            timeframe=CANDLE_TIMEFRAME,
+                            instrument_type="SPOT")
                 if intraday.empty:
-                    logger.debug("No intraday data")
+                    logger.warning("No intraday data")
                 else:
                     signal = self.check_entry_signal(intraday)
                     if (LTP_BREAKOUT_ENABLED and self.pending_breakout):
@@ -1143,6 +1515,12 @@ class MYALGO_TRADING_BOT:
                     self.place_exit_order(reason)
                 else:
                     threading.Thread(target=self.place_exit_order, args=(reason,), daemon=True).start()
+                
+                # FIX: In BACKTESTING_RANGE, do not kill the bot on market close. 
+                # Let the replay client finish the day's ticks and loop to the next day.
+                if MODE == "BACKTESTING_RANGE":
+                    return
+
                 self.shutdown_gracefully()
                 return
 
@@ -1572,7 +1950,12 @@ class MYALGO_TRADING_BOT:
                     signal_logger.info(f"⏳ Verifying BUY breakout after {elapsed:.1f}s @ {current_spot_ltp:.2f}")
                     if current_spot_ltp > high:
                         signal_logger.info(f"🚀 ENTRY BREAKOUT CONFIRMED AT (CALL SIDE) AFTER {elapsed:.1f}s @ {current_spot_ltp:.2f}")
-                        intraday = self.get_intraday()
+                        intraday = self.get_intraday(
+                            days=LOOKBACK_DAYS, 
+                            symbol=self.spot_symbol, 
+                            exchange=self.spot_exchange,
+                            timeframe=CANDLE_TIMEFRAME,
+                            instrument_type="SPOT")
                         self.place_entry_order("BUY", intraday)
                         self.reset_timer()
                         self.reset_pending_breakout()
@@ -1638,7 +2021,12 @@ class MYALGO_TRADING_BOT:
                 if elapsed >= ENTRY_CONFIRM_SECONDS:
                     if self.ltp < low:
                         signal_logger.info(f"🚀 ENTRY BREAKOUT CONFIRMED AT (PUT SIDE) AFTER {elapsed:.1f}s @ {self.ltp:.2f}")
-                        intraday = self.get_intraday()
+                        intraday = self.get_intraday(
+                            days=LOOKBACK_DAYS, 
+                            symbol=self.spot_symbol, 
+                            exchange=self.spot_exchange,
+                            timeframe=CANDLE_TIMEFRAME,
+                            instrument_type="SPOT")
                         self.place_entry_order("SELL", intraday)
                         self.reset_pending_breakout()
                         return
@@ -1649,7 +2037,7 @@ class MYALGO_TRADING_BOT:
                         return
             else:
                 # Fell back below breakout → reset
-                signal_logger.info("❌ SELL breakout fell back - resetting timer")
+                # signal_logger.info("❌ SELL breakout fell back - resetting timer")
                 self.reset_timer()
                 return
         # --------------------------
@@ -1739,7 +2127,7 @@ class MYALGO_TRADING_BOT:
             now_str = current_time.strftime("%H:%M:%S")
             # 🎯 Only log LTP in SIMULATED mode
             if BACKTESTING_MANAGER.active:
-                logger.debug(f"LTP: {self.ltp} {timestamp}")  # DEBUG: Tick-level data
+                # logger.debug(f"LTP: {self.ltp} {timestamp}")  # DEBUG: Tick-level data (DISABLED for performance)
                 ltp = data.get("ltp") or (data.get("data") or {}).get("ltp")
             else:
                 self.last_ws_tick_time = time.time()
@@ -1749,7 +2137,7 @@ class MYALGO_TRADING_BOT:
                 opt_ltp = self._update_option_ltp_from_df(current_time)
                 if opt_ltp is not None:
                     self.option_ltp = opt_ltp
-                    logger.debug(f"Option LTP: {self.option_ltp} {timestamp}")  # DEBUG: Tick-level data
+                    # logger.debug(f"Option LTP: {self.option_ltp} {timestamp}")  # DEBUG: Tick-level data (DISABLED for performance)
                 else:
                     position_logger.info(f"Option LTP not found in DataFrame for {self.option_symbol} at {current_time}")
             # Update LTP for spot breakout confirmation
@@ -2073,14 +2461,31 @@ class MYALGO_TRADING_BOT:
                 self.client.connect()
                 main_logger.info("🎬 Starting simulation replay...")
                 REPLAY_CLIENT.bot_ref = self
-                REPLAY_CLIENT.subscribe_ltp(
-                    self.instrument,
-                    on_data_received=self.on_ltp_update,
-                    strategy_fn=self.strategy_job,
-                )
-                # Keep alive until sim stops
-                while BACKTESTING_MANAGER.active and self.running and not self.stop_event.is_set():
-                    time.sleep(0.2)
+                
+                if MODE == "BACKTESTING_RANGE":
+                     # Clear logs before starting
+                     clear_trade_logs()
+                     # Use the pre-indexed days from Manager
+                     # Use the pre-indexed days from Manager
+                     days = sorted(BACKTESTING_MANAGER.day_indices.keys())
+                     if not days:
+                         main_logger.error("❌ No days indexed for BACKTESTING_RANGE")
+                         return
+                     main_logger.warning(f"🔄 Backtesting  {len(days)} days")
+                     REPLAY_CLIENT.replay_range(days, self)
+                     main_logger.info("✅ Multi-day backtesting range completed. Stopping bot.")
+                     self.running = False 
+                     self.stop_event.set()
+                else:
+                    # Single day
+                    REPLAY_CLIENT.subscribe_ltp(
+                        self.instrument,
+                        on_data_received=self.on_ltp_update,
+                        strategy_fn=self.strategy_job,
+                    )
+                    # Keep alive until sim stops
+                    while BACKTESTING_MANAGER.active and self.running and not self.stop_event.is_set():
+                        time.sleep(0.2)
             else:
                 # 🎯 LIVE MODE: robust websocket with retry
                 self.ws_should_run = True
@@ -2239,7 +2644,7 @@ class MYALGO_TRADING_BOT:
                     return result
 
                 logger.warning(f"⚠️ {description} returned empty on attempt {attempt}")
-                time.sleep(delay)
+                time.sleep(delay+2) # Slightly longer delay for empty response cases
             except Exception as e:
                 logger.warning(f"⚠️ {description} failed on attempt {attempt}: {e}")
                 if attempt < max_retries:
@@ -2254,7 +2659,221 @@ class MYALGO_TRADING_BOT:
     # ==========================================================
     # 🧠 Get intraday candle
     # ==========================================================
-    def get_intraday(self, days=LOOKBACK_DAYS, symbol=SYMBOL, exchange=EXCHANGE, instrument_type="SPOT") -> pd.DataFrame:
+    def _talib_ema_apply_func(self, close: np.ndarray, period: int) -> np.ndarray:
+        """
+        Implementation of EMA matching pandas ewm(span=period, adjust=False).
+        """
+        close = np.asarray(close, dtype=np.float64).flatten()
+        period = int(period)
+        alpha = 2 / (period + 1)
+        ema = np.empty_like(close)
+        
+        if len(close) > 0:
+            ema[0] = close[0]
+            for i in range(1, len(close)):
+                ema[i] = alpha * close[i] + (1 - alpha) * ema[i - 1]
+        return ema
+
+    def _calculate_sma_numpy(self, close: np.ndarray, period: int) -> np.ndarray:
+        """Vectorized SMA calculation using numpy."""
+        ret = np.cumsum(close, dtype=float)
+        ret[period:] = ret[period:] - ret[:-period]
+        return ret[period - 1:] / period
+
+    def _calculate_rsi_numpy(self, close: np.ndarray, period: int) -> np.ndarray:
+        """Vectorized RSI calculation matches standard logic."""
+        delta = np.diff(close)
+        gain = np.where(delta > 0, delta, 0.0)
+        loss = np.where(delta < 0, -delta, 0.0)
+
+        avg_gain = np.full_like(close, np.nan)
+        avg_loss = np.full_like(close, np.nan)
+
+        if len(gain) >= period:
+            avg_gain[period] = np.mean(gain[:period])
+            avg_loss[period] = np.mean(loss[:period])
+
+            # Use simple loop for wilder's smoothing to match standard RSI
+            for i in range(period + 1, len(close)):
+                avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gain[i - 1]) / period
+                avg_loss[i] = (avg_loss[i - 1] * (period - 1) + loss[i - 1]) / period
+
+        rs = avg_gain / np.where(avg_loss == 0, 1e-10, avg_loss)
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+    def _precalculate_strategy_indicators(self):
+        """
+        Pre-calculate strategy indicators (EMA, SMA, RSI) for the entire BACKTESTING_RANGE.
+        Stores results in self.dynamic_indicators_cache keyed by the timestamp of the last completed candle.
+        """
+        if not BACKTESTING_MANAGER.active:
+            return
+
+        # Access the strategy timeframe data (generic naming as requested)
+        # Using 5m as default source per existing logic, but generalizing naming
+        df = BACKTESTING_MANAGER.df_strategy_5m
+        
+        if df is None or df.empty:
+            logger.warning("No strategy data (5m) available for pre-calculation.")
+            return
+            
+        # Ensure TALIB_AVAILABLE is accessible or defined
+        global TALIB_AVAILABLE 
+
+        logger.info("⚡ Pre-calculating strategy indicators for backtesting...")
+        
+        # Convert to numpy arrays
+        close = df['close'].to_numpy(dtype=np.float64)
+        open_ = df['open'].to_numpy(dtype=np.float64)
+        high = df['high'].to_numpy(dtype=np.float64)
+        low = df['low'].to_numpy(dtype=np.float64)
+        if isinstance(df.index, pd.DatetimeIndex):
+            timestamps = df.index
+        else:
+            # If index is not datetime (e.g. range index), try 'timestamp' column or convert
+            if 'timestamp' in df.columns:
+                 timestamps = pd.to_datetime(df['timestamp'])
+            else:
+                 # Attempt to convert index
+                 timestamps = pd.to_datetime(df.index)
+
+        cache = {}
+        
+        # Pre-calculate indicators using vectorized functions
+        indicators = {}
+        
+        # EMAs
+        for p in EMA_PERIODS:
+            try:
+                # Use talib if available
+                if TALIB_AVAILABLE:
+                    indicators[f"EMA_{p}"] = self._talib_ema_apply_func(close, p)
+                else:
+                    # Fallback to pandas/numpy if desired, but _talib_ema_apply_func is currently implemented 
+                    # with specific logic. Assuming it handles fallback or calculation.
+                    # Actually _talib_ema_apply_func likely USES talib if available or pandas.
+                    # Let's just call it.
+                     indicators[f"EMA_{p}"] = self._talib_ema_apply_func(close, p)
+            except Exception as e:
+                logger.error(f"Error pre-calculating EMA_{p}: {e}")
+
+        # SMAs
+        for p in SMA_PERIODS:
+            sma = np.full_like(close, np.nan)
+            cs = np.cumsum(close)
+            # Fix: use 'p' instead of 'period'
+            cs[p:] = cs[p:] - cs[:-p]
+            sma[p-1:] = cs[p-1:] / p
+            indicators[f"SMA_{p}"] = sma
+
+        # RSIs
+        for p in RSI_PERIODS:
+            indicators[f"RSI_{p}"] = self._calculate_rsi_numpy(close, p)
+
+        # Previous Candle OHLC (for logic that uses 'previous candle' relative to the *last completed*)
+        # compute_dynamic_indicators returns "last_candle": df.iloc[-2].to_dict()
+        # So for a row at index `i`, "last_candle" is the candle at `i`.
+        # Wait, compute_dynamic_indicators(df) where df is sliced to current time.
+        # It takes `df.iloc[-2]`.
+        # If we are looking up the cache for `target_ts`, that `target_ts` IS the timestamp of `df.iloc[-2]`.
+        # So the values we store for `target_ts` should be the values calculated AT `target_ts`.
+        # Correct.
+
+        # Populate cache
+        # Each row i corresponds to a timestamp T. 
+        # The indicators calculated at index i are valid for that completed candle T.
+        
+        current_date_tracker = None
+        # Delayed trackers to match legacy `iloc[:-3]` logic (Excludes Signal Candle AND Prev Candle)
+        day_high_current = -float('inf')
+        day_low_current = float('inf')
+        
+        day_high_prev = -float('inf')
+        day_low_prev = float('inf')
+        
+        day_open = 0.0
+
+        for i, ts in enumerate(timestamps):
+             # 1. Tracker for Previous Candle
+             if i > 0:
+                 prev_row = {
+                     "open": float(open_[i-1]),
+                     "high": float(high[i-1]),
+                     "low": float(low[i-1]),
+                     "close": float(close[i-1]),
+                     "volume": 0,
+                     "date": timestamps[i-1]
+                 }
+             else:
+                 prev_row = {} 
+             
+             # 2. Tracker for Day High/Low
+             t_date = ts.date()
+             if t_date != current_date_tracker:
+                  current_date_tracker = t_date
+                  # Reset for new day
+                  day_high_current = -float('inf')
+                  day_low_current = float('inf')
+                  day_high_prev = -float('inf')
+                  day_low_prev = float('inf')
+                  day_open = float(open_[i])
+             
+             # Capture stats BEFORE updating (using PREV state to achieve lag)
+             # Matches `iloc[:-3]` on DF [..., Prev, Signal, Forming]
+             # Which excludes Signal (i) and Prev (i-1).
+             # So we use stats from 0..i-2.
+             
+             dh_val = day_high_prev
+             dl_val = day_low_prev
+             
+             row_data = {
+                 "last_candle": {
+                    "open": float(open_[i]),
+                    "high": float(high[i]),
+                    "low": float(low[i]),
+                    "close": float(close[i]),
+                    "volume": 0,
+                    "date": ts
+                 },
+                 "prev_candle": prev_row,
+                 "current_day_open": day_open,
+                 "current_day_high": dh_val if dh_val != -float('inf') else None,
+                 "current_day_low": dl_val if dl_val != float('inf') else None
+             }
+
+             # Update running stats
+             # 1. Push current state to prev (for next iteration's use)
+             day_high_prev = day_high_current
+             day_low_prev = day_low_current
+             
+             # 2. Update current state with this candle i
+             day_high_current = max(day_high_current, float(high[i]))
+             day_low_current = min(day_low_current, float(low[i]))
+
+             # Add calculated indicators
+             for name, arr in indicators.items():
+                val = arr[i]
+                if not np.isnan(val):
+                    row_data[name] = float(val)
+                else:
+                    row_data[name] = None
+
+             # Mirror compute_dynamic_indicators: RSI_PREV_{p} should represent the candle
+             # immediately before the cached "last_candle" timestamp.
+             for p in RSI_PERIODS:
+                 prev_val = indicators[f"RSI_{p}"][i - 1] if i > 0 else np.nan
+                 if not np.isnan(prev_val):
+                     row_data[f"RSI_PREV_{p}"] = float(prev_val)
+                 else:
+                     row_data[f"RSI_PREV_{p}"] = None
+            
+             cache[ts] = row_data
+
+        self.dynamic_indicators_cache = cache
+        logger.info(f"✅ Pre-calculation complete. Cached {len(cache)} candles.")
+
+    def get_intraday(self, days=LOOKBACK_DAYS, symbol=SYMBOL, exchange=EXCHANGE, timeframe=CANDLE_TIMEFRAME, instrument_type="SPOT") -> pd.DataFrame:
         """
         Fetch intraday OHLC data.
         ✅ Works identically in LIVE and SIMULATION modes
@@ -2272,7 +2891,7 @@ class MYALGO_TRADING_BOT:
             start_date = end_date - timedelta(days=days)
             base_client = client  # always use base client
             
-            order_logger.info(f"Fetching intraday: {symbol} {exchange} | {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+            order_logger.info(f"Fetching intraday [{MODE}]: {symbol} | {exchange} | {instrument_type} | {timeframe} | {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
             
             # ==========================================================
             # 🧠 SIMULATION MODE
@@ -2411,16 +3030,16 @@ class MYALGO_TRADING_BOT:
             # ==========================================================
             else:
                 try:
-                    data_logger.info(f"[LIVE MODE] Fetching intraday {symbol} {exchange}")
+                    # data_logger.info(f"[LIVE MODE] Fetching intraday {symbol} {exchange} {instrument_type} {timeframe} | {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
                     
                     raw = self.retry_api_call(
                         func=base_client.history,
                         max_retries=3,
-                        delay=2,
+                        delay=3,
                         description="Intraday History Fetch",
                         symbol=symbol,
                         exchange=exchange,
-                        interval=CANDLE_TIMEFRAME,
+                        interval=timeframe,
                         start_date=start_date.strftime("%Y-%m-%d"),
                         end_date=end_date.strftime("%Y-%m-%d")
                     )
@@ -2633,7 +3252,7 @@ class MYALGO_TRADING_BOT:
                 df = df.reset_index().set_index("timestamp")
 
             if interval == "W":
-                df = df.resample("W").agg({
+                df = df.resample("W-MON").agg({
                     "open": "first",
                     "high": "max",
                     "low": "min",
@@ -2642,7 +3261,7 @@ class MYALGO_TRADING_BOT:
                 }).dropna()
 
             elif interval == "M":
-                df = df.resample("M").agg({
+                df = df.resample("ME").agg({
                     "open": "first",
                     "high": "max",
                     "low": "min",
@@ -2774,6 +3393,22 @@ class MYALGO_TRADING_BOT:
             indicators_logger.warning("Empty intraday DataFrame - cannot compute dynamic indicators")
             return dyn
 
+        # ---------------------------
+        # ⚡ CACHE CHECK (Backtesting)
+        # ---------------------------
+        if BACKTESTING_MANAGER.active and self.dynamic_indicators_cache:
+             if len(intraday_df) >= 2:
+                 # The strategy uses the last completed candle (index -2)
+                 target_ts = intraday_df.index[-2] 
+                 if target_ts in self.dynamic_indicators_cache:
+                      cached = self.dynamic_indicators_cache[target_ts]
+                      # 🛡️ VALIDATION: Ensure we are serving cache for the same instrument (SPOT)
+                      # by comparing Close price. Avoids serving Spot cache for Options.
+                      cached_close = cached["last_candle"]["close"]
+                      current_close = intraday_df["close"].iloc[-2]
+                      if abs(cached_close - current_close) < 0.1:
+                           return cached
+
         df = intraday_df.copy()
         for col in ["open", "high", "low", "close"]:
             if col in df.columns:
@@ -2806,6 +3441,7 @@ class MYALGO_TRADING_BOT:
             rs = roll_up / roll_down.replace(0, 1e-8)
             rsi_series = 100.0 - (100.0 / (1.0 + rs))
             dyn[f"RSI_{p}"] = float(rsi_series.iloc[-2])
+            dyn[f"RSI_PREV_{p}"] = float(rsi_series.iloc[-3])
 
         # ---------------------------------------------------
         # VWAP using OHLCV of configured symbol/exchange/interval
@@ -2895,7 +3531,7 @@ class MYALGO_TRADING_BOT:
             current_ltp = self.ltp if self.ltp else 0.0
             signal_logger.info(f"Current Position: {self.position} @ {self.entry_price:.2f}")
             signal_logger.info(f"Current LTP: {current_ltp:.2f}")
-            signal_logger.info(f"SL Level: {self.stoploss_price:.2f}, TP Level: {self.target_price:.2f}")
+            signal_logger.info(f"SL Level: {self.stoploss_price}, TP Level: {self.target_price}")
             
             
             dyn_option = self.compute_dynamic_indicators(intraday_df_opt)
@@ -3240,6 +3876,7 @@ class MYALGO_TRADING_BOT:
             ema20 = float(dyn.get("EMA_20", 0.0))
             ema50 = float(dyn.get("EMA_50", 0.0))
             ema200 = float(dyn.get("EMA_200", 0.0))
+            rsi14 = float(dyn.get("RSI_14", 0.0))
 
             # static daily
             if not self.static_indicators:
@@ -3348,7 +3985,7 @@ class MYALGO_TRADING_BOT:
             long_cond1 = (close > weekly_pivot)
             long_cond2 = (close > daiily_pivot)
             long_cond3 = (close > ema9)
-            long_cond4 = (close > ema20)
+            long_cond4 = (ema9 > ema20)
             long_cond5 = (prev_close > prev_open)
             long_cond6 = (close > open_)
             long_cond7 = (close > ema50)
@@ -3357,6 +3994,7 @@ class MYALGO_TRADING_BOT:
             long_cond10 = current_high_ok
             long_cond11 = (close > prev_high)
             long_cond12 = (close > cpr_r1)
+            long_cond14 = (rsi14 > 50 and rsi14 < 75)
             # Guard against None pivots introduced by check_ltp_pivot_break
             gk_res = getattr(self, "gk_resistance_pivot", None)
             try:
@@ -3369,7 +4007,7 @@ class MYALGO_TRADING_BOT:
             short_cond1 = (close < weekly_pivot)
             short_cond2 = (close < daiily_pivot)
             short_cond3 = (close < ema9)
-            short_cond4 = (close < ema20)
+            short_cond4 = (ema9 < ema20)
             short_cond5 = (prev_close < prev_open)
             short_cond6 = (close < open_)
             short_cond7 = (close < ema50)
@@ -3378,6 +4016,7 @@ class MYALGO_TRADING_BOT:
             short_cond10 = current_low_ok
             short_cond11 = (close < prev_low)
             short_cond12 = (close < cpr_s1)
+            short_cond14 = (rsi14 < 50 and rsi14 > 25)
             # Guard for support pivot comparisons if used later
             gk_sup = getattr(self, "gk_support_pivot", None)
             try:
@@ -3385,87 +4024,49 @@ class MYALGO_TRADING_BOT:
             except Exception:
                 short_cond13 = False
             # short_cond12 = (close < self.gk_support_pivot) 
-
+    
             # Final Long/Short condition aggregation
 
-            long_cond =  long_cond2 and long_cond3 and long_cond4 and long_cond5 and long_cond6 and long_cond7 and  long_cond8 and long_cond11 and expiry_allowed 
+            long_cond =  long_cond2 and long_cond3 and long_cond4 and long_cond5 and long_cond6 and long_cond7 and  long_cond8 and long_cond11 and long_cond14 and expiry_allowed 
 
-            short_cond =  short_cond2 and short_cond3 and short_cond4 and short_cond5 and short_cond6 and short_cond7 and short_cond8 and short_cond11 and expiry_allowed   
-
-            # long_cond = long_cond5 and long_cond6 
-            # short_cond = short_cond5 and short_cond6
-            # Trend detection left here only for logging. TSL enabling
-            # is handled at runtime in `check_cpr_sl_tp_conditions`.
-            if long_cond and close > daiily_pivot and close > cpr_r1 and close > self.current_day_high:
-                signal_logger.info("🔵 Overall Trend: BULLISH (Close > Daily Pivot and CPR R1 and Current Day High)")
-            elif short_cond and close < daiily_pivot and close < cpr_s1 and close < self.current_day_low: 
-                signal_logger.info("🔴 Overall Trend: BEARISH (Close < Daily Pivot and CPR S1 and Current Day Low)")
-            # short_cond = short_cond6          
+            short_cond =  short_cond2 and short_cond3 and short_cond4 and short_cond5 and short_cond6 and short_cond7 and short_cond8 and short_cond11 and short_cond14 and expiry_allowed   
+         
             # Log detailed condition evaluation (matching your reference)
-            if BACKTESTING_MANAGER.active:
-                logger.debug(f"=== 🟢 LONG Signal Conditions === {long_cond}")
-                logger.debug(f"  1. Close > Weekly Pivot: {close:.2f} > {weekly_pivot:.2f} = {long_cond1}")
-                logger.debug(f"  2. Close > Daily Pivot: {close:.2f} > {daiily_pivot:.2f} = {long_cond2}")
-                logger.debug(f"  3. Close > EMA9: {close:.2f} > {ema9:.2f} = {long_cond3}")
-                logger.debug(f"  4. EMA9 > EMA20: {ema9:.2f} > {ema20:.2f} = {long_cond4}")
-                logger.debug(f"  5. Prev Close > Prev Open: {prev_close:.2f} > {prev_open:.2f} = {long_cond5}")
-                logger.debug(f"  6. Close > Prev High: {close:.2f} > {prev_high:.2f} = {long_cond11}")
-                logger.debug(f"  7. Close > Open: {close:.2f} > {open_:.2f} = {long_cond6}")
-                logger.debug(f"  8. Close > EMA50: {close:.2f} > {ema50:.2f} = {long_cond7}")
-                logger.debug(f"  9. Close > EMA200: {close:.2f} > {ema200:.2f} = {long_cond8}")
-                logger.debug(f"  10. LTP > last candle high: {current_ltp:.2f} > {high:.2f} = {long_cond9}")
-                logger.debug(f"  11. Close > current day high: {close:.2f} > {self.current_day_high :.2f} = {long_cond10}")
-                logger.debug(f"  12. Expiry Day Rule: {expiry_allowed}")
-                logger.debug(f"  13. Close > Gk Support Pivot: {close:.2f} > {self.gk_support_pivot} = {long_cond13}")
-                logger.info(f"  🟢 🎯 LONG Signal Valid: {long_cond} {get_now()}")
+            # 🎯 OPTIMIZATION: Reduce log verbosity in Backtesting
+            log_func = logger.debug if BACKTESTING_MANAGER.active else logger.info
 
-                logger.debug("=== 🔴 SHORT Signal Conditions ===")
-                logger.debug(f"  1. Close < Weekly Pivot: {close:.2f} < {weekly_pivot:.2f} = {short_cond1}")
-                logger.debug(f"  2. Close < Daily Pivot: {close:.2f} < {daiily_pivot:.2f} = {short_cond2}")
-                logger.debug(f"  3. Close < EMA9: {close:.2f} < {ema9:.2f} = {short_cond3}")
-                logger.debug(f"  4. EMA9 < EMA20: {ema9:.2f} < {ema20:.2f} = {short_cond4}")
-                logger.debug(f"  5. Prev Close < Prev Open: {prev_close:.2f} < {prev_open:.2f} = {short_cond5}")
-                logger.debug(f"  6. Close < Prev Low: {close:.2f} < {prev_low:.2f} = {short_cond11}")
-                logger.debug(f"  7. Close < Open: {close:.2f} < {open_:.2f} = {short_cond6}")
-                logger.debug(f"  8. Close < EMA50: {close:.2f} < {ema50:.2f} = {short_cond7}")
-                logger.debug(f"  9. Close < EMA200: {close:.2f} < {ema200:.2f} = {short_cond8}")
-                logger.debug(f"  10. LTP < last candle low: {current_ltp:.2f} < {low:.2f} = {short_cond9}")
-                logger.debug(f"  11. Close < current day low: {close:.2f} < {self.current_day_low :.2f} = {short_cond10}")
-                logger.debug(f"  12. Expiry Day Rule: {expiry_allowed}")
-                logger.debug(f"  13. Close < Gk Resistance Pivot: {close:.2f} < {self.gk_resistance_pivot} = {short_cond13}")
-                logger.info(f"  🔴 🎯 SHORT Signal Valid: {short_cond} {get_now()}")
-            else:
-                logger.info(f"=== 🟢 LONG Signal Conditions === {long_cond}")
-                signal_logger.info(f"  1. Close > Weekly Pivot: {close:.2f} > {weekly_pivot:.2f} = {long_cond1}")
-                signal_logger.info(f"  2. Close > Daily Pivot: {close:.2f} > {daiily_pivot:.2f} = {long_cond2}")
-                signal_logger.info(f"  3. Close > EMA9: {close:.2f} > {ema9:.2f} = {long_cond3}")
-                signal_logger.info(f"  4. EMA9 > EMA20: {ema9:.2f} > {ema20:.2f} = {long_cond4}")
-                signal_logger.info(f"  5. Prev Close > Prev Open: {prev_close:.2f} > {prev_open:.2f} = {long_cond5}")
-                signal_logger.info(f"  6. Close > Prev High: {close:.2f} > {prev_high:.2f} = {long_cond11}")
-                signal_logger.info(f"  7. Close > Open: {close:.2f} > {open_:.2f} = {long_cond6}")
-                signal_logger.info(f"  8. Close > EMA50: {close:.2f} > {ema50:.2f} = {long_cond7}")
-                signal_logger.info(f"  9. Close > EMA200: {close:.2f} > {ema200:.2f} = {long_cond8}")
-                signal_logger.info(f"  10. LTP > last candle high: {current_ltp:.2f} > {high:.2f} = {long_cond9}")
-                signal_logger.info(f"  11. Close > current day high: {close:.2f} > {self.current_day_high :.2f} = {long_cond10}")
-                signal_logger.info(f"  12. Expiry Day Rule: {expiry_allowed}")
-                signal_logger.info(f"  13. Close > Gk Resistance Pivot: {close:.2f} > {self.gk_resistance_pivot} = {long_cond13}")
-                signal_logger.info(f"  🟢 🎯 LONG Signal Valid: {long_cond} {get_now()}")
+            #Log detailed condition evaluation (matching your reference)
+            log_func(f"=== 🟢 LONG Signal Conditions === {long_cond}")
+            log_func(f"  1. Close > Weekly Pivot: {close:.2f} > {weekly_pivot:.2f} = {long_cond1}")
+            log_func(f"  2. Close > Daily Pivot: {close:.2f} > {daiily_pivot:.2f} = {long_cond2}")
+            log_func(f"  3. Close > EMA9: {close:.2f} > {ema9:.2f} = {long_cond3}")
+            log_func(f"  4. EMA9 > EMA20: {ema9:.2f} > {ema20:.2f} = {long_cond4}")
+            log_func(f"  5. Prev Close > Prev Open: {prev_close:.2f} > {prev_open:.2f} = {long_cond5}")
+            log_func(f"  6. Close > Prev High: {close:.2f} > {prev_high:.2f} = {long_cond11}")
+            log_func(f"  7. Close > Open: {close:.2f} > {open_:.2f} = {long_cond6}")
+            log_func(f"  8. Close > EMA50: {close:.2f} > {ema50:.2f} = {long_cond7}")
+            log_func(f"  9. Close > EMA200: {close:.2f} > {ema200:.2f} = {long_cond8}")
+            log_func(f"  10. LTP > last candle high: {current_ltp:.2f} > {high:.2f} = {long_cond9}")
+            log_func(f"  11. Close > current day high: {close:.2f} > {self.current_day_high} = {long_cond10}")
+            log_func(f"  12. Expiry Day Rule: {expiry_allowed}")
+            log_func(f"  13. Close > Gk Resistance Pivot: {close:.2f} > {self.gk_resistance_pivot} = {long_cond13}")
+            log_func(f"  🟢 🎯 LONG Signal Valid: {long_cond} {get_now()}")
 
-                signal_logger.info("=== 🔴 SHORT Signal Conditions ===")
-                signal_logger.info(f"  1. Close < Weekly Pivot: {close:.2f} < {weekly_pivot:.2f} = {short_cond1}")
-                signal_logger.info(f"  2. Close < Daily Pivot: {close:.2f} < {daiily_pivot:.2f} = {short_cond2}")
-                signal_logger.info(f"  3. Close < EMA9: {close:.2f} < {ema9:.2f} = {short_cond3}")
-                signal_logger.info(f"  4. EMA9 < EMA20: {ema9:.2f} < {ema20:.2f} = {short_cond4}")
-                signal_logger.info(f"  5. Prev Close < Prev Open: {prev_close:.2f} < {prev_open:.2f} = {short_cond5}")
-                signal_logger.info(f"  6. Close < Prev Low: {close:.2f} < {prev_low:.2f} = {short_cond11}")
-                signal_logger.info(f"  7. Close < Open: {close:.2f} < {open_:.2f} = {short_cond6}")
-                signal_logger.info(f"  8. Close < EMA50: {close:.2f} < {ema50:.2f} = {short_cond7}")
-                signal_logger.info(f"  9. Close < EMA200: {close:.2f} < {ema200:.2f} = {short_cond8}")
-                signal_logger.info(f"  10. LTP < last candle low: {current_ltp:.2f} < {low:.2f} = {short_cond9}")
-                signal_logger.info(f"  11. Close < current day low: {close:.2f} < {self.current_day_low :.2f} = {short_cond10}")
-                signal_logger.info(f"  12. Expiry Day Rule: {expiry_allowed}")
-                signal_logger.info(f"  13. Close < Gk Support Pivot: {close:.2f} < {self.gk_support_pivot} = {short_cond13}")
-                signal_logger.info(f"  🔴 🎯 SHORT Signal Valid: {short_cond} {get_now()}")
+            # log_func("=== 🔴 SHORT Signal Conditions ===")
+            log_func(f"  1. Close < Weekly Pivot: {close:.2f} < {weekly_pivot:.2f} = {short_cond1}")
+            log_func(f"  2. Close < Daily Pivot: {close:.2f} < {daiily_pivot:.2f} = {short_cond2}")
+            log_func(f"  3. Close < EMA9: {close:.2f} < {ema9:.2f} = {short_cond3}")
+            log_func(f"  4. EMA9 < EMA20: {ema9:.2f} < {ema20:.2f} = {short_cond4}")
+            log_func(f"  5. Prev Close < Prev Open: {prev_close:.2f} < {prev_open:.2f} = {short_cond5}")
+            log_func(f"  6. Close < Prev Low: {close:.2f} < {prev_low:.2f} = {short_cond11}")
+            log_func(f"  7. Close < Open: {close:.2f} < {open_:.2f} = {short_cond6}")
+            log_func(f"  8. Close < EMA50: {close:.2f} < {ema50:.2f} = {short_cond7}")
+            log_func(f"  9. Close < EMA200: {close:.2f} < {ema200:.2f} = {short_cond8}")
+            log_func(f"  10. LTP < last candle low: {current_ltp:.2f} < {low:.2f} = {short_cond9}")
+            log_func(f"  11. Close < current day low: {close:.2f} < {self.current_day_low} = {short_cond10}")
+            log_func(f"  12. Expiry Day Rule: {expiry_allowed}")
+            log_func(f"  13. Close < Gk Support Pivot: {close:.2f} < {self.gk_support_pivot} = {short_cond13}")
+            log_func(f"  🔴 🎯 SHORT Signal Valid: {short_cond} {get_now()}")
 
             # === Breakout Filter Check ===
             if long_cond:
@@ -3851,12 +4452,44 @@ class MYALGO_TRADING_BOT:
             position_logger.info(f"Initializing Enhanced CPR Range SL/TP for {signal} signal")
             position_logger.info(f"Features: Exclusion Filter={'ON' if CPR_EXCLUDE_PIVOTS else 'OFF'}, Dynamic Target={'ON' if USE_DYNAMIC_TARGET else 'OFF'}")
             position_logger.info("Option premimum: {:.2f}".format(float(base_price or 0.0)))
-            # Get signal candle data for initial SL
-            if intraday_df is None:
-                position_logger.warning("No signal candle data available for enhanced CPR initialization")
-                return False
-                
-            sig_candle = intraday_df.iloc[-2]
+            # Get signal candle data for initial SL (last completed candle = -2).
+            def _extract_signal_candle(df, source_tag):
+                if df is None:
+                    position_logger.warning(f"{source_tag}: intraday_df is None")
+                    return None
+                if not hasattr(df, "iloc"):
+                    position_logger.warning(f"{source_tag}: intraday_df has no iloc (type={type(df)})")
+                    return None
+                try:
+                    row_count = len(df)
+                except Exception:
+                    position_logger.warning(f"{source_tag}: unable to determine intraday_df length")
+                    return None
+                if row_count < 2:
+                    position_logger.warning(
+                        f"{source_tag}: insufficient candles for signal candle extraction (need>=2, got={row_count})"
+                    )
+                    return None
+                try:
+                    return df.iloc[-2]
+                except Exception as e:
+                    position_logger.warning(f"{source_tag}: failed to access signal candle at -2: {e}")
+                    return None
+
+            sig_candle = _extract_signal_candle(intraday_df, "initial")
+            if sig_candle is None:
+                position_logger.warning("Refreshing intraday data for CPR initialization")
+                intraday_df = self.get_intraday(
+                    days=LOOKBACK_DAYS,
+                    symbol=self.spot_symbol,
+                    exchange=self.spot_exchange,
+                    timeframe=CANDLE_TIMEFRAME,
+                    instrument_type="SPOT",
+                )
+                sig_candle = _extract_signal_candle(intraday_df, "refreshed")
+                if sig_candle is None:
+                    position_logger.warning("Could not extract valid signal candle after refresh")
+                    return False
             signal_candle_low = float(sig_candle.get('low', 0) or 0)
             signal_candle_high = float(sig_candle.get('high', 0) or 0)
             signal_candle_range = abs(signal_candle_high - signal_candle_low)
@@ -4140,6 +4773,9 @@ class MYALGO_TRADING_BOT:
         try:
             # NOTE: Dynamic TSL enabling is evaluated only when a TP is hit
             # to avoid repeated intraday fetches / indicator recomputations.
+            now = get_now()
+            tsl_enable_cutoff = now.replace(hour=14, minute=30, second=0, microsecond=0)
+            allow_dynamic_tsl_enable = now <= tsl_enable_cutoff
 
             side = self.cpr_side
             current_tp = self.get_current_cpr_tp()
@@ -4157,7 +4793,7 @@ class MYALGO_TRADING_BOT:
             
             # Check SL conditions with LTP breakout confirmation
             if side == "BUY" and current_ltp <= self.cpr_sl:
-                position_logger.warning(f"CPR BUY | SL Hit: {current_ltp:.2f} <= {self.cpr_sl:.2f}")
+                position_logger.debug(f"CPR BUY | SL Hit: {current_ltp:.2f} <= {self.cpr_sl:.2f}")
                 
                 # Setup LTP breakout confirmation using CPR SL level
                 if LTP_BREAKOUT_ENABLED:
@@ -4191,7 +4827,7 @@ class MYALGO_TRADING_BOT:
                     return "SL_HIT"
                     
             elif side == "SELL" and current_ltp >= self.cpr_sl:
-                position_logger.warning(f"CPR SELL | SL Hit: {current_ltp:.2f} >= {self.cpr_sl:.2f}")
+                position_logger.debug(f"CPR SELL | SL Hit: {current_ltp:.2f} >= {self.cpr_sl:.2f}")
 
                 # Setup LTP breakout confirmation for SELL
                 if LTP_BREAKOUT_ENABLED:
@@ -4228,26 +4864,31 @@ class MYALGO_TRADING_BOT:
                     position_logger.info(f"🟢 CPR BUY TP Hit: {current_ltp:.2f} >= {current_tp:.2f}")
                     # Evaluate dynamic TSL enable only when TP is hit (uses cached close if available)
                     if not getattr(self, 'tsl_enabled', False):
-                        try:
-                            last_close = None
-                            if getattr(self, 'cached_last_close', None) is not None:
-                                last_close = float(self.cached_last_close)
-                            else:
-                                intraday_df = self.get_intraday(days=LOOKBACK_DAYS, symbol=self.spot_symbol, exchange=self.spot_exchange, instrument_type="SPOT")
-                                dyn_for_trend = self.compute_dynamic_indicators(intraday_df) if intraday_df is not None and not intraday_df.empty else None
-                                if dyn_for_trend:
-                                    last_close = float(dyn_for_trend.get("last_candle", {}).get("close", 0.0))
-
-                            if last_close is not None:
-                                cpr_r1_local = float(self.static_indicators.get("DAILY", {}).get("r1", 0.0)) if self.static_indicators else 0.0
-                                daily_pivot_local = float(self.static_indicators.get("DAILY", {}).get("pivot", 0.0)) if self.static_indicators else 0.0
-                                if last_close > daily_pivot_local and last_close > cpr_r1_local:
-                                    position_logger.info("Enabling TSL dynamically (bullish CPR + above daily pivot + r1)")
-                                    self.tsl_enabled = True
+                        if allow_dynamic_tsl_enable:
+                            try:
+                                last_close = None
+                                if getattr(self, 'cached_last_close', None) is not None:
+                                    last_close = float(self.cached_last_close)
                                 else:
-                                    position_logger.info("TSL remains disabled (conditions for dynamic enable not met) - last close: {:.2f}, daily pivot: {:.2f}, cpr r1: {:.2f}".format(last_close, daily_pivot_local, cpr_r1_local))
-                        except Exception:
-                            pass
+                                    intraday_df = self.get_intraday(days=LOOKBACK_DAYS, symbol=self.spot_symbol, exchange=self.spot_exchange, instrument_type="SPOT")
+                                    dyn_for_trend = self.compute_dynamic_indicators(intraday_df) if intraday_df is not None and not intraday_df.empty else None
+                                    if dyn_for_trend:
+                                        last_close = float(dyn_for_trend.get("last_candle", {}).get("close", 0.0))
+
+                                if last_close is not None:
+                                    cpr_r1_local = float(self.static_indicators.get("DAILY", {}).get("r1", 0.0)) if self.static_indicators else 0.0
+                                    daily_pivot_local = float(self.static_indicators.get("DAILY", {}).get("pivot", 0.0)) if self.static_indicators else 0.0
+                                    if last_close > daily_pivot_local and last_close > cpr_r1_local:
+                                        position_logger.info("Enabling TSL dynamically (bullish CPR + above daily pivot + r1)")
+                                        self.tsl_enabled = True
+                                    else:
+                                        position_logger.info("TSL remains disabled (conditions for dynamic enable not met) - last close: {:.2f}, daily pivot: {:.2f}, cpr r1: {:.2f}".format(last_close, daily_pivot_local, cpr_r1_local))
+                            except Exception:
+                                pass
+                        else:
+                            position_logger.info(
+                                f"TSL dynamic enable skipped after cutoff (now={now.strftime('%H:%M:%S')}, cutoff=14:30:00)"
+                            )
 
                     # Check TSL flag to determine behavior
                     if not getattr(self, 'tsl_enabled', False):
@@ -4268,26 +4909,31 @@ class MYALGO_TRADING_BOT:
                     position_logger.info(f"🟢 CPR SELL TP Hit: {current_ltp:.2f} <= {current_tp:.2f}")
                     # Evaluate dynamic TSL enable only when TP is hit (uses cached close if available)
                     if not getattr(self, 'tsl_enabled', False):
-                        try:
-                            last_close = None
-                            if getattr(self, 'cached_last_close', None) is not None:
-                                last_close = float(self.cached_last_close)
-                            else:
-                                intraday_df = self.get_intraday(days=LOOKBACK_DAYS, symbol=self.spot_symbol, exchange=self.spot_exchange, instrument_type="SPOT")
-                                dyn_for_trend = self.compute_dynamic_indicators(intraday_df) if intraday_df is not None and not intraday_df.empty else None
-                                if dyn_for_trend:
-                                    last_close = float(dyn_for_trend.get("last_candle", {}).get("close", 0.0))
-
-                            if last_close is not None:
-                                cpr_s1_local = float(self.static_indicators.get("DAILY", {}).get("s1", 0.0)) if self.static_indicators else 0.0
-                                daily_pivot_local = float(self.static_indicators.get("DAILY", {}).get("pivot", 0.0)) if self.static_indicators else 0.0
-                                if last_close < daily_pivot_local and last_close < cpr_s1_local:
-                                    position_logger.info("Enabling TSL dynamically (bearish CPR + daily pivot + s1)")
-                                    self.tsl_enabled = True
+                        if allow_dynamic_tsl_enable:
+                            try:
+                                last_close = None
+                                if getattr(self, 'cached_last_close', None) is not None:
+                                    last_close = float(self.cached_last_close)
                                 else:
-                                    position_logger.info("TSL remains disabled (conditions for dynamic enable not met) - last close: {:.2f}, daily pivot: {:.2f}, cpr s1: {:.2f}".format(last_close, daily_pivot_local, cpr_s1_local))
-                        except Exception:
-                            pass
+                                    intraday_df = self.get_intraday(days=LOOKBACK_DAYS, symbol=self.spot_symbol, exchange=self.spot_exchange, instrument_type="SPOT")
+                                    dyn_for_trend = self.compute_dynamic_indicators(intraday_df) if intraday_df is not None and not intraday_df.empty else None
+                                    if dyn_for_trend:
+                                        last_close = float(dyn_for_trend.get("last_candle", {}).get("close", 0.0))
+
+                                if last_close is not None:
+                                    cpr_s1_local = float(self.static_indicators.get("DAILY", {}).get("s1", 0.0)) if self.static_indicators else 0.0
+                                    daily_pivot_local = float(self.static_indicators.get("DAILY", {}).get("pivot", 0.0)) if self.static_indicators else 0.0
+                                    if last_close < daily_pivot_local and last_close < cpr_s1_local:
+                                        position_logger.info("Enabling TSL dynamically (bearish CPR + daily pivot + s1)")
+                                        self.tsl_enabled = True
+                                    else:
+                                        position_logger.info("TSL remains disabled (conditions for dynamic enable not met) - last close: {:.2f}, daily pivot: {:.2f}, cpr s1: {:.2f}".format(last_close, daily_pivot_local, cpr_s1_local))
+                            except Exception:
+                                pass
+                        else:
+                            position_logger.info(
+                                f"TSL dynamic enable skipped after cutoff (now={now.strftime('%H:%M:%S')}, cutoff=14:30:00)"
+                            )
 
                     # Check TSL flag to determine behavior
                     if not getattr(self, 'tsl_enabled', False):
@@ -4897,6 +5543,12 @@ class MYALGO_TRADING_BOT:
 
             if self.trade_count >= MAX_TRADES_PER_DAY:
                 order_logger.warning(f"Daily trade limit reached ({self.trade_count}/{MAX_TRADES_PER_DAY})")
+                
+                # FIX: In Range Mode, do not kill the bot. Just stop taking new entries.
+                if MODE == "BACKTESTING_RANGE":
+                     logger.info("Daily trade limit reached. Staying idle for remainder of the day (Range Mode).")
+                     return False
+
                 logger.info("Daily trade limit reached (%d), will shutdown.", MAX_TRADES_PER_DAY)
                 threading.Thread(target=self.shutdown_gracefully, daemon=True).start()
                 return False
@@ -4930,6 +5582,9 @@ class MYALGO_TRADING_BOT:
                 order_logger.error(f"Entry order failed")
                 return False
             order_logger.info(f"✅ 🎯 Order placed successfully. dynamic SL/TP calculation started {get_now()}")
+            with self._state_lock:
+                self.exit_in_progress = True
+                self.position = signal
             order_logger.info(f"✅ 🎯 Entry Order Executed | ID={entry_order_id} |")
             order_logger.info(f"📈 Trade Count: {self.trade_count +1}/{MAX_TRADES_PER_DAY}")
             self.trade_start_time = get_now()
@@ -4941,23 +5596,11 @@ class MYALGO_TRADING_BOT:
                     # Determine which price to use for SL placement
                     exit_symbol = tradable_symbol
                     exit_exchange = tradable_exchange
-                    if USE_OPTION_FOR_SLTP:
-                        # For options, always use BUY side for SL calculation (premium goes up)
-                        entry_side = "BUY"
-                        risk_logger.info("Using BUY side for option SL calculation (premium-based)")
-                    elif USE_SPOT_FOR_SLTP:
-                        # For spot, use actual signal direction
-                        entry_side = signal.upper()
-                        risk_logger.info(f"Using {entry_side} side for spot SL calculation (direction-based)")
-                    else:
-                        # Default fallback
-                        entry_side = signal.upper()
-
-                    # Use existing computed 10% stoploss_price for SL order
-                    sl_price = self.compute_pct_sl(exec_price, entry_side)
+                    option_entry_type = "BUY"  # This is default for sl order since we are trading only in option buying.
+                    sl_price = self.compute_pct_sl(exec_price, option_entry_type)
 
                     order_logger.info(f"Attempting to place linked SL order after entry confirmation...")
-                    sl_order_id = self.place_and_confirm_stoploss(exit_symbol, exit_exchange, entry_side, sl_price)
+                    sl_order_id = self.place_and_confirm_stoploss(exit_symbol, exit_exchange, option_entry_type, sl_price)
 
                     if sl_order_id:
                         self.sl_order_id = sl_order_id
@@ -5043,13 +5686,26 @@ class MYALGO_TRADING_BOT:
                     if USE_SPOT_FOR_SLTP and not cpr_success:
                         risk_logger.info("SPOT CPR SL/TP calculation enabled")
                         cpr_source =  self.static_indicators
-                        cpr_success = self.initialize_cpr_range_sl_tp_enhanced(signal, intraday_df, base_price=base_price, pivots=cpr_source)
+                        intraday = self.get_intraday(
+                            days=LOOKBACK_DAYS, 
+                            symbol=self.spot_symbol, 
+                            exchange=self.spot_exchange,
+                            timeframe=CANDLE_TIMEFRAME,
+                            instrument_type="SPOT")
+                        cpr_success = self.initialize_cpr_range_sl_tp_enhanced(signal=signal, intraday_df=intraday, base_price=base_price, pivots=cpr_source)
                     if not cpr_success:
-                        self.static_indicators = spot_cpr
+                        # self.static_indicators = spot_cpr
+                        cpr_source =  self.static_indicators
+                        intraday = self.get_intraday(
+                            days=LOOKBACK_DAYS, 
+                            symbol=self.spot_symbol, 
+                            exchange=self.spot_exchange,
+                            timeframe=CANDLE_TIMEFRAME,
+                            instrument_type="SPOT")
                         risk_logger.info("Option CPR initialization failed, Falling back to SPOT CPR")
-                        cpr_success = self.initialize_cpr_range_sl_tp_enhanced(signal, intraday_df, base_price=base_price, pivots=cpr_source)
+                        cpr_success = self.initialize_cpr_range_sl_tp_enhanced(signal=signal, intraday_df=intraday, base_price=base_price, pivots=cpr_source)
                     if not cpr_success:
-                        self.initialize_signal_candle_sl_tp(signal, intraday_df, base_price=base_price)
+                        self.initialize_signal_candle_sl_tp(signal=signal, intraday=intraday, base_price=base_price)
                 else:
                     # fallback: fixed TP/SL
                     # ✅ FIX: Determine effective side for fallback logic
@@ -5711,11 +6367,17 @@ class MYALGO_TRADING_BOT:
         # 1) Signal Replay Client to stop (simulation)
         # ---------------------------
         try:
-            # Ensure BACKTESTING_MANAGER is marked inactive so replay loops can detect it
+            # Signal Replay Client to stop (simulation)
+            # ---------------------------
             try:
-                BACKTESTING_MANAGER.active = False
+                # Ensure BACKTESTING_MANAGER is marked inactive so replay loops can detect it
+                # ONLY if NOT in BACKTESTING_RANGE (where we want to keep manager active for next day)
+                if MODE != "BACKTESTING_RANGE":
+                    try:
+                        BACKTESTING_MANAGER.active = False
+                    except Exception:
+                        pass
             except Exception:
-                # if BACKTESTING_MANAGER not present or any error, continue
                 pass
 
             # Signal replay internal stop event if available
@@ -5923,11 +6585,9 @@ class MYALGO_TRADING_BOT:
     # Run
     # -------------------------
     def run(self):
-        main_logger.info("=== 🚀 STARTING MYALGO TRADING SESSION ===")
+        main_logger.warning("=== 🚀 STARTING MYALGO TRADING SESSION ===")
         session_start_time = datetime.now()
-        main_logger.info(f"⏰ Session Start Time: {session_start_time}")
-        
-        logger.info("🚀 Starting bot")
+        main_logger.warning(f"⏰ Session Start Time: {session_start_time}")
         
         try:
             # websocket thread
@@ -5968,27 +6628,31 @@ class MYALGO_TRADING_BOT:
             # Calculate session statistics
             session_end_time = datetime.now()
             session_duration = session_end_time - session_start_time
-            main_logger.info("=== TRADING SESSION COMPLETED ===")
-            main_logger.info(f"Session Start: {session_start_time}")
-            main_logger.info(f"Session End: {session_end_time}")
-            main_logger.info(f"Total Duration: {session_duration}")
+            main_logger.warning("=== TRADING SESSION COMPLETED ===")
+            main_logger.warning(f"Session Start: {session_start_time}")
+            main_logger.warning(f"Session End: {session_end_time}")
+            main_logger.warning(f"Total Duration: {session_duration}")
             main_logger.info(f"Total Trades Executed: {self.trade_count}")
             main_logger.info(f"Max Trades Allowed: {MAX_TRADES_PER_DAY}")
             main_logger.info(f"Final Status: {'Max trades reached' if self.trade_count >= MAX_TRADES_PER_DAY else 'Session ended normally'}")
             
             if MODE == "BACKTESTING":
-                main_logger.info("📋 [SIMULATION] Backtesting session ended")
+                main_logger.warning("📋 [SIMULATION] Backtesting session ended")
                 from backtesting_analysis import main
                 main()
             
             logger.info("Bot stopped")
             
-            # Only exit system in single-run modes. 
-            # In BACKTESTING_RANGE, return control to orchestrator.
-            if MODE != "BACKTESTING_RANGE":
-                sys.exit()
+            # Exit system unless instructed otherwise
+            if MODE == "BACKTESTING_RANGE":
+                main_logger.info("✅ Multi-day backtesting completed successfully")
+                # Run analysis after completion
+                main_logger.info("🔍 Starting post-backtest analysis...")
+                from backtesting_analysis import main as run_analysis
+                run_analysis()
+                sys.exit(0)
             else:
-                main_logger.info("🔄 Returning control to orchestrator...")
+                 sys.exit()
 # -------------------------
 # main
 # -------------------------
@@ -6001,6 +6665,9 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────────────
     # MODE 1: BACKTESTING - DATE RANGE (NEW)
     # ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # MODE 1: BACKTESTING - DATE RANGE (NEW - OPTIMIZED)
+    # ─────────────────────────────────────────────────────────────
     if MODE == "BACKTESTING_RANGE":
         try:
             # Validate configuration
@@ -6008,30 +6675,19 @@ if __name__ == "__main__":
                 main_logger.error("❌ BACKTESTING_RANGE mode requires START_DATE and END_DATE")
                 sys.exit(1)
             
-            main_logger.info("🎯 BACKTESTING MODE: DATE RANGE")
-            main_logger.info(f"📅 Range: {START_DATE} → {END_DATE}")
+            main_logger.warning(f"📅 BACKTESTING: {START_DATE} → {END_DATE}")
             
-            # Import orchestrator
-            from backtesting_engine import BacktestOrchestrator
-            
-            # Create and run orchestrator
-            orchestrator = BacktestOrchestrator(
+            # 1. Initialize Manager with Range
+            BACKTESTING_MANAGER.start_range(
                 start_date_str=START_DATE,
-                end_date_str=END_DATE
+                end_date_str=END_DATE,
+                symbol=SYMBOL,
+                exchange=EXCHANGE,
+                timeframe="1m"
             )
             
-            orchestrator.run_backtest_range()
-            
-            # Run analysis after completion
-            main_logger.info("🔍 Starting post-backtest analysis...")
-            from backtesting_analysis import main as run_analysis
-            run_analysis()
-            
-            main_logger.info("✅ Multi-day backtesting completed successfully")
-            sys.exit(0)
-            
         except Exception as e:
-            main_logger.exception(f"❌ Multi-day backtesting failed: {e}")
+            main_logger.exception(f"❌ Multi-day backtesting initialization failed: {e}")
             sys.exit(1)
     
     # ─────────────────────────────────────────────────────────────
@@ -6055,10 +6711,11 @@ if __name__ == "__main__":
             sys.exit(1)
     
     # ═════════════════════════════════════════════════════════════
-    # RUN BOT (ONLY FOR SINGLE-DAY MODES)
+    # RUN BOT (ALL MODES)
     # ═════════════════════════════════════════════════════════════
     
-    # Skip bot creation for BACKTESTING_RANGE (orchestrator handles it)
-    if MODE != "BACKTESTING_RANGE":
-        bot = MYALGO_TRADING_BOT()
-        bot.run()
+    # In BACKTESTING_RANGE, bot.run() -> websocket_thread -> REPLAY_CLIENT.replay_range -> handles loop
+    bot = MYALGO_TRADING_BOT()
+    if MODE == "BACKTESTING_RANGE":
+        bot._precalculate_strategy_indicators()
+    bot.run()

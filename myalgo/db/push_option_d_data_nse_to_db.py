@@ -79,8 +79,8 @@ REFERER_URL = "https://www.nseindia.com/"
 
 # Optional date-range filter (inclusive). Set to None to process all dates.
 # Acceptable formats: "DD-MM-YYYY" or "YYYY-MM-DD"
-START_DATE: Optional[str] = "2026-01-01"
-END_DATE: Optional[str] = "2026-02-06"
+START_DATE: Optional[str] = "2026-02-09"
+END_DATE: Optional[str] = "2026-02-11"
 
 # MAPPING: NSE JSON Field -> DuckDB Column
 # Note: symbol, exchange, timeframe, timestamp are constructed/transformed
@@ -107,8 +107,15 @@ def setup_logger():
 logger = setup_logger()
 
 class NSEHistoricalIngestor:
-    def __init__(self, db_path: str):
+    def __init__(
+        self,
+        db_path: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ):
         self.db_path = db_path
+        self.start_date = start_date
+        self.end_date = end_date
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -145,9 +152,12 @@ class NSEHistoricalIngestor:
     def get_expiries_and_strikes(self, underlying: str) -> Dict[str, List[int]]:
         """Fetch unique expiries and their strikes from DB."""
         try:
-            # Build optional date filter based on global START_DATE/END_DATE
+            # Build optional date filter based on runtime values, else module defaults
             date_filter = ""
-            if START_DATE and END_DATE:
+            filter_start = self.start_date if self.start_date is not None else START_DATE
+            filter_end = self.end_date if self.end_date is not None else END_DATE
+
+            if filter_start and filter_end:
                 # Accept DD-MM-YYYY or YYYY-MM-DD input formats
                 def _norm(dstr):
                     for fmt in ("%d-%m-%Y", "%Y-%m-%d"):
@@ -158,13 +168,13 @@ class NSEHistoricalIngestor:
                     raise ValueError(f"Unsupported date format: {dstr}")
 
                 try:
-                    s = _norm(START_DATE)
-                    e = _norm(END_DATE)
+                    s = _norm(filter_start)
+                    e = _norm(filter_end)
                     # Use DATE(timestamp) for safe date-only comparison in DuckDB
                     date_filter = f"AND DATE(timestamp) BETWEEN DATE '{s}' AND DATE '{e}'"
                     logger.info(f"Applying date filter: {s} -> {e}")
                 except Exception as ex:
-                    logger.warning(f"Invalid START_DATE/END_DATE provided: {ex} - ignoring date filter")
+                    logger.warning(f"Invalid start/end date provided: {ex} - ignoring date filter")
 
             query = f"""
             SELECT expiry, list(distinct strike) as strikes

@@ -14,4 +14,5 @@ pytz>=2023.3
 requests>=2.31.0  # For API calls to brokers/data providers
 websocket-client>=1.6.0  # For real-time data streaming
 python-dotenv>=1.0.0  # For environment variable management
-.claude
+vectorbt>=0.24.0
+    
