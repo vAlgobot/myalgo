@@ -1,20 +1,23 @@
 import sqlite3
 import pandas as pd
-import os
+import os, sys
 import uuid
+from datetime import datetime
 import math
 from logger import get_logger
 
 analysis_logger = get_logger("backtest_analysis")
 
 INITIAL_CAPITAL = 50000
+SLIPPAGE_MODE = "PERCENT"   # Options: "PERCENT" or None
+SLIPPAGE_PERCENT = 0.5      # per side
 
 class BacktestingAnalysis:
     def __init__(
         self,
         db_path: str,
         brokerage_per_order: float = 25,
-        strategy_name: str = "default_strategy",
+        strategy_name: str = "Double_RISK_Scalping_NIFTY",
         symbol: str = None,
         timeframe: str = "5m",
     ):
@@ -36,24 +39,28 @@ class BacktestingAnalysis:
         conn = sqlite3.connect(self.db_path)
         self.raw_df = pd.read_sql(
             """
-            SELECT timestamp, symbol, quantity, price, leg_type, reason
-            FROM my_trade_logs
-            WHERE leg_type IN ('ENTRY', 'EXIT', 'CPR_TP_HIT')
+            SELECT timestamp, symbol, quantity, option_price, leg_type, reason
+            FROM my_trades
+            WHERE leg_type IN ('ENTRY', 'EXIT', 'TP_HIT') and strategy = ?
             ORDER BY timestamp
             """,
-            conn
+            conn,
+            params=(self.strategy_name,)
         )
         conn.close()
 
         if self.raw_df.empty:
-            raise ValueError("No ENTRY / EXIT records found in DB")
-
+            # raise ValueError("No ENTRY / EXIT records found in DB")
+            analysis_logger.warning("No ENTRY / EXIT records found in DB for strategy '%s'", self.strategy_name)
+            sys.exit(0)
         self.raw_df["timestamp"] = pd.to_datetime(self.raw_df["timestamp"])
 
     # -------------------------------
     # Pair ENTRY → EXIT & calculate PnL (Enhanced with Opportunity)
     # -------------------------------
     def build_trades(self):
+        analysis_logger.info(f"Applied slippage: Mode={SLIPPAGE_MODE}, Percent={SLIPPAGE_PERCENT}")
+        
         trades = []
         open_trade = None
         tp_prices = []
@@ -63,23 +70,32 @@ class BacktestingAnalysis:
                 open_trade = row
                 tp_prices = []
 
-            elif row["leg_type"] == "CPR_TP_HIT" and open_trade is not None:
-                tp_prices.append(row["price"])
+            elif row["leg_type"] == "TP_HIT" and open_trade is not None:
+                tp_prices.append(row["option_price"])
 
             elif row["leg_type"] == "EXIT" and open_trade is not None:
-                entry_price = float(open_trade["price"])
-                exit_price = float(row["price"])
+                entry_price = float(open_trade["option_price"])
+                exit_price = float(row["option_price"])
                 qty = float(row["quantity"])
+
+                # Apply Slippage (Long Options)
+                if SLIPPAGE_MODE == "PERCENT":
+                    slip = SLIPPAGE_PERCENT / 100
+                    entry_price_adj = entry_price * (1 + slip)
+                    exit_price_adj = exit_price * (1 - slip)
+                else:
+                    entry_price_adj = entry_price
+                    exit_price_adj = exit_price
 
                 # If we had TPs hit, the 'opportunity' was the max price we realized along the way or at exit
                 # Assumes Long Option Buying strategy
-                max_price = max([exit_price] + tp_prices) if tp_prices else exit_price
+                max_price = max([exit_price_adj] + tp_prices) if tp_prices else exit_price_adj
 
-                execution_pnl = (exit_price - entry_price) * qty
+                execution_pnl = (exit_price_adj - entry_price_adj) * qty
                 opportunity_pnl = (max_price - entry_price) * qty
                 missed_pnl = opportunity_pnl - execution_pnl
                 
-                capital = entry_price * qty
+                capital = entry_price_adj * qty
                 
                 # 🎯 Determine exit reason/status
                 exit_reason = row.get("reason", "Unknown")
@@ -182,20 +198,28 @@ class BacktestingAnalysis:
         self.max_win_day_streak, _ = self._streaks(self.day_pnl > 0)
         self.max_loss_day_streak, _ = self._streaks(self.day_pnl < 0)
 
-        # ---- Equity & Drawdown ----
-        df["cum_pnl"] = df["pnl"].cumsum()
-        df["portfolio_equity"] = INITIAL_CAPITAL + df["cum_pnl"]
+        # ---- Equity & Drawdown (NET - Brokerage included) ----
+        self.total_orders = self.total_trades * 2
+        self.brokerage = self.total_orders * self.brokerage_per_order
+
+        df["pnl_net"] = df["pnl"]
+        df["cum_pnl_net"] = df["pnl_net"].cumsum() - self.brokerage
+        df["portfolio_equity"] = INITIAL_CAPITAL + df["cum_pnl_net"]
+
         df["peak_equity"] = df["portfolio_equity"].cummax()
         df["drawdown"] = df["portfolio_equity"] - df["peak_equity"]
 
         self.peak_equity = df["peak_equity"].max()
         self.final_equity = df["portfolio_equity"].iloc[-1]
-        self.max_drawdown = df["drawdown"].min()
-        self.max_drawdown_pct = (self.max_drawdown / self.peak_equity) * 100
 
-        self.total_orders = self.total_trades * 2
-        self.brokerage = self.total_orders * self.brokerage_per_order
-        self.net_pnl = self.gross_pnl - self.brokerage
+        self.max_drawdown = abs(df["drawdown"].min())
+        df["drawdown_pct"] = (df["drawdown"] / df["peak_equity"]) * 100
+        self.max_drawdown_pct = abs(df["drawdown_pct"].min())
+
+        analysis_logger.info(f"Max Drawdown (₹): {self.max_drawdown:.2f}")
+        analysis_logger.info(f"Max Drawdown (%): {self.max_drawdown_pct:.2f}%")
+
+        self.net_pnl = df["pnl_net"].sum() - self.brokerage
 
         # ---- Risk Metrics ----
         avg_loss_abs = abs(self.avg_loss) if self.avg_loss != 0 else 0
@@ -211,13 +235,13 @@ class BacktestingAnalysis:
     def _safe_float(value, default=0.0):
         if pd.isna(value):
             return default
-        return float(value)
-
+        return float(f"{value:.2f}") if isinstance(value, (int, float)) else default
+    
     def _ensure_strategy_runs_table(self, conn: sqlite3.Connection):
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS strategy_runs (
-                run_id TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 strategy_name TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 timeframe TEXT NOT NULL,
@@ -266,6 +290,7 @@ class BacktestingAnalysis:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_runs_timeframe ON strategy_runs(timeframe)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_runs_start_date ON strategy_runs(start_date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_runs_end_date ON strategy_runs(end_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_runs_id ON strategy_runs(id)")
 
     def _build_strategy_run_row(self):
         start_date = self.trade_df["date"].min().isoformat()
@@ -298,8 +323,8 @@ class BacktestingAnalysis:
         else:
             sharpe_ratio = 0.0
 
+        # We rely on DB autoincrement `id` as the canonical run identifier.
         row = {
-            "run_id": str(uuid.uuid4()),
             "strategy_name": self.strategy_name,
             "symbol": symbol,
             "timeframe": self.timeframe,
@@ -334,6 +359,7 @@ class BacktestingAnalysis:
             "best_day": self._safe_float(self.best_day),
             "worst_day": self._safe_float(self.worst_day),
             "brokerage": self._safe_float(self.brokerage),
+            "created_at": datetime.now()
         }
         return row
 
@@ -341,14 +367,14 @@ class BacktestingAnalysis:
         row = self._build_strategy_run_row()
 
         columns = [
-            "run_id", "strategy_name", "symbol", "timeframe", "start_date", "end_date",
+            "strategy_name", "symbol", "timeframe", "start_date", "end_date",
             "initial_capital", "final_equity", "net_pnl", "growth_percent",
             "total_trades", "winning_trades", "losing_trades", "breakeven_trades", "win_rate",
             "gross_profit", "gross_loss", "avg_trade", "avg_win", "avg_loss", "risk_reward",
             "profit_factor", "expectancy", "max_drawdown", "max_drawdown_percent",
             "return_over_drawdown", "sharpe_ratio", "avg_risk_per_trade", "max_win_streak",
             "max_loss_streak", "trading_days", "win_day_percent", "best_day", "worst_day",
-            "brokerage"
+            "brokerage","created_at"
         ]
 
         placeholders = ", ".join(["?"] * len(columns))
@@ -357,14 +383,13 @@ class BacktestingAnalysis:
         conn = sqlite3.connect(self.db_path)
         try:
             self._ensure_strategy_runs_table(conn)
-            conn.execute(
+            cur = conn.execute(
                 f"INSERT INTO strategy_runs ({', '.join(columns)}) VALUES ({placeholders})",
                 values,
             )
             conn.commit()
-            analysis_logger.info(
-                f"✅ Saved strategy run summary to strategy_runs (run_id={row['run_id']})"
-            )
+            db_id = cur.lastrowid
+            analysis_logger.info(f"✅ Saved strategy run summary to strategy_runs (db_id={db_id})")
         finally:
             conn.close()
 
@@ -480,11 +505,11 @@ class BacktestingAnalysis:
 # -------------------------------
 # main entry point
 # -------------------------------
-def main():
+def main(strategy_name: str = "Double_RISK_Scalping_NIFTY", symbol: str = "NIFTY", timeframe: str = "5m"):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     db_path = os.path.join(base_dir, "myalgo.db")
-
-    analyzer = BacktestingAnalysis(db_path=db_path)
+    analysis_logger.warning(f"Starting backtesting analysis for strategy='{strategy_name}', symbol='{symbol}', timeframe='{timeframe}'")
+    analyzer = BacktestingAnalysis(db_path=db_path, strategy_name=strategy_name, symbol=symbol, timeframe=timeframe)
     analyzer.load_trade_legs()
     analyzer.build_trades()
     analyzer.analyze()

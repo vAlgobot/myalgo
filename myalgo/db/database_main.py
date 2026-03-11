@@ -107,7 +107,8 @@ class DatabaseManager:
         
         # Database configuration
         self.spot_table = "spot_data"
-        self.options_table = "options_data"
+        self.options_table = "options_data_master"
+        # self.options_table = "options_data" # old option data for reference, not used for backtesting
         self.metadata_table = "data_metadata"
         self.table = None
         
@@ -328,7 +329,7 @@ class DatabaseManager:
                 # Select final columns in correct order
                 final_columns = [
                 'symbol', 'exchange', 'underlying', 'strike', 'expiry', 'timeframe', 'timestamp',
-                'open', 'high', 'low', 'close', 'volume', 'oi']
+                'open', 'high', 'low', 'close', 'volume', 'oi', 'iv']
                 missing_columns = [col for col in required_columns if col not in df.columns]
             else:
                 required_columns = ['open', 'high', 'low', 'close', 'volume']
@@ -492,7 +493,7 @@ class DatabaseManager:
             if instrument_type == 'OPTIONS':
                 self.spot_table = self.options_table
                 target_table = self.options_table
-                columns = ['symbol', 'exchange', 'underlying', 'strike', 'expiry', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi']
+                columns = ['symbol', 'exchange', 'underlying', 'strike', 'expiry', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi', 'iv']
                 conflict_targets = "symbol, exchange, timeframe, timestamp" 
                 # Note: Options PK in schema is (symbol, exchange, timeframe, timestamp)
             else:
@@ -825,7 +826,6 @@ class DatabaseManager:
                 where_conditions = [
                     "underlying = ?",
                     "exchange = ?",
-                    "expiry = ?",
                     "strike = ?",
                     "symbol = ?",
                     "LOWER(timeframe) = ?"
@@ -842,7 +842,7 @@ class DatabaseManager:
                         pass
                 
                 strike_price = extract_strike_from_symbol(symbol)
-                params = [underlying_symbol.upper(), exchange.upper(), expiry_date, strike_price, 
+                params = [underlying_symbol.upper(), exchange.upper(), strike_price, 
                          symbol.upper(), fetch_timeframe.lower()]
             else:
                 self.logger.error(f"Invalid instrument type: {instrument_type}")
@@ -1709,6 +1709,7 @@ if __name__ == "__main__":
     db_manager = get_database_manager(read_only=True)
     print("✅ Database opened in READ-ONLY mode")
 
-    # df = db_manager.get_ohlcv_data('BANKNIFTY', 'NSE_INDEX', '1m', '2026-01-16', '2026-01-16', instrument_type="SPOT")
-    df = db_manager.get_ohlcv_data(symbol='NIFTY27JAN2625450CE', exchange='NFO', timeframe='D', start_date='2026-01-17', end_date='2026-01-22', instrument_type="OPTIONS", underlying_symbol="NIFTY", expiry_date="27-01-2026")
+    #df = db_manager.get_ohlcv_data('NIFTY', 'NSE_INDEX', 'D', '2024-04-01', '2024-07-01', instrument_type="SPOT")
+    # df = db_manager.get_ohlcv_data(symbol='NIFTY02MAR2625150CE', exchange='NFO', timeframe='1m', start_date='2026-02-25 10:00:00', end_date='2026-02-25 15:30:00', instrument_type="OPTIONS", underlying_symbol="NIFTY", expiry_date="02-03-2026")
+    df = db_manager.get_ohlcv_data(symbol='NIFTY02MAR2625150CE', exchange='NFO', timeframe='1m', start_date='2026-02-24 10:00:00', end_date='2026-02-25 15:30:00', instrument_type="OPTIONS", underlying_symbol="NIFTY", expiry_date="02-03-2026")
     print(df.count())

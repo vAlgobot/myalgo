@@ -28,14 +28,13 @@ CSV_FOLDER_PATH = r"C:\Users\Srivi\myalgo_openalgo\myalgo\option_expired_data"
 DB_PATH = r"C:\Users\Srivi\myalgo_openalgo\myalgo\data\market_data.db"
 ARCHIVE_FOLDER_PATH = r"C:\Users\Srivi\myalgo_openalgo\myalgo\option_expired_data\Archive"
 # 🔹 SYMBOL CONFIGURATION (CHANGE HERE)
-UNDERLYING_SYMBOL = "NIFTY"   # Options: NIFTY, BANKNIFTY, SENSEX
+UNDERLYING_SYMBOL = "SENSEX"   # Options: NIFTY, BANKNIFTY, SENSEX
 EXCHANGE = "NFO"              # Options: NFO (For Nifty/BankNifty), BFO (For Sensex)
 
 # Expiry List (Source of Truth NSE)
 EXPIRY_LIST_RAW = [
     "06-JAN-26",
-    "13-JAN-26","20-JAN-26","27-JAN-26","03-FEB-26","10-FEB-26","17-FEB-26","24-FEB-26"
-]
+    "13-JAN-26","20-JAN-26","27-JAN-26","03-FEB-26","10-FEB-26","17-FEB-26","24-FEB-26", "03-MAR-2026","10-MAR-2026","17-MAR-2026","24-MAR-2026","31-MAR-2026"]
 
 # Logging Setup
 def setup_logger():

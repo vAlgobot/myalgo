@@ -1,14 +1,8 @@
 """
 OpenAlgo Dynamic Market Data Dispatcher
 ---------------------------------------
-Author: OpenAlgo Core Engineering
-Role  : Lead Algo Trading Systems Engineer
 
-Supports:
-- SPOT + OPTIONS
-- LIVE + BACKTESTING
-- DuckDB backend
-- Gap validation & patching
+- LIVE MODE MARKET_DATE IS NONE WE CAN DOWNLAOD CURRENT DAY DATA ELSE WE CAN DOWNLOAD DATA FOR THE GIVEN MARKET_DATE
 """
 from datetime import datetime, timedelta
 from typing import List, Dict
@@ -28,26 +22,29 @@ logger = get_logger("market_data_dispatcher")
 # =====================================================================
 # 🔹 GLOBAL CONFIGURATION (DRIVER VARIABLES)
 # =====================================================================
-MODE = "BACKTESTING"                  # LIVE | BACKTESTING
+MODE = "LIVE"                  # LIVE | BACKTESTING
 INSTRUMENT_TYPE = "SPOT"       # SPOT | OPTIONS
 SYMBOL = ["NIFTY"]  # For SPOT mode ["NIFTY","BANKNIFTY","SENSEX"]
 SPOT_EXCHANGE = "NSE_INDEX"
 OPTION_EXCHANGE = "NFO"
 TIMEFRAMES = ["1m", "5m", "D"]  # List of timeframes to fetch
 
+MARKET_DATE = None  # Optional: Specific market date for LIVE mode (YYYY-MM-DD) or None
 #---Backtesting configuration-----#
-START_DATE = "2026-02-13"
-END_DATE = "2026-02-13"
+START_DATE = "2026-02-24"
+END_DATE = "2026-02-25"
 BATCH_DATES = []
 EXCHANGE = "NSE_INDEX"
 
 #---Openalgo api-----#
-API_KEY = "076b15b4998ba741e0f12a49ef2befbd9cb11483a1a66fba50163c87a8453dc0"
-API_HOST = "https://myalgo.vralgo.com/"
+API_KEY = "56ca4e1d47a566adf3dada0ab5555358431dde1cb110ebdd8ec069a308ed4e50" #live
+API_HOST = "https://myalgo.vralgo.com"
 WS_URL = "wss://myalgo.vralgo.com/ws"
+# API_KEY = "59b70ffdda45f37e5feaa863942cdae78510b0432bc39c166c269ad816b1ccfd" #sandbox
+# API_HOST = "http://127.0.0.1:5000"
+# WS_URL = "ws://127.0.0.1:8765"
 
 
-MARKET_DATE = "2026-02-12"  # Optional: Specific market date for LIVE mode (YYYY-MM-DD) or None
 DAY_CANDLE_LOOKBACK_DAYS = 70
 LOOKBACK_DAYS = 10          # Lookback days for LIVE mode
 client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL)  # Placeholder for your market data API client
@@ -93,7 +90,7 @@ class MarketDataDispatcher:
             f"INSTRUMENT={self.instrument_type} | "
             f"SYMBOLS={self.symbol}")
     
-    def retry_api_call(self, func, max_retries=3, delay=2, description="API call", *args, **kwargs):
+    def retry_api_call(self, func, max_retries=5, delay=10, description="API call", *args, **kwargs):
         """
         Generic retry mechanism for API calls.
         Retries the given function up to max_retries times if it fails or returns invalid/empty data.
@@ -474,17 +471,18 @@ class MarketDataDispatcher:
             start_date = today
             end_date = today
         else:
-            start_date = market_date
+            market_date = datetime.strptime(market_date, "%Y-%m-%d")
+            start_date = market_date 
             end_date = market_date
 
         for symbol in symbols:
             for tf in timeframes:
                 today = datetime.now(IST)
-                end_date = today
+                end_date = market_date if market_date is not None else today
                 if tf == "D":
                     lookback_filter_days = DAY_CANDLE_LOOKBACK_DAYS
                 elif tf == "1m":
-                    lookback_filter_days = 0
+                    lookback_filter_days = 1  # Only fetch current day for 1m to ensure we get the full day's range without gaps
                 else:
                     lookback_filter_days = LOOKBACK_DAYS
 
@@ -535,8 +533,11 @@ class MarketDataDispatcher:
             start_date = today
             end_date = today
         else:
-            start_date = market_date
+            market_date =  datetime.strptime(market_date, "%Y-%m-%d")
+            start_date = market_date - timedelta(days=1)  # Fetch previous day to ensure we get the day's range
             end_date = market_date
+            start_date = start_date.strftime("%Y-%m-%d")
+            end_date = end_date.strftime("%Y-%m-%d")
 
         # ---- Step 1: Fetch daily SPOT candle
         day_df = self.retry_api_call(
@@ -569,11 +570,11 @@ class MarketDataDispatcher:
         for opt_symbol in option_symbols:
             for tf in timeframes:
                 today = datetime.now(IST)
-                end_date = today
+                end_date = market_date if market_date is not None else today
                 if tf == "D":
                     lookback_filter_days = DAY_CANDLE_LOOKBACK_DAYS
                 elif tf == "1m":
-                    lookback_filter_days = 0
+                    lookback_filter_days = 1  # Only fetch current day for 1m to ensure we get the full day's range without gaps
                 else:
                     lookback_filter_days = LOOKBACK_DAYS
 
@@ -603,6 +604,7 @@ class MarketDataDispatcher:
                 df["expiry"] = expiry_str
                 df["strike"] = strike
                 df["opt_type"] = opt_type
+                df["iv"] = "0"  # Default IV value - in a real app, this would be computed from the option data
 
                 DB_MANAGER.store_ohlcv_data(
                     symbol=opt_symbol,
@@ -723,14 +725,14 @@ class MarketDataDispatcher:
                                     end_date=e_date,
                                     instrument_type=self.instrument_type
                                 )
-                    elif self.instrument_type == "OPTIONS_DATA":
+                    elif self.instrument_type == "OPTIONS":
                         for tf in self.timeframes:
                             self.backtest_data_loader_with_gap_validation(
                                 symbol=self.symbol,
                                 exchange=self.option_exchange,
                                 timeframe=tf,
                                 start_date=s_date,
-                                e_date=e_date,
+                                end_date=e_date,
                                 instrument_type=self.instrument_type
                             )
             else:

@@ -4,10 +4,8 @@ import json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-
 import pyotp
 import pandas as pd
-
 from dhanhq import DhanLogin, DhanContext, dhanhq
 from push_option_historical_data_csv_to_db import (
     OptionsIngestionPipeline,
@@ -19,8 +17,8 @@ from push_option_historical_data_csv_to_db import (
 from push_option_d_data_nse_to_db import NSEHistoricalIngestor
 
 MODE = "HISTORICAL"  # "LIVE" or "HISTORICAL"
-start_date = "2026-02-13"   #✅ Used when MODE = "HISTORICAL" (YYYY-MM-DD)
-end_date = "2026-02-13"     #✅ Used when MODE = "HISTORICAL" (YYYY-MM-DD)
+start_date = "2025-01-01"   #✅ Used when MODE = "HISTORICAL" (YYYY-MM-DD)
+end_date = "2026-02-26"     #✅ Used when MODE = "HISTORICAL" (YYYY-MM-DD)
 out_dir = str(Path(__file__).resolve().parents[1] / "option_expired_data") #✅ Output directory for CSV files
 expiry_type = "WEEK"  # or "MONTH" #✅ Choose expiry type (WEEK or MONTH)
 expiry_code = 1       #✅ 1 for nearest expiry, 2 for next
@@ -36,14 +34,14 @@ class DhanExpiredDataDownloader:
         # ===== CREDENTIALS =====
         self.CLIENT_ID = "1106711453"
         self.PIN = "251988"
-        self.TOTP_SECRET = "NKAH37E23LXNVODCEYUJAPDEP3ZLUYMF"
+        self.TOTP_SECRET = "MOV56TD5Q3C5AXGIDZWSFTQJ3Q343XGA"
 
         # ===== TOKEN SETTINGS =====
         self.TOKEN_FILE = Path(__file__).resolve().parent / "dhan_token.json"
         self.TOKEN_VALIDITY = 6 * 60 * 60  # 6 hours (safe)
 
         # ===== INSTRUMENT SETTINGS =====
-        self.NIFTY_SECURITY_ID = 13          # adjust if needed
+        self.NIFTY_SECURITY_ID = 51          # adjust if needed 13 FOR nifty 51 for sensex
         self.EXCHANGE_SEGMENT = "NSE_FNO"
         self.OPT_INSTRUMENT = "OPTIDX"
 
@@ -687,7 +685,7 @@ if __name__ == "__main__":
         out_dir=out_dir,
         api_delay=1.5,           # ⏰ 1.5 seconds between each API call 
         chunk_days=31,           # ✅ 31 CALENDAR days = ~23 trading days per chunk
-        run_nse_after_ingest=True,
+        run_nse_after_ingest=False,  # Set to True if you want to run NSE D data ingestion after CSV ingestion
         nse_start_date_filter=runtime_start_date,
         nse_end_date_filter=runtime_end_date,
     )
