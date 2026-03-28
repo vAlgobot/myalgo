@@ -31,7 +31,9 @@ from datetime import datetime, timedelta, date, time as dt_time
 import time
 import threading
 import sqlite3
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.background import BackgroundScheduler  # used for backtesting/local
+from apscheduler.schedulers.blocking import BlockingScheduler 
+from apscheduler.executors.pool import ThreadPoolExecutor       # used for live on Linux (no extra thread)
 from apscheduler.triggers.cron import CronTrigger
 # Directly call the helper from MarketDataDispatcher
 # from market_data_dispatcher import MarketDataDispatcher
@@ -45,7 +47,177 @@ from typing import Dict, List, Optional, Tuple
 import io
 import time
 import platform
+import requests
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+# ==============================================================
+# MULTI-STRATEGY CONFIG INJECTION
+# --------------------------------------------------------------
+# apply_config(cfg) is the ONLY place where injectable params
+# are mapped. All keys are optional — omitted keys keep the
+# engine's hardcoded defaults below unchanged.
+#
+# run(config) is the public entry point called by strategy files.
+# Calling it with no arguments is identical to the old __main__.
+# ==============================================================
+import json as _json
+
+def apply_config(cfg: dict) -> None:
+    """
+    Inject a strategy CONFIG dict into engine globals.
+    Must be called BEFORE any engine logic runs (handled by run()).
+    Every parameter is listed here — this block is the documentation.
+    """
+    global MODE, LOGGING_MODE, STRATETGY_MODE
+    global SYMBOL, EXCHANGE, PRODUCT
+    global CANDLE_TIMEFRAME, LOOKBACK_DAYS, SIGNAL_CHECK_INTERVAL
+    global START_DATE, END_DATE, SIMULATION_DATE, CLEAR_TRADE_TABLE
+    global MAX_TRADES_PER_DAY, ENTRY_CONFIRM_SECONDS, EXIT_CONFIRM_SECONDS
+    global ENABLE_SECONDS_CONFIRMATION_LIVE, DAY_HIGH_LOW_VALIDATION_FROM_TRADE
+    global EXPIRY_DAY_HL_BREAKOUT, TWOCANDLEBREAKOUT
+    global SL_PERCENT, RISK_REWARD_RATIO, MIN_SL_POINTS, MAX_RISK_POINTS
+    global MAX_SIGNAL_RANGE, MIN_TP_SEPARATION_R, MIN_REWARD_PCT_OF_RISK
+    global MIN_REWARD_FOR_SL_MOVE, MIN_ABSOLUTE_REWARD
+    global SL_BUFFER_PCT, SL_BUFFER_POINT, USE_DYNAMIC_TARGET, DYNAMIC_TARGET_METHOD
+    global RSI_STRATEGY, RSI_LEVELS, RSI_LOOKBACK
+    global GAP_FILTER_ENABLED, GAP_THRESHOLD_PERCENT
+    global CPR_MIDPOINTS_ENABLED, ENABLE_LTP_PIVOT_GATE, CANDLE_BREAKOUT_1M_ENABLED
+    global TSL_ENABLED, SL_TP_METHOD
+    global ENTRY_LTP_BREAKOUT_ENABLED, ENTRY_BREAKOUT_MODE
+    global EXIT_LTP_BREAKOUT_ENABLED, EXIT_LTP_BREAKOUT_MODE
+    global EXIT_BREAKOUT_CONFIRM_CANDLES, ENTRY_BREAKOUT_CONFIRM_CANDLES
+    global REVERSAL_MODE, LTP_BREAKOUT_INTERVAL_MIN
+    global OPTION_ENABLED, OPTION_EXCHANGE, STRIKE_INTERVAL
+    global OPTION_EXPIRY_TYPE, OPTION_STRIKE_SELECTION, EXPIRY_LOOKAHEAD_DAYS
+    global LOT_QUANTITY, LOT, QUANTITY, SL_ORDER_ENABLED
+    global USE_SPOT_FOR_SLTP, USE_OPTION_FOR_SLTP
+    global PIVOT_TOUCH_BUFFER_PTS, PIVOT_TOUCH_BUFFER_PCT
+    global STRATEGY
+
+    # ── shorthand section refs ─────────────────────────────────
+    i   = cfg.get("instrument",        {})
+    m   = cfg.get("mode",              {})
+    tf  = cfg.get("timeframe",         {})
+    r   = cfg.get("risk",              {})
+    tm  = cfg.get("trade_management",  {})
+    st  = cfg.get("strategy",          {})
+    br  = cfg.get("breakout",          {})
+    opt = cfg.get("options",           {})
+    pv  = cfg.get("pivot",             {})
+
+    # ── identity ──────────────────────────────────────────────
+    _name = cfg.get("strategy_name")
+    if _name:
+        STRATEGY = f"{_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.environ["STRATEGY"] = STRATEGY
+
+    # ── instrument ────────────────────────────────────────────
+    SYMBOL   = i.get("symbol",   SYMBOL)
+    EXCHANGE = i.get("exchange", EXCHANGE)
+    PRODUCT  = i.get("product",  PRODUCT)
+
+    # ── mode ──────────────────────────────────────────────────
+    MODE            = m.get("run_mode",       MODE)
+    LOGGING_MODE    = m.get("logging_mode",   LOGGING_MODE)
+    STRATETGY_MODE  = m.get("strategy_mode",  STRATETGY_MODE)
+    START_DATE      = m.get("start_date",     START_DATE)
+    END_DATE        = m.get("end_date",       END_DATE)
+    SIMULATION_DATE = m.get("simulation_date",SIMULATION_DATE)
+    CLEAR_TRADE_TABLE = m.get("clear_trade_table", CLEAR_TRADE_TABLE)
+    TWOCANDLEBREAKOUT = m.get("twocandlebreakout", TWOCANDLEBREAKOUT)
+
+    # ── timeframe ─────────────────────────────────────────────
+    CANDLE_TIMEFRAME      = tf.get("candle",                CANDLE_TIMEFRAME)
+    LOOKBACK_DAYS         = tf.get("lookback_days",         LOOKBACK_DAYS)
+    SIGNAL_CHECK_INTERVAL = tf.get("signal_check_interval", SIGNAL_CHECK_INTERVAL)
+
+    # ── risk ──────────────────────────────────────────────────
+    SL_PERCENT             = float(r.get("sl_percent",            SL_PERCENT))
+    RISK_REWARD_RATIO      = float(r.get("risk_reward_ratio",     RISK_REWARD_RATIO))
+    MIN_SL_POINTS          = r.get("min_sl_points",          MIN_SL_POINTS)
+    MAX_RISK_POINTS        = r.get("max_risk_points",        MAX_RISK_POINTS)
+    MAX_SIGNAL_RANGE       = r.get("max_signal_range",       MAX_SIGNAL_RANGE)
+    MIN_TP_SEPARATION_R    = r.get("min_tp_separation_r",    MIN_TP_SEPARATION_R)
+    MIN_REWARD_PCT_OF_RISK = r.get("min_reward_pct_of_risk", MIN_REWARD_PCT_OF_RISK)
+    MIN_REWARD_FOR_SL_MOVE = r.get("min_reward_for_sl_move", MIN_REWARD_FOR_SL_MOVE)
+    MIN_ABSOLUTE_REWARD    = r.get("min_absolute_reward",    MIN_ABSOLUTE_REWARD)
+    SL_BUFFER_PCT          = float(r.get("sl_buffer_pct",        SL_BUFFER_PCT))
+    SL_BUFFER_POINT        = r.get("sl_buffer_point",        SL_BUFFER_POINT)
+    USE_DYNAMIC_TARGET     = r.get("use_dynamic_target",     USE_DYNAMIC_TARGET)
+    DYNAMIC_TARGET_METHOD  = r.get("dynamic_target_method",  DYNAMIC_TARGET_METHOD)
+
+    # ── trade management ──────────────────────────────────────
+    MAX_TRADES_PER_DAY                 = tm.get("max_trades_per_day",                MAX_TRADES_PER_DAY)
+    ENTRY_CONFIRM_SECONDS              = tm.get("entry_confirm_seconds",             ENTRY_CONFIRM_SECONDS)
+    EXIT_CONFIRM_SECONDS               = tm.get("exit_confirm_seconds",              EXIT_CONFIRM_SECONDS)
+    ENABLE_SECONDS_CONFIRMATION_LIVE   = tm.get("enable_seconds_confirmation_live",  ENABLE_SECONDS_CONFIRMATION_LIVE)
+    DAY_HIGH_LOW_VALIDATION_FROM_TRADE = tm.get("day_high_low_validation_from_trade",DAY_HIGH_LOW_VALIDATION_FROM_TRADE)
+    EXPIRY_DAY_HL_BREAKOUT             = tm.get("expiry_day_hl_breakout",            EXPIRY_DAY_HL_BREAKOUT)
+
+    # ── strategy toggles ──────────────────────────────────────
+    RSI_STRATEGY              = st.get("rsi_enabled",               RSI_STRATEGY)
+    RSI_LEVELS                = st.get("rsi_levels",                RSI_LEVELS)
+    RSI_LOOKBACK              = st.get("rsi_lookback",              RSI_LOOKBACK)
+    GAP_FILTER_ENABLED        = st.get("gap_filter_enabled",        GAP_FILTER_ENABLED)
+    GAP_THRESHOLD_PERCENT     = st.get("gap_threshold_percent",     GAP_THRESHOLD_PERCENT)
+    CPR_MIDPOINTS_ENABLED     = st.get("cpr_midpoints_enabled",     CPR_MIDPOINTS_ENABLED)
+    ENABLE_LTP_PIVOT_GATE     = st.get("enable_ltp_pivot_gate",     ENABLE_LTP_PIVOT_GATE)
+    CANDLE_BREAKOUT_1M_ENABLED= st.get("candle_breakout_1m_enabled",CANDLE_BREAKOUT_1M_ENABLED)
+    TSL_ENABLED               = st.get("tsl_enabled",               TSL_ENABLED)
+    SL_TP_METHOD              = st.get("sl_tp_method",              SL_TP_METHOD)
+
+    # ── breakout ──────────────────────────────────────────────
+    ENTRY_LTP_BREAKOUT_ENABLED     = br.get("entry_ltp_breakout_enabled",     ENTRY_LTP_BREAKOUT_ENABLED)
+    ENTRY_BREAKOUT_MODE            = br.get("entry_breakout_mode",            ENTRY_BREAKOUT_MODE)
+    EXIT_LTP_BREAKOUT_ENABLED      = br.get("exit_ltp_breakout_enabled",      EXIT_LTP_BREAKOUT_ENABLED)
+    EXIT_LTP_BREAKOUT_MODE         = br.get("exit_ltp_breakout_mode",         EXIT_LTP_BREAKOUT_MODE)
+    EXIT_BREAKOUT_CONFIRM_CANDLES  = br.get("exit_breakout_confirm_candles",  EXIT_BREAKOUT_CONFIRM_CANDLES)
+    ENTRY_BREAKOUT_CONFIRM_CANDLES = br.get("entry_breakout_confirm_candles", ENTRY_BREAKOUT_CONFIRM_CANDLES)
+    REVERSAL_MODE                  = br.get("reversal_mode",                  REVERSAL_MODE)
+    LTP_BREAKOUT_INTERVAL_MIN      = br.get("ltp_breakout_interval_min",      LTP_BREAKOUT_INTERVAL_MIN)
+
+    # ── options ───────────────────────────────────────────────
+    OPTION_ENABLED          = opt.get("enabled",               OPTION_ENABLED)
+    OPTION_EXCHANGE         = opt.get("exchange",              OPTION_EXCHANGE)
+    STRIKE_INTERVAL         = opt.get("strike_interval",       STRIKE_INTERVAL)
+    OPTION_EXPIRY_TYPE      = opt.get("expiry_type",           OPTION_EXPIRY_TYPE)
+    OPTION_STRIKE_SELECTION = opt.get("strike_selection",      OPTION_STRIKE_SELECTION)
+    EXPIRY_LOOKAHEAD_DAYS   = opt.get("expiry_lookahead_days", EXPIRY_LOOKAHEAD_DAYS)
+    LOT_QUANTITY            = opt.get("lot_quantity",          LOT_QUANTITY)
+    LOT                     = opt.get("lot",                   LOT)
+    SL_ORDER_ENABLED        = opt.get("sl_order_enabled",      SL_ORDER_ENABLED)
+    USE_SPOT_FOR_SLTP       = opt.get("use_spot_for_sltp",     USE_SPOT_FOR_SLTP)
+    USE_OPTION_FOR_SLTP     = opt.get("use_option_for_sltp",   USE_OPTION_FOR_SLTP)
+    QUANTITY = LOT * LOT_QUANTITY  # always recompute after either changes
+
+    # ── pivot ─────────────────────────────────────────────────
+    PIVOT_TOUCH_BUFFER_PTS = pv.get("touch_buffer_pts", PIVOT_TOUCH_BUFFER_PTS)
+    PIVOT_TOUCH_BUFFER_PCT = pv.get("touch_buffer_pct", PIVOT_TOUCH_BUFFER_PCT)
+
+    # ── sync env flags (logging setup already ran at import,
+    #    but we update so any re-import or test run is correct) ─
+    if MODE in ("BACKTESTING", "BACKTESTING_RANGE"):
+        os.environ["BACKTEST_MODE"] = "true"
+        os.environ["FAST_BACKTEST"] = "true" if LOGGING_MODE == "fast" else "false"
+    else:
+        os.environ["BACKTEST_MODE"] = "false"
+        os.environ["FAST_BACKTEST"] = "false"
+
+
+def run(config: dict = None) -> None:
+    """
+    Public entry point — called by strategy files.
+    With no arguments behaves identically to running the script directly.
+
+    Usage from a strategy file:
+        import myalgo_trading_system as engine
+        engine.run(config=CONFIG)
+    """
+    if config:
+        apply_config(config)
+    _run_trading_engine()
+
+
 # ==============================================================  
 # MODE CONFIGURATION
 # ==============================================================
@@ -59,23 +231,24 @@ LOGGING_MODE = "fast"  # ← CHANGE THIS ONE VARIABLE TO SWITCH LOGGING DETAIL L
 # BACKTESTING_RANGE Configuration (NEW)
 # ─────────────────────────────────────────────────────────────
 STRATETGY_MODE = "SCALPING"  # "SCALPING" or "LIVE_TESTING" (can be used in strategy logic to differentiate behavior)
-CLEAR_TRADE_TABLE = True                        # Clear trade logs table before backtesting (if True, only in BACKTESTING modes)  
-CANDLE_BREAKOUT_1M_ENABLED = True                        # Clear trade logs table before backtesting (if True, only in BACKTESTING modes)
-ENABLE_LTP_PIVOT_GATE = True                     # master switch for this gatekeeper
+CLEAR_TRADE_TABLE = True                       # Clear trade logs table before backtesting (if True, only in BACKTESTING modes)  
+CANDLE_BREAKOUT_1M_ENABLED = True               # Clear trade logs table before backtesting (if True, only in BACKTESTING modes)
+ENABLE_LTP_PIVOT_GATE = True                    # master switch for this gatekeeper
+TWOCANDLEBREAKOUT = False                       # If True, require previous candle bullish/bearish + current close breakout above/below prev high/low
 RSI_STRATEGY = False # Set to True to enable RSI-based entry conditions in strategy_job()
 RSI_LEVELS = [50]   
 RSI_LOOKBACK = 5  # Lookback candles for RSI V setup validation
-START_DATE: Optional[str] = "11-03-2026"  # DD-MM-YYYY formatbroke_cdH = close > self.ib_high
-END_DATE: Optional[str] = "11-03-2026"    # DD-MM-YYYY format
+START_DATE: Optional[str] = "01-01-2024"  # DD-MM-YYYY format
+END_DATE: Optional[str] = "25-03-2026"    # DD-MM-YYYY format
 now = datetime.now()
 SYMBOL = "NIFTY"
-STRATEGY = "Scalping_Strategy_" + now.strftime("%Y%m%d_%H%M%S")  # Strategy name for logging and tracking
+STRATEGY = "Scalping_LIVE_v1_Dsabled_Broker_SL" + now.strftime("%Y%m%d_%H%M%S")  # Strategy name for logging and tracking
 CPR_MIDPOINTS_ENABLED = True # Enable midpoint levels for target consideration (CPR method)
 # === Gap Filter Configuration ===
 GAP_FILTER_ENABLED = True           # If True, gap-up/gap-down days require 15-min candle breakout before entry
 GAP_THRESHOLD_PERCENT = 0.3         # Minimum gap % to classify a day as gap_up or gap_down (e.g. 1.0 = 1%)
 # Risk settings
-EXPIRY_DAY_HL_BREAKOUT = True  # If True, on expiry day entry requires breakout of previous day high/low (more conservative)
+EXPIRY_DAY_HL_BREAKOUT = True     # If True, on expiry day entry requires breakout of previous day high/low (more conservative)
 STOPLOSS = 0                      #Stoploss
 TARGET = 0                        #Target
 MAX_SIGNAL_RANGE = 30             #Maximum signal range
@@ -89,7 +262,7 @@ MIN_ABSOLUTE_REWARD = 15          #Minimum absolute reward in points
 ENTRY_CONFIRM_SECONDS = 0         #Seconds to confirm entry
 EXIT_CONFIRM_SECONDS = 0          #Seconds to confirm exit    
 ENABLE_SECONDS_CONFIRMATION_LIVE = False     # For live mode, require confirmation seconds for entry
-SL_BUFFER_PCT = 0.15              #15% buffer from premium automatic SL placement in broker
+SL_BUFFER_PCT = 0.25              #20% buffer from premium automatic SL placement in broker
 SL_BUFFER_POINT = 5    
 DAY_HIGH_LOW_BREAKOUT_START_TIME = "15:00"        #Buffer in points from premium in CPR SL placement
 # Backtesting confirmation candles for exit LTP breakout (set to 1 for immediate confirmation)
@@ -154,12 +327,13 @@ TALIB_AVAILABLE = False
 # ----------------------------
 # Global Constants
 os_name = platform.system()
-MARKET_OPEN  = dt_time(9, 00)   # 09:15 AM Market open time
-MARKET_CLOSE = dt_time(15, 20)  # 03:20 PM Market close time
+MARKET_OPEN  = dt_time(9, 15)   # 09:15 AM Market open time
+MARKET_CLOSE = dt_time(15, 19)  # 03:19 PM Market close time
 ENTRY_CUTOFF_TIME = dt_time(15, 00) # 03:00 PM No new entry orders after this time
 EXPIRY_CUTOFF_TIME = dt_time(15, 00) # 02:45 PM on expiry day for more conservative exit conditions
 IB_CUTOFF_TIME = dt_time(10, 20) # 10:20 AM - use IB high/low for the day instead of actual high/low for entry conditions to simulate more conservative behavior (can be set to market open time for strictest)
 TRADE_START_TIME = dt_time(9, 25) # 09:25 AM - start looking for trades from this time (allows for initial volatility to settle)
+TSL_CUTOFF_TIME = dt_time(14, 45) # 02:45 PM - stop trailing SL after this time to avoid end-of-day volatilit
 # dispatcher = MarketDataDispatcher()
 
 # ─────────────────────────────────────────────────────────────
@@ -172,19 +346,18 @@ SIMULATION_DATE: Optional[str] = "13-12-2025"  # DD-MM-YYYY or None
 logging.info(f"🔧 Setting up API client based on OS {os_name}")
 if os_name.upper == "OS LINUX" or os_name.upper() == "LINUX":
     logging.info("💻 Running on Linux - using production API settings")
-    API_KEY = "56ca4e1d47a566adf3dada0ab5555358431dde1cb110ebdd8ec069a308ed4e50"
-    API_HOST = "https://myalgo.vralgo.com"
-    WS_URL = "wss://myalgo.vralgo.com/ws"
+    API_KEY = "f5d15a5720a8f036b0a24958f354c61b6f73db81acb4e640ca9884bead2eb684"
+    API_HOST = "https://v.vralgo.com"
+    WS_URL = "wss://v.vralgo.com/ws"
 else:
     logging.info("🖥️ Running on Windows - using local API settings")
-    API_KEY = "56ca4e1d47a566adf3dada0ab5555358431dde1cb110ebdd8ec069a308ed4e50"
-    API_HOST = "https://myalgo.vralgo.com/"
-    WS_URL = "wss://myalgo.vralgo.com/ws"
+    API_KEY = "f5d15a5720a8f036b0a24958f354c61b6f73db81acb4e640ca9884bead2eb684"
+    API_HOST = "https://v.vralgo.com/"
+    WS_URL = "wss://v.vralgo.com/ws"
 
 # API_KEY = "7773b590c743c9184fb1bb74830091a379f88c2035a2203e2b40d24cb2f86711"
 # API_HOST = "http://127.0.0.1:5000"
 # WS_URL = "ws://127.0.0.1:8765"
-
 # ==============================================================  
 try:
     if MODE == "LIVE":
@@ -198,13 +371,44 @@ except Exception as e:
     logging.error(f"❌ 🚨 Failed to initialize OpenAlgo API client: {e}")
     sys.exit(1)
 
+# ==============================================================
+# Telegram Alert Helper
+# ==============================================================
+def send_telegram_alert(message: str, username: str = "valgo_live", priority: int = 5) -> dict:
+    """
+    Send a Telegram alert via the OpenAlgo notify endpoint.
+
+    Args:
+        message  : Alert text to send.
+        username : OpenAlgo username to notify (default: valgo_live).
+        priority : Alert priority 1-10 (default: 5).
+
+    Returns:
+        dict with the API response, or an error dict on failure.
+    """
+    try:
+        url = f"{API_HOST.rstrip('/')}/api/v1/telegram/notify"
+        payload = {
+            "apikey": API_KEY,
+            "username": username,
+            "message": message,
+            "priority": priority,
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        result = response.json()
+        logging.info(f"📨 Telegram alert sent | status={result}")
+        return result
+    except Exception as e:
+        logging.error(f"❌ Telegram alert failed: {e}")
+        return {"status": "error", "message": str(e)}
+
 # ==============================================================   
 # Instrument
 SYMBOL = "NIFTY"                                  #Symbol
 EXCHANGE = "NSE_INDEX"                            #Exchange                     
 PRODUCT = "MIS"                                   #Product
 CANDLE_TIMEFRAME = "5m"                           #Candle timeframe
-LOOKBACK_DAYS = 10                                #Lookback days
+LOOKBACK_DAYS = 10                                 #Lookback days (3 days = ~225 5m candles, enough for EMA100)
 SIGNAL_CHECK_INTERVAL = 5                         #minutes (use integer minutes)
                         #Minimum TP separation ratio is to avoid closer pivot with previous target
 # ===============================================================
@@ -1115,7 +1319,7 @@ else:
     from db.database_main import DatabaseManager
     BACKTESTING_MANAGER = BacktestingManager()  # inactive in live mode
     REPLAY_CLIENT = None
-    DB_MANAGER = DatabaseManager(read_only=True)
+    DB_MANAGER = None
 # =========================================================
 # 📘 SQLAlchemy Dataclass Setup for Trade Logging
 # =========================================================
@@ -1152,6 +1356,11 @@ class TradeLog(Base):
     hourly_vs_weekly_cpr: str = Column(String(30), nullable=True)  # above_weekly_cpr, below_weekly_cpr, inside_weekly_cpr
     current_rtp: bool = Column(Boolean, nullable=True)        # True if EMA9 > EMA20 > EMA50 > EMA200 (or vice versa)
     rtp_9_30: bool = Column(Boolean, nullable=True)           # Snapshot of RTP at 09:30 candle
+    gap_pct: float = Column(Float, nullable=True)             # Exact Gap percentage
+    rsi_level: float = Column(Float, nullable=True)           # RSI level at entry
+    close_location: str = Column(String(50), nullable=True)   # Current candle close CPR location
+    first_15m_candle_type: str = Column(String(50), nullable=True) # Strong/Weak Bullish/Bearish
+    current_candle_type: str = Column(String(50), nullable=True)   # Strong/Normal/Weak Bullish/Bearish
 
 @dataclass
 class CprMarketData(Base):
@@ -1381,6 +1590,7 @@ class MYALGO_TRADING_BOT:
         self.ws_subscription_lock = threading.Lock()
         self.ib_high = None
         self.ib_low = None
+        self.broker_sl = None          # Broker-level SL price; set after SL order placement (live only)
 
         # Gap filter state (reset daily)
         self.gap_type_cache = None      # 'gap_up', 'gap_down', 'no_gap' — cached per day
@@ -1512,6 +1722,9 @@ class MYALGO_TRADING_BOT:
             self.ib_high = None
             self.ib_low = None
             self.rtp_9_30 = None
+            self.gap_type_cache = None
+            self.gap_percent = None
+            self.first_15m_candle_type = None
             
             # 8. Intrabar
             self._option_intrabar_stage = 0
@@ -1650,7 +1863,23 @@ class MYALGO_TRADING_BOT:
             signal_logger.exception("_breakout_1m_job failed")
 
     def init_scheduler(self):
-        self.scheduler = BackgroundScheduler(timezone=IST)
+        """
+        Use BlockingScheduler on Linux to avoid RuntimeError: can't start new thread.
+
+        WHY:
+        ----
+        BackgroundScheduler.start() ALWAYS creates a new internal OS thread for its
+        event loop — even with a ThreadPoolExecutor limiting job runners, the scheduler
+        itself still needs 1 extra thread. On Linux (inside Flask/gunicorn), the process
+        thread pool is already exhausted, so ANY attempt to start a new thread fails.
+
+        BlockingScheduler.start() runs the event loop directly in the CURRENT thread
+        (strategy_thread, which is already a daemon thread). Zero extra threads created.
+        shutdown() from shutdown_gracefully() stops the blocking loop cleanly.
+        """
+        if self.scheduler and self.scheduler.running:
+            return
+        self.scheduler = BlockingScheduler(timezone=IST)
         self.scheduler.add_job(
             self.strategy_job,
             CronTrigger(minute=f"*/{int(SIGNAL_CHECK_INTERVAL)}", second=5),
@@ -1660,13 +1889,13 @@ class MYALGO_TRADING_BOT:
         if CANDLE_BREAKOUT_1M_ENABLED:
             self.scheduler.add_job(
                 self._breakout_1m_job,
-                CronTrigger(minute="*", second=5),  # fires at HH:MM:05
+                CronTrigger(minute="*", second=3),  # fires at HH:MM:03
                 id="breakout_1m_job",
                 replace_existing=True,
             )
-            logger.info("📊 1m breakout validation job registered (fires every minute at :05)")
-        self.scheduler.start()
-        logger.info("APScheduler started — signal checks every %s minute(s)", SIGNAL_CHECK_INTERVAL)
+            logger.info("📊 1m breakout validation job registered (fires every minute at :03)")
+        logger.info("APScheduler (BlockingScheduler) starting — signal checks every %s minute(s)", SIGNAL_CHECK_INTERVAL)
+        self.scheduler.start()  # ← blocks strategy_thread; returns when shutdown() is called
 
     def strategy_job(self):
         """
@@ -1751,7 +1980,8 @@ class MYALGO_TRADING_BOT:
                 if BACKTESTING_MANAGER.active:
                     self.place_exit_order(reason)
                 else:
-                    threading.Thread(target=self.place_exit_order, args=(reason,), daemon=True).start()
+                    self.place_exit_order(reason)
+                    # threading.Thread(target=self.place_exit_order, args=(reason,), daemon=True).start()
                 
                 # FIX: In BACKTESTING_RANGE, do not kill the bot on market close. 
                 # Let the replay client finish the day's ticks and loop to the next day.
@@ -1767,27 +1997,49 @@ class MYALGO_TRADING_BOT:
     def strategy_thread(self):
         """
         Strategy thread wrapper - behavior depends on mode:
-        - LIVE: starts APScheduler
+        - LIVE: starts BlockingScheduler (blocks this thread's loop — no extra thread needed)
         - SIMULATION: no scheduler (replay handles timing)
+
+        WHY BlockingScheduler?
+        ─────────────────────
+        BackgroundScheduler.start() spawns a new OS thread internally.
+        On Linux (AWS/gunicorn), this fails with:
+            RuntimeError: can't start new thread
+        when the process thread limit is exhausted.
+        BlockingScheduler.start() runs the event loop directly in the
+        calling thread (strategy_thread), requiring ZERO extra threads.
         """
         logger.info("Strategy scheduler starting")
-        
+
         # 🎯 Only start scheduler in LIVE mode
         if not BACKTESTING_MANAGER.active:
-            self.init_scheduler()
+            # init_scheduler() calls BlockingScheduler.start() which blocks here.
+            # The thread stays alive inside the scheduler loop until shutdown().
+            try:
+                self.init_scheduler()
+            except KeyboardInterrupt:
+                logger.info("Manual stop requested (scheduler)")
+                self.shutdown_gracefully()
+            except Exception as e:
+                logger.exception("Scheduler error: %s", e)
+            finally:
+                logger.info("Strategy thread finally block reached")
+                # Shut down scheduler if not already stopped by shutdown_gracefully()
+                if self.scheduler and self.scheduler.running:
+                    try:
+                        self.scheduler.shutdown(wait=False)
+                        logger.info("Scheduler stopped")
+                    except Exception as ex:
+                        logger.debug("Scheduler shutdown in finally block failed (likely already stopped): %s", ex)
         else:
             main_logger.info("📅 Simulation mode - APScheduler disabled (replay controls timing)")
-            
-        try:
-            while not self.stop_event.is_set() and self.running:
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            logger.info("Manual stop requested")
-            self.shutdown_gracefully()
-        finally:
-            if self.scheduler:
-                self.scheduler.shutdown(wait=False)
-                logger.info("Scheduler stopped")
+            # In simulation mode keep the thread alive while the replay runs
+            try:
+                while not self.stop_event.is_set() and self.running:
+                    time.sleep(0.1)
+            except KeyboardInterrupt:
+                logger.info("Manual stop requested")
+                self.shutdown_gracefully()
 
     def reset_pending_breakout(self):
         """Reset any active pending breakout state."""
@@ -2507,6 +2759,29 @@ class MYALGO_TRADING_BOT:
                 option_symbol = getattr(self, 'option_symbol', None)
                 spot_entry_price = getattr(self, 'spot_entry_price', None)
                 option_entry_price = getattr(self, 'option_entry_price', None)
+
+            # ─── Broker SL Hit Detection (ALL MODES) ─────────────────────────────────
+            if (position
+                    and not exit_in_progress
+                    and self.broker_sl is not None
+                    and self.option_ltp is not None
+                    and self.option_ltp < self.broker_sl):
+                position_logger.warning(
+                    f"⚠️ BROKER SL HIT DETECTED: option_ltp={self.option_ltp:.2f} < broker_sl={self.broker_sl:.2f} "
+                    f"| Triggering exit as BROKER_SL_HIT"
+                )
+                with self._state_lock:
+                    self.exit_in_progress = True
+                
+                if BACKTESTING_MANAGER.active:
+                    self.place_exit_order("BROKER_SL_HIT")
+                else:
+                    threading.Thread(
+                        target=self.place_exit_order, args=("BROKER_SL_HIT",), daemon=True
+                    ).start()
+                return
+            # ─────────────────────────────────────────────────────────────────────────
+
             # If no active position or still initializing, show status and skip
             if not position or exit_in_progress or stoploss_price in (None, 0.0) or target_price in (None, 0.0):
                 current_time = time.time()
@@ -2962,7 +3237,7 @@ class MYALGO_TRADING_BOT:
                     logger.info(f"✅ {description} (analyze/success mode) succeeded on attempt {attempt}")
                     return result
 
-                logger.warning(f"⚠️ {description} returned empty on attempt {attempt}")
+                logger.warning(f"⚠️ {description} returned empty on attempt {attempt} - retrying...response: {result}")
                 time.sleep(delay+2) # Slightly longer delay for empty response cases
             except Exception as e:
                 logger.warning(f"⚠️ {description} failed on attempt {attempt}: {e}")
@@ -3421,8 +3696,8 @@ class MYALGO_TRADING_BOT:
                     
                     raw = self.retry_api_call(
                         func=base_client.history,
-                        max_retries=3,
-                        delay=3,
+                        max_retries=10,
+                        delay=10,
                         description="Intraday History Fetch",
                         symbol=symbol,
                         exchange=exchange,
@@ -3483,8 +3758,12 @@ class MYALGO_TRADING_BOT:
         """
         try:
             # 🎯 Use get_now() for proper date handling
+            current_time = get_now().time()
+             # 🛑 TIME CHECK: strict cutoff for new entries
+            if current_time < MARKET_OPEN:
+                # indicators_logger.warning(f"⛔ Indicator calculation skipped: Current time {current_time.strftime('%H:%M:%S')} < Trade Start_time {TRADE_START_TIME.strftime('%H:%M:%S')}")
+                return False
             current_time = get_now()
-            
             self.static_indicators = {}
             indicators_logger.info("╔══════════════════════════════")
             indicators_logger.info("🔍 INITIALIZING MULTI-TIMEFRAME CPR COMPUTATION")
@@ -3548,7 +3827,7 @@ class MYALGO_TRADING_BOT:
                         )
                         weekly_ind['cpr_type'] = weekly_cpr_type
                         indicators_logger.info(
-                            f"📊 WEEKLY CPR Type: {weekly_cpr_type} "
+                            f"📊 WEEKLY CPR Type: {weekly_cpr_type}"
                             f"(CWT={weekly_ind['tc']:.2f}, CWC={weekly_ind['pivot']:.2f}, CWL={weekly_ind['bc']:.2f} "
                             f"vs PWT={weekly_ind['prev_top']:.2f}, PWC={weekly_ind['prev_center']:.2f}, PWL={weekly_ind['prev_low']:.2f})"
                         )
@@ -3635,8 +3914,8 @@ class MYALGO_TRADING_BOT:
             if MODE == "LIVE":
                 raw = self.retry_api_call(
                     func=client.history,
-                    max_retries=3,
-                    delay=5,
+                    max_retries=10,
+                    delay=10,
                     description=f"LIVE Historical ({interval})",
                     symbol=symbol,
                     exchange=exchange,
@@ -4213,7 +4492,7 @@ class MYALGO_TRADING_BOT:
                 is_spot_ema_exit = False
                 is_opt_ema_exit = False
                 if REVERSAL_MODE == "SPOT":
-                    reversal_triggered = is_spot_reversal
+                    reversal_triggered = False
                     is_spot_ema_exit = spot_close < spot_ema20
                 elif REVERSAL_MODE == "OPTIONS":
                     reversal_triggered = is_opt_reversal
@@ -4282,7 +4561,7 @@ class MYALGO_TRADING_BOT:
                 is_spot_ema_exit = False
                 is_opt_ema_exit = False
                 if REVERSAL_MODE == "SPOT":
-                    reversal_triggered = is_spot_reversal
+                    reversal_triggered = False
                     is_spot_ema_exit = spot_close > spot_ema20
                 elif REVERSAL_MODE == "OPTIONS":
                     reversal_triggered = is_opt_reversal
@@ -4394,6 +4673,22 @@ class MYALGO_TRADING_BOT:
 
         return day_open, day_high, day_low
 
+    def classify_candle(self, open_p, high_p, low_p, close_p):
+        """Classify a candle's body size relative to its entire range."""
+        total_range = high_p - low_p
+        if total_range == 0:
+            return "Neutral"
+        body = abs(close_p - open_p)
+        body_pct = body / total_range
+        direction = "Bullish" if close_p >= open_p else "Bearish"
+        if body_pct > 0.6:
+            strength = "Strong"
+        elif body_pct > 0.3:
+            strength = "Normal"
+        else:
+            strength = "Weak"
+        return f"{strength} {direction}"
+
     # =========================================================
     # 📊 INSTITUTIONAL CONTEXT HELPERS (Gap / CPR / Open Zone)
     # =========================================================
@@ -4468,6 +4763,7 @@ class MYALGO_TRADING_BOT:
                 return "no_gap"  # transient default, NOT stored in cache
 
             gap_percent = ((float(current_day_open) - prev_day_close) / prev_day_close) * 100.0
+            self.gap_percent = gap_percent
 
             if gap_percent >= GAP_THRESHOLD_PERCENT:
                 gap_type = "gap_up"
@@ -4503,8 +4799,14 @@ class MYALGO_TRADING_BOT:
                     if not window.empty:
                         self.first_15m_high = float(window["high"].max())
                         self.first_15m_low  = float(window["low"].min())
+                        self.first_15m_candle_type = self.classify_candle(
+                            float(window.iloc[0]["open"]),
+                            self.first_15m_high,
+                            self.first_15m_low,
+                            float(window.iloc[-1]["close"])
+                        )
                         signal_logger.info(
-                            f"📐 First 15-min candle | High={self.first_15m_high:.2f} Low={self.first_15m_low:.2f} "
+                            f"📐 First 15-min candle | High={self.first_15m_high:.2f} Low={self.first_15m_low:.2f} Type={self.first_15m_candle_type} "
                             f"(from {len(window)} candle(s))"
                         )
                     else:
@@ -4652,6 +4954,80 @@ class MYALGO_TRADING_BOT:
 
         except Exception as e:
             signal_logger.warning(f"⚠️ compute_open_location failed: {e}")
+            return None
+
+    def compute_close_location(self, close_price):
+        """
+        Identify where the given close price is relative to 13 price levels.
+        """
+        try:
+            close_price = float(close_price or 0.0)
+            if not close_price:
+                return None
+
+            daily_ind = (self.static_indicators or {}).get("DAILY", {})
+            if not daily_ind:
+                return None
+
+            # Build ordered named levels (name → value)
+            levels = {
+                "pdl":   float(daily_ind.get("low",    0.0)),
+                "s4":    float(daily_ind.get("s4",     0.0)),
+                "s3":    float(daily_ind.get("s3",     0.0)),
+                "s2":    float(daily_ind.get("s2",     0.0)),
+                "s1":    float(daily_ind.get("s1",     0.0)),
+                "bc":    float(daily_ind.get("bc",     0.0)),
+                "pivot": float(daily_ind.get("pivot",  0.0)),
+                "tc":    float(daily_ind.get("tc",     0.0)),
+                "r1":    float(daily_ind.get("r1",     0.0)),
+                "r2":    float(daily_ind.get("r2",     0.0)),
+                "r3":    float(daily_ind.get("r3",     0.0)),
+                "r4":    float(daily_ind.get("r4",     0.0)),
+                "pdh":   float(daily_ind.get("high",   0.0)),
+            }
+
+            # Remove zero values (missing data), then sort ascending
+            levels = {k: v for k, v in levels.items() if v != 0.0}
+            sorted_levels = sorted(levels.items(), key=lambda x: x[1])
+
+            if not sorted_levels:
+                return None
+
+            # Check if close is below the lowest level
+            lowest_name, lowest_val = sorted_levels[0]
+            if close_price < lowest_val:
+                return f"below_{lowest_name}"
+
+            # Check if close is above the highest level
+            highest_name, highest_val = sorted_levels[-1]
+            if close_price > highest_val:
+                return f"above_{highest_name}"
+
+            # Find the two levels surrounding the close
+            zone = None
+            for i in range(len(sorted_levels) - 1):
+                lo_name, lo_val = sorted_levels[i]
+                hi_name, hi_val = sorted_levels[i + 1]
+
+                if abs(close_price - lo_val) < 0.01:
+                    zone = f"at_{lo_name}"
+                    break
+                if abs(close_price - hi_val) < 0.01:
+                    zone = f"at_{hi_name}"
+                    break
+
+                if lo_val < close_price < hi_val:
+                    zone = f"between_{lo_name}_{hi_name}"
+                    break
+
+            if zone is None:
+                zone = "unknown"
+
+            signal_logger.info(f"📍 Close Location: {close_price:.2f} → {zone}")
+            return zone
+
+        except Exception as e:
+            signal_logger.warning(f"⚠️ compute_close_location failed: {e}")
             return None
 
 
@@ -4876,6 +5252,11 @@ class MYALGO_TRADING_BOT:
             rsi14 = float(dyn.get("RSI_14", 0.0))
             prev_rsi14 = float(dyn.get("RSI_PREV_14", 0.0))
 
+            # Store the current attributes for trade logging
+            self.current_rsi = rsi14
+            self.current_candle_type = self.classify_candle(open_, high, low, close)
+            self.current_close_location = self.compute_close_location(close)
+
             # ── Railway Track Pattern (RTP) ─────────────────────────────────────────
             try:
                 if ema9 > 0 and ema20 > 0 and ema50 > 0 and ema200 > 0:
@@ -5048,9 +5429,18 @@ class MYALGO_TRADING_BOT:
                 short_cond13 = False
             # short_cond12 = (close < self.gk_support_pivot) 
 
-            long_cond =  long_cond2 and long_cond3 and long_cond4 and long_cond6 and long_cond7 and  long_cond8 and  long_cond14 and expiry_allowed and long_cond12
+            # Add two-candle breakout validation if enabled
+            if TWOCANDLEBREAKOUT:
+                # For LONG: require previous candle bullish (cond5) AND current close above previous high (cond11)
+                # For SHORT: require previous candle bearish (cond5) AND current close below previous low (cond11)
+                long_cond =  long_cond3 and long_cond4 and long_cond5 and long_cond6 and long_cond7 and long_cond8 and long_cond11 and long_cond14 and expiry_allowed and long_cond12
+                short_cond = short_cond3 and short_cond4 and short_cond5 and short_cond6 and short_cond7 and short_cond8 and short_cond11 and short_cond14 and expiry_allowed and short_cond12
+            else:
+                # Default: without two-candle breakout requirement
+                long_cond =  long_cond3 and long_cond4 and long_cond6 and long_cond7 and long_cond8 and long_cond12 and long_cond14 and expiry_allowed
+                short_cond = short_cond3 and short_cond4 and short_cond6 and short_cond7 and short_cond8 and short_cond12 and expiry_allowed and short_cond14 and expiry_allowed
 
-            short_cond =  short_cond2 and short_cond3 and short_cond4 and short_cond6 and short_cond7 and short_cond8 and short_cond14 and expiry_allowed and short_cond12
+
             
             log_func = logger.debug if BACKTESTING_MANAGER.active else logger.info
             if RSI_STRATEGY and now_dt.time() > dt_time(11, 15):
@@ -5564,12 +5954,12 @@ class MYALGO_TRADING_BOT:
             self.cpr_side = effective_side
             
             # Calculate initial SL from signal candle
-            position_logger.info(f"Calculating initial SL using Option signal candle range: Low={signal_candle_low:.2f}, High={signal_candle_high:.2f}, Range={signal_candle_range:.2f}")
+            position_logger.info(f"Calculating initial SL using signal candle range: Low={signal_candle_low:.2f}, High={signal_candle_high:.2f}, Range={signal_candle_range:.2f}")
             premium_based_range = self.entry_price * SL_PERCENT
             percent = SL_PERCENT * 100
             position_logger.info(f"{percent:.2f}% SL from entry premium {self.entry_price:.2f}: {premium_based_range:.2f}")
             position_logger.info(f"Minumum SL points: {MIN_SL_POINTS}")
-            position_logger.info(f"Option Signal candle range: {signal_candle_range:.2f}")
+            position_logger.info(f"Signal candle range: {signal_candle_range:.2f}")
             max_allowed_range = max(MIN_SL_POINTS, min(signal_candle_range, premium_based_range, MAX_RISK_POINTS))
             position_logger.info(f"Calculated max allowed SL range: {max_allowed_range:.2f}, (SignalCandleRange={signal_candle_range:.2f}, PremiumBasedRange={premium_based_range:.2f})")
             if self.cpr_side == "BUY":
@@ -5800,7 +6190,7 @@ class MYALGO_TRADING_BOT:
             # NOTE: Dynamic TSL enabling is evaluated only when a TP is hit
             # to avoid repeated intraday fetches / indicator recomputations.
             now = get_now()
-            tsl_enable_cutoff = now.replace(hour=14, minute=45, second=0, microsecond=0)
+            tsl_enable_cutoff = TSL_CUTOFF_TIME if isinstance(TSL_CUTOFF_TIME, datetime) else now.replace(hour=TSL_CUTOFF_TIME.hour, minute=TSL_CUTOFF_TIME.minute, second=0, microsecond=0)
             allow_dynamic_tsl_enable = now <= tsl_enable_cutoff 
           # Disable dynamic TSL enabling for now (can be enabled later after testing)
 
@@ -6354,12 +6744,11 @@ class MYALGO_TRADING_BOT:
                 self.option_ltp = self._update_option_ltp_from_df(current_time)
                 exec_price = self.option_ltp
             else:
-                return False
-                
+                return None, None
             # Use current LTP as execution price
             if exec_price is None:
                 order_logger.warning(f"⚠️ Simulation Option LTP is not available, cannot execute order")
-                return False
+                return None, None
             exec_price = self.option_ltp
             order_logger.info(f"✅ 🎯 [SIMULATION] Order executed: ID={mock_order_id} | Price={exec_price}")
             return mock_order_id, exec_price
@@ -6583,10 +6972,10 @@ class MYALGO_TRADING_BOT:
                 
                 # FIX: In Range Mode, do not kill the bot. Just stop taking new entries.
                 if MODE == "BACKTESTING_RANGE":
-                     logger.info("Daily trade limit reached. Staying idle for remainder of the day (Range Mode).")
+                     logger.warning("Daily trade limit reached. Staying idle for remainder of the day (Range Mode).")
                      return False
 
-                logger.info("Daily trade limit reached (%d), will shutdown.", MAX_TRADES_PER_DAY)
+                logger.warning("Daily trade limit reached (%d), will shutdown.", MAX_TRADES_PER_DAY)
                 threading.Thread(target=self.shutdown_gracefully, daemon=True).start()
                 return False
             current_ltp = self.ltp if self.ltp else 0.0
@@ -6616,7 +7005,7 @@ class MYALGO_TRADING_BOT:
                                       action="BUY", quantity=QUANTITY, position_size = QUANTITY, price_type="MARKET", product=PRODUCT)
             
             if entry_order_id is None or exec_price is None:
-                order_logger.error(f"Entry order failed")
+                order_logger.error(f"Entry order failed due to order placement or option price not available.")
                 return False
             order_logger.info(f"✅ 🎯 Order placed successfully. dynamic SL/TP calculation started {get_now()}")
             with self._state_lock:
@@ -6641,7 +7030,8 @@ class MYALGO_TRADING_BOT:
 
                     if sl_order_id:
                         self.sl_order_id = sl_order_id
-                        order_logger.info(f"✅ 🎯 Stop Loss Order Placed Successfully | ID={sl_order_id} | SL={sl_price:.2f}")
+                        self.broker_sl = sl_price  # Store for real-time broker SL hit detection
+                        order_logger.info(f"✅ 🎯 Stop Loss Order Placed Successfully | ID={sl_order_id} | SL={sl_price:.2f} | broker_sl set={self.broker_sl:.2f}")
                     else:
                         order_logger.warning("⚠️ Stop Loss order placement failed after entry confirmation.")
                 except Exception:
@@ -6656,8 +7046,7 @@ class MYALGO_TRADING_BOT:
             else:
                 order_logger.info("📋 [SIMULATION] Option LTP from Duck db for current simulation date")
                 #Write code to fetch option ltp from duckdb for current simulation date and subscribe similar to market OHLC data
-                # Load full-day option candles from DB
-                  
+                # Load full-day option candles from DB                
             
             # mark that we are initializing (prevent concurrent monitoring during setup)
             with self._state_lock:
@@ -6827,6 +7216,11 @@ class MYALGO_TRADING_BOT:
                     "gap_type":      _ctx_gap,
                     "cpr_relation":  _ctx_cpr_rel,
                     "open_location": _ctx_open_loc,
+                    "gap_pct": getattr(self, 'gap_percent', None),
+                    "rsi_level": getattr(self, 'current_rsi', None),
+                    "close_location": getattr(self, 'current_close_location', None),
+                    "first_15m_candle_type": getattr(self, 'first_15m_candle_type', None),
+                    "current_candle_type": getattr(self, 'current_candle_type', None),
                 })
                 order_logger.info(
                     f"📊 Institutional Context | "
@@ -7178,6 +7572,13 @@ class MYALGO_TRADING_BOT:
             self.spot_entry_price = 0.0
             self.option_entry_price = 0.0
             self.option_stop_loss = 0.0
+            self.broker_sl = None          # Reset broker SL tracker for next trade
+            
+            # Reset trade-specific tracking properties per user request
+            self.current_rsi = None
+            self.current_candle_type = None
+            self.current_close_location = None
+            
             # Reset enhanced CPR attributes
             self.cpr_active = False
             self.cpr_levels_sorted = []
@@ -7422,8 +7823,17 @@ class MYALGO_TRADING_BOT:
                 logger.info("📋 [SIMULATION] Skipping final order cancellation and position close API calls")
             else:
                 logger.info("Attempting final order cancellations and position close via API")
-                client.cancelallorder(strategy=STRATEGY)
-                client.closeposition(strategy=STRATEGY)
+                try:
+                    cancel_result = client.cancelallorder(strategy=STRATEGY)
+                    logger.info(f"Cancel all orders result: {cancel_result}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Error cancelling all orders: {e}")
+                
+                try:
+                    close_result = client.closeposition(strategy=STRATEGY)
+                    logger.info(f"Close position result: {close_result}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Error closing position via API (may already be closed or position not held): {e}")
         except Exception:
             logger.exception("Error while logging final status")
 
@@ -7496,11 +7906,15 @@ class MYALGO_TRADING_BOT:
         try:
             if getattr(self, "scheduler", None):
                 try:
-                    self.scheduler.shutdown(wait=False)
-                    main_logger.info("Scheduler shutdown completed")
-                except Exception:
-                    # best-effort shutdown
-                    logger.exception("Scheduler shutdown error")
+                    # Only attempt shutdown if scheduler is actually running
+                    if self.scheduler.running:
+                        self.scheduler.shutdown(wait=False)
+                        main_logger.info("Scheduler shutdown completed")
+                    else:
+                        logger.debug("Scheduler is not running, skipping shutdown")
+                except Exception as e:
+                    # best-effort shutdown - log but don't fail
+                    logger.debug(f"Scheduler shutdown error (may already be stopped): {e}")
         except Exception:
             logger.exception("Scheduler object error")
 
@@ -7716,7 +8130,7 @@ class MYALGO_TRADING_BOT:
             main_logger.info(f"Total Trades Executed: {self.trade_count}")
             main_logger.info(f"Max Trades Allowed: {MAX_TRADES_PER_DAY}")
             main_logger.info(f"Final Status: {'Max trades reached' if self.trade_count >= MAX_TRADES_PER_DAY else 'Session ended normally'}")
-            
+        
             if MODE == "BACKTESTING":
                 main_logger.warning("📋 [SIMULATION] Backtesting session ended")
                 from backtesting_analysis import main
@@ -7733,11 +8147,12 @@ class MYALGO_TRADING_BOT:
                 run_analysis(strategy_name=STRATEGY, symbol=SYMBOL, timeframe="5m")
                 sys.exit(0)
             else:
-                 sys.exit()
+                send_telegram_alert(message="🔔 Trading session completed", username="valgo_live", priority=5)
+                sys.exit()
 # -------------------------
-# main
+# main driver
 # -------------------------
-if __name__ == "__main__":
+def _run_trading_engine():
     
     # ═════════════════════════════════════════════════════════════
     # MODE DETECTION & INITIALIZATION
@@ -7787,6 +8202,8 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────────────
     else:
         main_logger.info("🚀 Live Mode Activated")
+        #Telegeram alert for live mode
+        send_telegram_alert(message="🚀 MYALGO Bot started in LIVE mode", username="valgo_live", priority=5)
         if not market_is_open():
             logger.info("🛑 Market closed right now. Please schedule the bot to run during market hours.")
             sys.exit(1)
@@ -7800,3 +8217,6 @@ if __name__ == "__main__":
     if MODE == "BACKTESTING_RANGE":
         bot._precalculate_strategy_indicators()
     bot.run()
+
+if __name__ == "__main__":
+    run()
